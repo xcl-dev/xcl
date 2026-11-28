@@ -581,6 +581,41 @@ pub fn console_list_methods() -> Result<(), String> {
         ensure!(r32(0x300) == 0xDEAD_00AA && r64(0x308) == 0x0000_0003_0000_0000, "wait cells not written");
         ensure!(r32(0x310) == 0x55AA_55AA, "post-Wait32/64 write failed ({:#x})", r32(0x310));
 
+        // 4. Same-list write-then-wait on ordinary title memory (outside graphics memory), where the
+        // CPU does the write after the GPU: the wait must follow that store, not the submission
+        // (otherwise it times out before the write is even submitted), by Execute and by KickoffX.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let cells = Box::new([AtomicU32::new(0), AtomicU32::new(0)]);
+        let cell = |i: usize| &cells[i] as *const AtomicU32 as u64;
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        write32_bottom(l, cell(0), 0x0BAD_F00D, 0, 0);
+        wait32(l, cell(0), 3, 0x0BAD_F00D, u32::MAX, 0);
+        write32_bottom(l, at(0x318), 0x6666_7777, 0, 0);
+        list.Close().map_err(e)?;
+        let t0 = std::time::Instant::now();
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 4)?;
+        let took = t0.elapsed();
+        let c0 = cells[0].load(Ordering::Acquire);
+        ensure!(c0 == 0x0BAD_F00D && r32(0x318) == 0x6666_7777, "write-then-wait on title memory ({c0:#x}, {:#x})", r32(0x318));
+        ensure!(took < std::time::Duration::from_secs(1), "Execute: wait after a CPU-done write in the same list took {took:?}");
+
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        write32_bottom(l, cell(1), 0x0DEF_ACED, 0, 0);
+        wait32(l, cell(1), 3, 0x0DEF_ACED, u32::MAX, 0);
+        write32_bottom(l, at(0x31C), 0x7777_8888, 0, 0);
+        let t0 = std::time::Instant::now();
+        kickoff(l);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 5)?;
+        let took = t0.elapsed();
+        let c1 = cells[1].load(Ordering::Acquire);
+        ensure!(c1 == 0x0DEF_ACED && r32(0x31C) == 0x7777_8888, "write-then-wait on title memory by KickoffX ({c1:#x}, {:#x})", r32(0x31C));
+        ensure!(took < std::time::Duration::from_secs(1), "KickoffX: wait after a CPU-done write in the same list took {took:?}");
+
         crate::XMemFree(mem as *mut c_void, graphics);
         Ok(())
     }

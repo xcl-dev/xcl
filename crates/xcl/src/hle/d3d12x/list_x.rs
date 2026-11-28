@@ -3648,6 +3648,21 @@ unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects],
     }
 }
 
+/// receipts of deferred CPU writes a wait went on without (`wait_cpu_completions`)
+static CPU_WRITES_UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
+
+/// Wait for the deferred CPU writes a following wait depends on. A receipt that is not confirmed
+/// (the worker wrote after giving up on the GPU, or the job never reached it) is logged and the
+/// wait goes on as for any other cell: the continuation is on the same queue, so the GPU still
+/// runs it after the producer, and a wait the store did not satisfy times out (`wait_all_on`).
+fn wait_cpu_completions(completions: &mut Vec<super::cpu_writes::Completion>) {
+    for completion in completions.drain(..) {
+        if !completion.wait() && once(&CPU_WRITES_UNCONFIRMED, 8) {
+            crate::xlog_warn!("D3D12.X: a wait after a deferred CPU write goes on without the GPU having finished the write's segment");
+        }
+    }
+}
+
 /// Execute a plan and retain completion receipts for its deferred CPU writes.
 unsafe fn execute_submission_plan_with_completions(
     queue: *mut c_void,
@@ -3698,9 +3713,7 @@ unsafe fn execute_submission_plan_with_completions(
             completions.extend(completion);
         }
         if after_cpu_write {
-            for completion in completions.drain(..) {
-                let _ = completion.wait();
-            }
+            wait_cpu_completions(&mut completions);
         }
         let t = Instant::now();
         let on_cpu = wait_all_on(queue, &effects.waits, &effects.write64_signals);
@@ -5322,9 +5335,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     if !gate.failed() && !waits.is_empty() {
         if wait_after_cpu_write {
-            for completion in prior_cpu_completions.drain(..) {
-                let _ = completion.wait();
-            }
+            wait_cpu_completions(&mut prior_cpu_completions);
         }
         if sparse_again_after_split(wait_all_on(q_raw, &waits, &write64_signals), split_sparse_after_cpu_waits_only()) {
             mapped_after_wait(q_raw);
@@ -8426,7 +8437,7 @@ mod tests {
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(20));
                         completed.store(true, Ordering::Release);
-                        let _ = done.send(());
+                        let _ = done.send(true);
                     });
                     (true, Some(receipt))
                 } else {
@@ -8450,6 +8461,50 @@ mod tests {
         };
         assert!(!completed_all);
         assert_eq!(callbacks, 1, "a failed first chunk suppresses later waits and submissions");
+    }
+
+    /// A receipt the worker could not confirm (here: dropped before it was sent) is counted, and
+    /// the continuation is still submitted once, after the producer.
+    #[test]
+    fn an_unconfirmed_cpu_receipt_is_counted_and_the_continuation_goes_on() {
+        let producer = 0x7ffe_2901usize as *mut c_void;
+        let continuation = 0x7ffe_2902usize as *mut c_void;
+        let cell = Box::new(AtomicU64::new(1));
+        let va = &*cell as *const AtomicU64 as u64;
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            let mut first = ListState::default();
+            first.note_write(WriteProducer::CpuAfterSegment, va, 8);
+            m.insert(producer as usize, first);
+            let wait = PendingWait { va, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 1, mask: u64::MAX, after_write64: false };
+            m.insert(continuation as usize, ListState { pending_waits: vec![wait], ..Default::default() });
+        }
+        let plan = SubmissionPlan::capture(&[producer, continuation]);
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.as_mut().unwrap();
+            m.remove(&(producer as usize));
+            m.remove(&(continuation as usize));
+        }
+        let before = CPU_WRITES_UNCONFIRMED.load(Ordering::Relaxed);
+        let mut chunks = Vec::new();
+        unsafe {
+            let leftovers = execute_submission_plan_with_completions(std::ptr::null_mut(), &plan, &[], |chunk| {
+                chunks.push(chunk.lists().to_vec());
+                if chunk.lists() == [producer] {
+                    let (receipt, done) = super::super::cpu_writes::completion_pair_for_test();
+                    drop(done);
+                    (true, Some(receipt))
+                } else {
+                    (true, None)
+                }
+            });
+            let (leftovers, submitted) = leftovers;
+            assert!(submitted && leftovers.is_empty());
+        }
+        assert_eq!(chunks, vec![vec![producer], vec![continuation]]);
+        assert!(CPU_WRITES_UNCONFIRMED.load(Ordering::Relaxed) > before, "the unconfirmed receipt is counted");
     }
 
     #[test]

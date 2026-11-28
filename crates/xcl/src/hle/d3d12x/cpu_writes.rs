@@ -34,7 +34,10 @@ struct Job {
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
-    done: Option<mpsc::Sender<()>>,
+    /// how long the worker waits for `value` before writing anyway (`WAIT_MS`)
+    wait_ms: u32,
+    /// told whether the queue got to `value` before the writes were done
+    done: Option<mpsc::Sender<bool>>,
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -71,13 +74,27 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
             let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
             for job in rx {
-                if super::real::fence_completed(&job.fence) < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
-                    if super::real::fence_completed(&job.fence) < job.value {
+                let mut reached = super::real::fence_completed(&job.fence) >= job.value;
+                if !reached && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+                    // the event can also be set by an earlier job's value, registered before
+                    // that job gave up: the fence is checked again until the time is up
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(job.wait_ms.into());
+                    loop {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        th::WaitForSingleObject(event, left.as_millis().max(1) as u32);
+                        reached = super::real::fence_completed(&job.fence) >= job.value;
+                        if reached {
+                            break;
+                        }
+                    }
+                    if !reached {
                         static LATE: AtomicU64 = AtomicU64::new(0);
                         let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
                         if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", super::real::fence_completed(&job.fence), job.value, job.writes.len());
+                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {} ms (fence at {}, wanted {}; {} writes)", job.wait_ms, super::real::fence_completed(&job.fence), job.value, job.writes.len());
                         }
                     }
                 }
@@ -91,7 +108,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                     }
                 }
                 if let Some(done) = job.done {
-                    let _ = done.send(());
+                    let _ = done.send(reached);
                 }
             }
         });
@@ -224,33 +241,46 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
 }
 
 /// Receipt published only after the worker has applied every deferred store in a submission.
-pub(super) struct Completion(mpsc::Receiver<()>);
+pub(super) struct Completion(mpsc::Receiver<bool>);
 
 impl Completion {
+    /// Whether the stores were done after the GPU had finished their submission. False when the
+    /// worker wrote anyway after `WAIT_MS` (a removed device, a queue that never got there) and
+    /// when the job never reached the worker (no fence, a failed `Signal`, no worker thread).
     pub(super) fn wait(self) -> bool {
         let _stall = crate::stall::span(crate::stall::StallKind::MemorySynchronization);
-        self.0.recv().is_ok()
+        self.0.recv().unwrap_or(false)
     }
 }
 
 #[cfg(test)]
-pub(super) fn completion_pair_for_test() -> (Completion, mpsc::Sender<()>) {
+pub(super) fn completion_pair_for_test() -> (Completion, mpsc::Sender<bool>) {
     let (tx, rx) = mpsc::channel();
     (Completion(rx), tx)
 }
 
-/// Schedule `writes` from lists just submitted to `queue` after the GPU has finished them.
-unsafe fn schedule(queue: *mut c_void, writes: Vec<Write>, completion: bool) -> Option<Completion> {
-    if writes.is_empty() || queue.is_null() {
+/// Schedule `writes` from lists just submitted to `queue` after the GPU has finished them. With
+/// `completion`, every nonempty `writes` gets a receipt; one whose job is dropped before the worker
+/// has it reads as failed, its sender going with the job.
+unsafe fn schedule(queue: *mut c_void, writes: Vec<Write>, completion: bool, wait_ms: u32) -> Option<Completion> {
+    if writes.is_empty() {
         return None;
     }
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return None };
     let (done, receipt) = if completion {
         let (tx, rx) = mpsc::channel();
         (Some(tx), Some(Completion(rx)))
     } else {
         (None, None)
     };
+    enqueue(queue, writes, wait_ms, done);
+    receipt
+}
+
+unsafe fn enqueue(queue: *mut c_void, writes: Vec<Write>, wait_ms: u32, done: Option<mpsc::Sender<bool>>) {
+    if queue.is_null() {
+        return;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
     let job = {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -259,31 +289,30 @@ unsafe fn schedule(queue: *mut c_void, writes: Vec<Write>, completion: bool) -> 
             std::collections::hash_map::Entry::Vacant(v) => {
                 let mut dev: Option<ID3D12Device> = None;
                 if q.GetDevice(&mut dev).is_err() {
-                    return None;
+                    return;
                 }
-                let Some(dev) = dev else { return None };
-                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return None };
+                let Some(dev) = dev else { return };
+                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
                 v.insert(QueueFence { fence, value: 0 })
             }
         };
         entry.value += 1;
         if super::real::native_queue_signal(q, &entry.fence, entry.value).is_err() {
-            return None;
+            return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes, done }
+        Job { fence: entry.fence.clone(), value: entry.value, writes, wait_ms, done }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    worker().lock().unwrap().send(job).ok()?;
-    receipt
+    let _ = worker().lock().unwrap().send(job);
 }
 
 pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
-    let _ = schedule(queue, writes, false);
+    let _ = schedule(queue, writes, false, WAIT_MS);
 }
 
 pub(super) unsafe fn after_with_completion(queue: *mut c_void, writes: Vec<Write>) -> Option<Completion> {
-    schedule(queue, writes, true)
+    schedule(queue, writes, true, WAIT_MS)
 }
 
 #[cfg(test)]
@@ -398,6 +427,46 @@ mod tests {
             mirrors::released(cpu);
             VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A receipt is true only when the queue got to the writes' submission: false when the worker
+    /// wrote after giving up, and a later job's wait outlasts the event of the value given up on.
+    #[test]
+    fn a_receipt_says_whether_the_queue_got_there() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cell = Box::new([0u32; 2]);
+            let va = cell.as_ptr() as usize;
+
+            // the queue stands at the gate: the worker gives up after 50 ms and writes anyway
+            q.Wait(&gate, 1).unwrap();
+            let late = schedule(q.as_raw(), vec![Write::Immediate(va, vec![7])], true, 50).expect("a receipt");
+            assert!(!late.wait(), "a write done before its queue got there is not confirmed");
+
+            // the next job's value comes after a second gate; opening the first sets the worker's
+            // event for the value given up on, which must not end the next job's wait
+            q.Wait(&gate, 2).unwrap();
+            let next = schedule(q.as_raw(), vec![Write::Immediate(va + 4, vec![9])], true, 5_000).expect("a receipt");
+            gate.Signal(1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!((*((va + 4) as *const AtomicU32)).load(Ordering::Acquire), 0, "written before its queue got there");
+            gate.Signal(2).unwrap();
+            assert!(next.wait(), "the queue got to the second job");
+            assert_eq!(*cell, [7, 9]);
+
+            // no queue: the job never reaches the worker, and the receipt says so
+            let lost = schedule(std::ptr::null_mut(), vec![Write::Immediate(va, vec![1])], true, 50).expect("a receipt");
+            assert!(!lost.wait());
+            assert!(schedule(q.as_raw(), Vec::new(), true, 50).is_none(), "no writes, no receipt");
         }
     }
 
