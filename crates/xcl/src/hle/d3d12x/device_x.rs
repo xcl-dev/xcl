@@ -84,6 +84,13 @@ pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, d
     hr
 }
 
+/// device #124 CreateCommandQueue1(desc, creator ID, riid, queue) (PC #75): #8 with a creator ID,
+/// which only groups queues for the PC's scheduler
+pub(super) unsafe extern "system" fn create_command_queue1_x(this: *mut c_void, desc: *const [u32; 4], _creator: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    real::note_newer_device_method(124);
+    create_command_queue_x(this, desc, riid, ppv)
+}
+
 /// device #9 CreateCommandAllocator(type, riid, allocator)
 pub(super) unsafe extern "system" fn create_command_allocator_x(this: *mut c_void, ty: u32, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     real::dev_create_command_allocator(this, pc_list_type(ty) as usize, riid, ppv)

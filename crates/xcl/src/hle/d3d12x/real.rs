@@ -61,6 +61,23 @@ pub enum Kind {
 }
 
 #[cfg(test)]
+mod device_queue1_tests {
+    use super::*;
+
+    /// Console device #124 is CreateCommandQueue1 (PC #75, at the distance of #127 from its PC
+    /// slot): it gets the console queue path, as #8 and #48.
+    #[test]
+    fn console_device_124_creates_a_console_queue() {
+        let dev = layout::chain("ID3D12Device")[0];
+        assert_eq!(layout::slot(dev, "CreateCommandQueue1"), Some(75));
+        assert_eq!(layout::slot(dev, "CreateCommittedResource3").map(|p| p + 51), Some(127));
+        let slots = console_slots(Kind::Device);
+        assert!(slots.contains(&(124, super::super::device_x::create_command_queue1_x as usize)));
+        assert_eq!(slots.iter().filter(|e| e.0 == 124).count(), 1);
+    }
+}
+
+#[cfg(test)]
 mod slot_cache_tests {
     use super::*;
 
@@ -1391,6 +1408,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (108, x::get_resource_allocation_info2_x as usize),
                 (127, dev_create_committed_resource_layout_x as usize),
                 (133, x::create_placed_resource_layout_x as usize),
+                (124, x::create_command_queue1_x as usize),
             ]
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
