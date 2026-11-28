@@ -345,6 +345,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
+- Pipelines whose DXIL is not in the disk cache yet are built in the background: the title
+  gets a stand-in pipeline at once (a graphics pipeline draws nothing until the real one is
+  ready; a compute pipeline is waited for where it is used). `XCL_ASYNC_PSO=0` builds every
+  pipeline in the call instead, as before.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
