@@ -4721,13 +4721,13 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// for one of the `XCL_HUGE_PSO_CONCURRENCY` slots. NVIDIA's compiler (nvgpucomp64) takes
 /// minutes and ~1 GB for a 1 – 2 MB program; ~20 of them at once (one per worker) were slower
 /// in total than 1 – 2 at a time. Small programs (ms each) never wait.
-fn huge_pso_bytes() -> usize {
+pub(crate) fn huge_pso_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
 
 /// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
-fn huge_pso_concurrency() -> usize {
+pub(crate) fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
 }
@@ -4796,7 +4796,7 @@ static MEDIUM_COMPILES: LazyLock<Slots> = LazyLock::new(|| {
         ),
     }
 });
-const GIANT_DRIVER_COMPILE: usize = 4 << 20;
+pub(crate) const GIANT_DRIVER_COMPILE: usize = 4 << 20;
 static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
 
 fn compile_slots(bytes: usize) -> &'static Slots {
@@ -4933,12 +4933,12 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
 /// of it — the driver's compile of a 29.8 MB program grew past 14 GB free before it was stopped
 /// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
 /// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
-fn big_compile_headroom(dxil_len: usize) -> u64 {
+pub(crate) fn big_compile_headroom(dxil_len: usize) -> u64 {
     (3u64 << 30).max(dxil_len as u64 * 512)
 }
 
 /// That much commit is free (true when that is not known).
-fn big_compile_commit_free(need: u64) -> bool {
+pub(crate) fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;

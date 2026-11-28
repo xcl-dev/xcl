@@ -1408,6 +1408,8 @@ struct Pipelines {
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
+    /// concurrency and commit-headroom gate for uncached large DXIL driver compiles
+    gate: OfflineGate,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
     #[cfg(test)]
@@ -1752,6 +1754,125 @@ impl Drop for RunningPermit<'_> {
     }
 }
 
+#[derive(Default)]
+struct OfflineGateState {
+    active_cold: usize,
+    active_huge: usize,
+    active_giant: usize,
+}
+
+/// Concurrency and commit-headroom gate for uncached offline `--pipelines` builds.
+/// Serializes giant compiles (`>= giant_bytes`), caps huge compiles (`>= huge_bytes`) to
+/// `huge_most`, and waits for `big_compile_headroom` free commit while any other cold
+/// compile is active. When `active_cold == 0`, a sole huge/giant compile proceeds so low
+/// host commit never deadlocks progress.
+struct OfflineGate {
+    state: Mutex<OfflineGateState>,
+    cv: std::sync::Condvar,
+    huge_bytes: usize,
+    huge_most: usize,
+    giant_bytes: usize,
+}
+
+struct OfflineGateGuard<'a> {
+    gate: &'a OfflineGate,
+    is_huge: bool,
+    is_giant: bool,
+}
+
+impl Drop for OfflineGateGuard<'_> {
+    fn drop(&mut self) {
+        let mut s = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.active_cold -= 1;
+        if self.is_huge {
+            s.active_huge -= 1;
+        }
+        if self.is_giant {
+            s.active_giant -= 1;
+        }
+        self.gate.cv.notify_all();
+    }
+}
+
+impl OfflineGate {
+    fn from_env() -> Self {
+        use crate::hle::d3d12x::real;
+        Self::new(real::huge_pso_bytes(), real::huge_pso_concurrency(), real::GIANT_DRIVER_COMPILE)
+    }
+
+    fn new(huge_bytes: usize, huge_most: usize, giant_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(OfflineGateState::default()),
+            cv: std::sync::Condvar::new(),
+            huge_bytes,
+            huge_most: huge_most.max(1),
+            giant_bytes,
+        }
+    }
+
+    fn enter(&self, dxil_len: usize, commit_free: impl Fn(u64) -> bool) -> OfflineGateGuard<'_> {
+        let is_giant = dxil_len >= self.giant_bytes;
+        let is_huge = dxil_len >= self.huge_bytes;
+        let need = crate::hle::d3d12x::real::big_compile_headroom(dxil_len);
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let blocked_by_size = if is_giant {
+                s.active_giant >= 1 || s.active_huge > 0
+            } else if is_huge {
+                s.active_giant > 0 || s.active_huge >= self.huge_most
+            } else {
+                false
+            };
+            let blocked_by_commit = is_huge && s.active_cold > 0 && !commit_free(need);
+            if !blocked_by_size && !blocked_by_commit {
+                s.active_cold += 1;
+                if is_huge {
+                    s.active_huge += 1;
+                }
+                if is_giant {
+                    s.active_giant += 1;
+                }
+                return OfflineGateGuard { gate: self, is_huge, is_giant };
+            }
+            s = self.cv.wait_timeout(s, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
+enum CachedProbe<P> {
+    Miss,
+    Hit(P),
+    Stale,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_with_gate<C, P, E>(
+    gate: &OfflineGate,
+    running: &(Mutex<usize>, std::sync::Condvar),
+    most: usize,
+    dxil_len: usize,
+    over_cap: bool,
+    ctx: &mut C,
+    commit_free: impl Fn(u64) -> bool,
+    mut try_cached: impl FnMut(&mut C) -> CachedProbe<P>,
+    mut on_stale: impl FnMut(&mut C),
+    mut cold_build: impl FnMut(&mut C) -> Result<P, E>,
+) -> Option<(Result<P, E>, bool)> {
+    let _gate = gate.enter(dxil_len, commit_free);
+    let _permit = RunningPermit::enter(running, most);
+    match try_cached(ctx) {
+        CachedProbe::Hit(pso) => return Some((Ok(pso), true)),
+        CachedProbe::Stale => {
+            on_stale(ctx);
+            if over_cap {
+                return None;
+            }
+        }
+        CachedProbe::Miss => {}
+    }
+    Some((cold_build(ctx), false))
+}
+
 #[cfg(test)]
 mod running_permit_tests {
     use super::RunningPermit;
@@ -2094,6 +2215,151 @@ mod pipeline_cap_tests {
     }
 }
 
+#[cfg(test)]
+mod offline_gate_tests {
+    use super::OfflineGate;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn offline_gate_serializes_huge_compiles_while_small_compiles_proceed() {
+        let gate = Arc::new(OfflineGate::new(256 << 10, 1, 4 << 20));
+        let first = gate.enter(512 << 10, |_| true);
+        // Small DXIL builds proceed immediately alongside an active huge build.
+        let small = gate.enter(64 << 10, |_| false);
+        drop(small);
+
+        let (tx, rx) = mpsc::channel();
+        let gate2 = gate.clone();
+        let second = std::thread::spawn(move || {
+            let _g = gate2.enter(512 << 10, |_| true);
+            let _ = tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(rx.try_recv().is_err(), "second huge compile should wait for the first");
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(5)).expect("second huge compile proceeds");
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn offline_gate_waits_for_headroom_while_another_compile_is_active_and_avoids_deadlock_when_alone() {
+        let gate = Arc::new(OfflineGate::new(256 << 10, 2, 4 << 20));
+        let active_small = gate.enter(64 << 10, |_| true);
+        let commit_ok = Arc::new(AtomicBool::new(false));
+        let commit_ok2 = commit_ok.clone();
+        let (tx, rx) = mpsc::channel();
+        let gate2 = gate.clone();
+        let huge = std::thread::spawn(move || {
+            let _g = gate2.enter(1 << 20, |_| commit_ok2.load(Ordering::Acquire));
+            let _ = tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(rx.try_recv().is_err(), "huge compile should wait for commit headroom while another compile is active");
+        drop(active_small);
+        // With no other cold compile in flight, the sole huge compile must proceed despite commit_free == false.
+        rx.recv_timeout(Duration::from_secs(5)).expect("sole huge compile should not deadlock on low commit");
+        huge.join().unwrap();
+        let _ = commit_ok;
+    }
+
+    #[test]
+    fn offline_gate_runs_giant_compile_alone_even_with_higher_huge_concurrency() {
+        let gate = Arc::new(OfflineGate::new(256 << 10, 2, 4 << 20));
+        let huge = gate.enter(1 << 20, |_| true);
+        let (tx_giant, rx_giant) = mpsc::channel();
+        let gate2 = gate.clone();
+        let t0 = Instant::now();
+        let giant_thread = std::thread::spawn(move || {
+            let _g = gate2.enter(4 << 20, |_| true);
+            let _ = tx_giant.send(());
+            std::thread::sleep(Duration::from_millis(120));
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(rx_giant.try_recv().is_err(), "giant compile should wait until active huge compiles finish");
+        drop(huge);
+        rx_giant.recv_timeout(Duration::from_secs(5)).expect("giant compile proceeds once alone");
+        // While giant is running, another huge compile must also wait.
+        let (tx_huge2, rx_huge2) = mpsc::channel();
+        let gate3 = gate.clone();
+        let huge2_thread = std::thread::spawn(move || {
+            let _g = gate3.enter(1 << 20, |_| true);
+            let _ = tx_huge2.send(());
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(rx_huge2.try_recv().is_err(), "huge compile should wait for active giant compile");
+        giant_thread.join().unwrap();
+        rx_huge2.recv_timeout(Duration::from_secs(5)).expect("huge compile proceeds after giant");
+        huge2_thread.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn offline_gate_serializes_giant_cached_probe_fallback() {
+        use super::{build_with_gate, CachedProbe, OfflineGate};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let gate = Arc::new(OfflineGate::new(256 << 10, 2, 4 << 20));
+        let running = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak_concurrent = Arc::new(AtomicUsize::new(0));
+        let stale_calls = Arc::new(AtomicUsize::new(0));
+        let cold_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let g = gate.clone();
+            let r = running.clone();
+            let a = active.clone();
+            let p = peak_concurrent.clone();
+            let s = stale_calls.clone();
+            let c = cold_calls.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut seen = AtomicBool::new(false);
+                let out = build_with_gate::<(), u32, ()>(
+                    &g,
+                    &r,
+                    4,
+                    4 << 20,
+                    false,
+                    &mut (),
+                    |_| true,
+                    |_| {
+                        let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                        p.fetch_max(cur, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(80));
+                        a.fetch_sub(1, Ordering::SeqCst);
+                        *seen.get_mut() = true;
+                        CachedProbe::Stale
+                    },
+                    |_| {
+                        s.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {
+                        let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                        p.fetch_max(cur, Ordering::SeqCst);
+                        c.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(30));
+                        a.fetch_sub(1, Ordering::SeqCst);
+                        Ok(7)
+                    },
+                );
+                assert!(seen.into_inner());
+                assert_eq!(out, Some((Ok(7), false)));
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(peak_concurrent.load(Ordering::SeqCst), 1, "giant cached probes and their cold fallbacks must serialize under OfflineGate");
+        assert_eq!(stale_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cold_calls.load(Ordering::SeqCst), 2);
+    }
+}
+
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
 
@@ -2136,6 +2402,7 @@ impl Pipelines {
                 inflight: (Mutex::new(InflightBuilds::default()), std::sync::Condvar::new()),
                 running: (Mutex::new(0), std::sync::Condvar::new()),
                 most,
+                gate: OfflineGate::from_env(),
                 max_dxil,
                 #[cfg(test)]
                 cache_dir: None,
@@ -2353,77 +2620,100 @@ impl Pipelines {
                 return Err(format!("Compute DXIL exceeds the native pipeline size limit ({} bytes)", dxil.len()));
             }
         }
-        let _permit = RunningPermit::enter(&self.running, self.most);
-        // (another process may have written the blob while this one waited for its turn)
-        if cached.is_none() {
-            loaded = path.as_deref().and_then(driver_cache::load);
-            cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
-        }
-        let from_cache = cached.as_ref().and_then(|bytes| {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            // a driver that cannot use the blob may compile from the DXIL itself and still
-            // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
-                .ok()
-                .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
-        });
-        // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
-        // size cap and start the expensive uncached driver compile.
-        if cached.is_some() && from_cache.is_none() {
-            if let Some(loaded) = loaded.take() {
-                let _ = loaded.invalidate();
-            }
-        }
-        if cached.is_some() && from_cache.is_none() && over_cap {
-            self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
-        }
-        let r = if let Some(pso) = from_cache {
-            if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
-                book.record(warm_blobs::stamp(path, layout, blob));
-            }
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
-        } else {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            let persist_path = path.as_deref().filter(|_| _claim.is_some() || cached.is_some());
-            let persistence = pso.as_ref().ok().map(|pso| match persist_path {
-                None => PersistenceOutcome::Disabled,
-                Some(path) => match unsafe { pso.GetCachedBlob() } {
-                    Ok(blob) => {
-                        let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                        let len = unsafe { blob.GetBufferSize() };
-                        if bytes.is_null() || len == 0 {
-                            PersistenceOutcome::BlobUnavailable
-                        } else {
-                            let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
-                            if driver_cache::write(path, bytes) {
-                                if let Some(((book, layout), _)) = receipt {
-                                    book.record(warm_blobs::stamp(path, layout, bytes));
-                                }
-                                PersistenceOutcome::Saved
+        let mut ctx = (&mut desc, &mut loaded, &mut cached);
+        let outcome = build_with_gate(
+            &self.gate,
+            &self.running,
+            self.most,
+            dxil.len(),
+            over_cap,
+            &mut ctx,
+            crate::hle::d3d12x::real::big_compile_commit_free,
+            |(desc, loaded, cached)| {
+                // (another process may have written the blob while this one waited for its turn)
+                if cached.is_none() {
+                    **loaded = path.as_deref().and_then(driver_cache::load);
+                    **cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
+                }
+                let Some(bytes) = cached.as_ref() else {
+                    return CachedProbe::Miss;
+                };
+                desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE {
+                    pCachedBlob: bytes.as_ptr().cast(),
+                    CachedBlobSizeInBytes: bytes.len(),
+                };
+                // a driver that cannot use the blob may compile from the DXIL itself and still
+                // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
+                match unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(*desc) }
+                    .ok()
+                    .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
+                {
+                    Some(pso) => CachedProbe::Hit(pso),
+                    None => CachedProbe::Stale,
+                }
+            },
+            |(_, loaded, _)| {
+                // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
+                // size cap and start the expensive uncached driver compile.
+                if let Some(loaded) = loaded.take() {
+                    let _ = loaded.invalidate();
+                }
+            },
+            |(desc, _, cached)| {
+                desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(*desc) };
+                let persist_path = path.as_deref().filter(|_| _claim.is_some() || cached.is_some());
+                let persistence = pso.as_ref().ok().map(|pso| match persist_path {
+                    None => PersistenceOutcome::Disabled,
+                    Some(path) => match unsafe { pso.GetCachedBlob() } {
+                        Ok(blob) => {
+                            let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                            let len = unsafe { blob.GetBufferSize() };
+                            if bytes.is_null() || len == 0 {
+                                PersistenceOutcome::BlobUnavailable
                             } else {
-                                PersistenceOutcome::WriteFailed
+                                let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+                                if driver_cache::write(path, bytes) {
+                                    if let Some(((book, layout), _)) = receipt {
+                                        book.record(warm_blobs::stamp(path, layout, bytes));
+                                    }
+                                    PersistenceOutcome::Saved
+                                } else {
+                                    PersistenceOutcome::WriteFailed
+                                }
                             }
                         }
-                    }
-                    Err(_) => PersistenceOutcome::BlobUnavailable,
-                },
-            });
-            record_fresh_creation(persistence, &self.created, &self.persistence);
-            if let Some(outcome) = persistence {
-                if matches!(outcome, PersistenceOutcome::BlobUnavailable | PersistenceOutcome::WriteFailed)
-                    && !self.persistence_warned.swap(true, Ordering::Relaxed)
-                {
-                    if let Some(path) = persist_path {
-                        crate::xlog_warn!("Shader preparation: failed to persist driver blob {}; this pipeline will be rebuilt on the next run", path.display());
+                        Err(_) => PersistenceOutcome::BlobUnavailable,
+                    },
+                });
+                record_fresh_creation(persistence, &self.created, &self.persistence);
+                if let Some(outcome) = persistence {
+                    if matches!(outcome, PersistenceOutcome::BlobUnavailable | PersistenceOutcome::WriteFailed)
+                        && !self.persistence_warned.swap(true, Ordering::Relaxed)
+                    {
+                        if let Some(path) = persist_path {
+                            crate::xlog_warn!("Shader preparation: failed to persist driver blob {}; this pipeline will be rebuilt on the next run", path.display());
+                        }
                     }
                 }
+                pso
+            },
+        );
+        let r = match outcome {
+            None => {
+                self.capped.fetch_add(1, Ordering::Relaxed);
+                self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
             }
-            pso
+            Some((Ok(pso), true)) => {
+                if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
+                    book.record(warm_blobs::stamp(path, layout, blob));
+                }
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                Ok(pso)
+            }
+            Some((r, _)) => r,
         };
         let library = match &r {
             Ok(pso) => pipeline_library::store(library_name, pso),
