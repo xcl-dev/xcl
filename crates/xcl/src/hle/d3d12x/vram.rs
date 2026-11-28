@@ -2673,6 +2673,26 @@ fn tier2(dev: &ID3D12Device) -> bool {
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
 }
 
+/// Whether a sampled texture at `va` may defer tile mapping until CPU texels are uploaded.
+/// A sampled view aliasing a live GPU-owned 64 KiB page (render target, depth buffer, or Hi-Z UAV)
+/// has all-zero CPU memory at `va`, so lazy levels would never map its tiles and shaders would read
+/// zeros; map eagerly instead (reusing the existing live pages at zero extra VRAM cost).
+fn should_use_lazy_levels(level_pages_on: bool, aliases_live: bool, desc: &D3D12_RESOURCE_DESC) -> bool {
+    level_pages_on
+        && !aliases_live
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.SampleDesc.Count == 1
+        && desc.Flags == D3D12_RESOURCE_FLAG_NONE
+}
+
+/// Whether `va` already has a live 64 KiB video-memory page on `dev_key`.
+fn has_live_page(dev_key: usize, va: usize) -> bool {
+    let g = PAGES.lock().unwrap();
+    let Some(Some(pages)) = g.get(&dev_key) else { return false };
+    pages.pages.contains_key(&va)
+}
+
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
 /// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
 /// available (the caller falls back to a committed resource).
@@ -2694,8 +2714,9 @@ pub unsafe fn place_pages(
     if console_has_packed_3d_mips(desc) {
         return None;
     }
+    let aliases_live = va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va));
     // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    let lazy = should_use_lazy_levels(level_pages(), aliases_live, desc);
     // (as `place`: without a size every PC tile went on the title's pages from `va` on)
     let console_bytes = console_bytes.or_else(|| {
         let least = least_texture_bytes(desc);
@@ -5015,5 +5036,152 @@ mod tests {
         };
         assert_eq!(tm.record_srv(Some(&ms)), (false, 4096));
         assert_eq!(tm.srv_sampled_texels, 3 * 4096);
+    }
+
+    #[test]
+    fn should_use_lazy_levels_skips_gpu_aliased_sampled_textures() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 10,
+            Format: DXGI_FORMAT_R16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        assert!(should_use_lazy_levels(true, false, &tex));
+        assert!(!should_use_lazy_levels(true, true, &tex), "sampled view aliasing a live GPU page must map eagerly");
+        assert!(!should_use_lazy_levels(false, false, &tex));
+        let mut uav = tex;
+        uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        assert!(!should_use_lazy_levels(true, false, &uav));
+        let mut arr = tex;
+        arr.DepthOrArraySize = 2;
+        assert!(!should_use_lazy_levels(true, false, &arr));
+    }
+
+    /// Real GPU, `XCL_TEXTURE_LEVEL_PAGES=1`: a sampled Texture2D placed at the same 64 KiB-aligned
+    /// VA as a live GPU-owned render target must map eagerly (sharing the target's live pages) so
+    /// the GPU-written texels are visible through the sampled view instead of reading zeros.
+    #[test]
+    fn gpu_sampled_texture_aliasing_live_gpu_target_maps_eagerly_with_level_pages() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::*;
+        const NAME: &str = "gpu_sampled_texture_aliasing_live_gpu_target_maps_eagerly_with_level_pages";
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct ResetLazy;
+        impl Drop for ResetLazy {
+            fn drop(&mut self) {
+                LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetLazy;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return println!("SKIPPED {NAME}: software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return println!("SKIPPED {NAME}: no D3D12 device") };
+            if !tier2(&dev) {
+                return println!("SKIPPED {NAME}: adapter lacks tiled resources tier 2");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let va: usize = 0x0000_0042_0000_0000;
+            let bytes: u64 = 256 * 256 * 4;
+            let rt_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let iid = &ID3D12Resource::IID as *const _ as *const windows_sys::core::GUID;
+            let mut raw_rt: *mut c_void = std::ptr::null_mut();
+            let hr = place(dev.as_raw(), va, &rt_desc, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32, std::ptr::null(), Some(bytes), iid, &mut raw_rt);
+            assert!(hr.is_some_and(|h| h >= 0) && !raw_rt.is_null(), "place render target failed: {hr:?}");
+            let rt = ID3D12Resource::from_raw(raw_rt);
+            assert!(has_live_page(dev.as_raw() as usize, va), "GPU-owned target should populate live pages");
+
+            // Clear the render target on the GPU to a recognizable non-zero color.
+            let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                ..Default::default()
+            }).unwrap();
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateRenderTargetView(&rt, None, rtv);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.ClearRenderTargetView(rtv, &[64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0, 1.0], None);
+            list.Close().unwrap();
+            before_execute(&queue);
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 10_000).unwrap();
+
+            // Place a sampled Texture2D at the same VA with XCL_TEXTURE_LEVEL_PAGES=1 active.
+            LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            let srv_desc = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_NONE, ..rt_desc };
+            let mut raw_srv: *mut c_void = std::ptr::null_mut();
+            let hr = place_pages(dev.as_raw(), va, &srv_desc, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, std::ptr::null(), Some(bytes), iid, &mut raw_srv);
+            assert!(hr.is_some_and(|h| h >= 0) && !raw_srv.is_null(), "place_pages sampled view failed: {hr:?}");
+            let srv = ID3D12Resource::from_raw(raw_srv);
+            assert!(!has_lazy_levels(srv.as_raw() as usize), "sampled view aliasing a live GPU target must not stay lazy");
+
+            // Read back texel (0,0) through the sampled view: it must see the RT's cleared color.
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            dev.GetCopyableFootprints(&srv.GetDesc(), 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+            let rb_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            let rb = rb.unwrap();
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&srv), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.Close().unwrap();
+            before_execute(&queue);
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).unwrap())]);
+            queue.Signal(&fence, 2).unwrap();
+            crate::gpu::fence::wait(&fence, 2, &dev, None, 10_000).unwrap();
+
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let px = std::ptr::read(p as *const [u8; 4]);
+            rb.Unmap(0, None);
+            assert_eq!(px, [64, 128, 192, 255], "sampled view did not read GPU-written target texels");
+
+            forget(srv.as_raw() as usize);
+            forget(rt.as_raw() as usize);
+            drop(srv);
+            drop(rt);
+        }
     }
 }
