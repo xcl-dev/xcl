@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::{Interface, GUID, IUnknown};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_ALREADY_EXISTS;
 
 use crate::util::{E_INVALIDARG, E_NOINTERFACE, E_NOT_SUFFICIENT_BUFFER, E_POINTER, HRESULT, S_FALSE, S_OK};
 
@@ -26,16 +27,16 @@ impl Store {
         Self { entries: HashMap::new(), bytes: 0 }
     }
 
-    fn insert(&mut self, key: Vec<u8>, val: Vec<u8>) {
-        if let Some(old) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(key.len() + old.len());
+    fn insert(&mut self, key: &[u8], val: &[u8]) -> HRESULT {
+        if self.entries.contains_key(key) {
+            return DXGI_ERROR_ALREADY_EXISTS.0;
         }
         let cost = key.len().saturating_add(val.len());
-        if self.bytes.saturating_add(cost) > MAX_STORE_BYTES {
-            return;
+        if self.bytes.saturating_add(cost) <= MAX_STORE_BYTES {
+            self.entries.insert(key.to_vec(), val.to_vec());
+            self.bytes += cost;
         }
-        self.bytes += cost;
-        self.entries.insert(key, val);
+        S_OK
     }
 
     fn clear(&mut self) {
@@ -254,14 +255,9 @@ unsafe extern "system" fn store_value(
     if key.is_null() || key_size == 0 || (val.is_null() && val_size > 0) {
         return E_INVALIDARG;
     }
-    let k = std::slice::from_raw_parts(key as *const u8, key_size as usize).to_vec();
-    let v = if val_size == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(val as *const u8, val_size as usize).to_vec()
-    };
-    (*this).store.lock().unwrap().insert(k, v);
-    S_OK
+    let k = std::slice::from_raw_parts(key.cast::<u8>(), key_size as usize);
+    let v = if val_size == 0 { &[] } else { std::slice::from_raw_parts(val.cast::<u8>(), val_size as usize) };
+    (*this).store.lock().unwrap().insert(k, v)
 }
 
 unsafe extern "system" fn set_delete_on_destroy(this: *mut Session) {
@@ -303,6 +299,11 @@ mod tests {
             let key = b"key";
             let value = b"shared";
             first.StoreValue(key.as_ptr().cast(), key.len() as u32, value.as_ptr().cast(), value.len() as u32).unwrap();
+            for session in [&first, &second] {
+                let replacement = b"replacement";
+                let error = session.StoreValue(key.as_ptr().cast(), key.len() as u32, replacement.as_ptr().cast(), replacement.len() as u32).unwrap_err();
+                assert_eq!(error.code(), DXGI_ERROR_ALREADY_EXISTS);
+            }
             first.SetDeleteOnDestroy();
             drop(first);
             let duplicate = second.clone();
