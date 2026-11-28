@@ -4807,6 +4807,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     record_native_generation(target as usize, init_generation);
     trace_list(target as usize, ListEvent::Reset);
+    // the list records anew (reset here, not through `cl_reset`)
+    super::dred::reset(target);
+    if bound_pso != 0 {
+        super::dred::mark_pipeline(target, bound_pso, init_pso);
+    }
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
@@ -6607,6 +6612,102 @@ mod tests {
         }
         assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
         assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+    }
+
+    unsafe extern "system" fn dred_test_native_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        0
+    }
+    unsafe extern "system" fn dred_test_set_name(_this: *mut c_void, _name: *const u16) -> i32 {
+        0
+    }
+    static DRED_TEST_MARKERS: AtomicU64 = AtomicU64::new(0);
+    unsafe extern "system" fn dred_test_set_marker(
+        _this: *mut c_void,
+        _metadata: u32,
+        _data: *const c_void,
+        _size: u32,
+    ) {
+        DRED_TEST_MARKERS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// #2462: a console list's Reset (#10/#139 → `reset_pc`) is a new DRED recording that starts
+    /// with its initial pipeline, so `XCL_DRED=1` keeps a bounded history and names this frame's
+    /// pipelines (it appended every frame to the first recording).
+    #[test]
+    fn xcl_dred_starts_a_recording_with_the_initial_pipeline_at_each_reset() {
+        use super::super::dred;
+        let mut native = [0usize; PC_RESET + 1];
+        native[PC_RESET] = dred_test_native_reset as usize;
+        // what `dred::mark_pipeline` calls through the list's vtable: SetName (#6), SetMarker (#56)
+        let mut extended = [0usize; 1 + 64];
+        extended[0] = native.as_ptr() as usize;
+        extended[1 + 6] = dred_test_set_name as usize;
+        extended[1 + 56] = dred_test_set_marker as usize;
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let (alloc, draw, frames, binds) = (0x7710usize, 0x7a00usize, 10usize, 3usize);
+        let initial = |f: usize| 0x7b00 + 0x10 * f;
+        let cs_label = |f: usize| format!("cs {:016x}", crate::gpu::shader::fnv64(&[f as u8]));
+
+        dred::ON_FOR_TEST.with(|on| on.set(true));
+        dred::label(draw, &[("ps", Some(b"draw".as_slice()))]);
+        for f in 0..frames {
+            dred::label(initial(f), &[("cs", Some(&[f as u8][..]))]);
+        }
+        unsafe { on_create(list, alloc, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        DRED_TEST_MARKERS.store(0, Ordering::SeqCst);
+        for f in 0..frames {
+            assert_eq!(unsafe { reset_x(list, alloc, initial(f)) }, 0);
+            // the frame's SetPipelineState calls, marked as `real` marks them
+            for _ in 0..binds {
+                unsafe { dred::mark_pipeline(list, draw, draw) };
+            }
+            let recordings = dred::recordings_for_test(list);
+            assert_eq!(
+                recordings.len(),
+                (f + 1).min(4),
+                "frame {f}: one recording per Reset, the last 4 kept"
+            );
+            let last = recordings.last().unwrap();
+            assert_eq!(
+                last.len(),
+                1 + binds,
+                "frame {f}: its initial pipeline and its binds, not the frames before"
+            );
+            assert_eq!(
+                last[0].as_deref(),
+                Some(cs_label(f).as_str()),
+                "frame {f}: the Reset's initial pipeline"
+            );
+            // a fault at this frame's first dispatch: begin, XCL's marker, dispatch, …
+            let history = [46, 0, 6, 0, 6, 0, 6, 0, 6];
+            assert_eq!(
+                dred::bound_at(list as usize, &history, 2),
+                Some(cs_label(f)),
+                "frame {f}"
+            );
+        }
+        // the initial pipeline's marker reached the PC list, so DRED's count stays in step
+        assert_eq!(
+            DRED_TEST_MARKERS.load(Ordering::SeqCst) as usize,
+            frames * (1 + binds)
+        );
+
+        dred::forget_list(list);
+        dred::forget_pso(draw);
+        for f in 0..frames {
+            dred::forget_pso(initial(f));
+        }
+        dred::ON_FOR_TEST.with(|on| on.set(false));
+        LISTS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .remove(&(list as usize));
+        super::super::bind::remove_state_for_test(list);
+        unsafe { super::super::alloc_pool::forget(alloc) };
     }
 
     #[test]

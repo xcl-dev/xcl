@@ -32,7 +32,28 @@ thread_local! {
     static OWN_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// a test on this thread records as with `XCL_DRED=1` (other tests' lists are not marked)
+    pub(super) static ON_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The recordings kept for `list`, oldest first.
+#[cfg(test)]
+pub(super) fn recordings_for_test(list: *mut c_void) -> Vec<Vec<Option<String>>> {
+    MARKS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)).cloned())
+        .unwrap_or_default()
+}
+
 pub fn on() -> bool {
+    #[cfg(test)]
+    if ON_FOR_TEST.with(|f| f.get()) {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some())
 }
