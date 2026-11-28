@@ -4215,9 +4215,13 @@ pub fn end_title(code: u32) -> ! {
         let _ = std::thread::Builder::new().name("xcl-end-watchdog".into()).spawn(move || {
             let _ = tx.send(windows_sys::Win32::System::Threading::GetCurrentThreadId());
             std::thread::sleep(std::time::Duration::from_secs(15));
-            windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
+            crate::eh::terminate_unhooked(code);
         });
         let watchdog = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or(0);
+        // what the NtTerminateProcess hook writes out, while no thread is suspended: the process
+        // ends past the hook (a suspended thread may hold stderr, the log file or the heap)
+        crate::hle::d3d12x::pso_async::flush_used_bounded(std::time::Duration::from_millis(100));
+        flush_indirect_split_records(std::time::Duration::from_millis(100));
         crate::log::flush();
         // the title's threads stop first: with its fences at the maximum a running title thinks
         // the GPU is done and resets command allocators the GPU still runs (Fortnite: a device
@@ -4231,9 +4235,8 @@ pub fn end_title(code: u32) -> ! {
         }
         drain_gpu();
         crate::log::flush();
-        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
+        crate::eh::terminate_unhooked(code)
     }
-    std::process::abort()
 }
 
 /// Every thread of the process but this one and `keep` (XCL's end watchdog), suspended – twice

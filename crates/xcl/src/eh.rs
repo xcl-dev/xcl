@@ -143,6 +143,23 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
     orig(h, status)
 }
 
+/// The process ends without the hook's logging and flushes, for a caller that has suspended the
+/// other threads: one of them may hold a lock that work takes (stderr, the log file, the heap).
+/// No allocation, no lock.
+pub(crate) fn terminate_unhooked(code: u32) -> ! {
+    unsafe {
+        match ORIG_NT_TERMINATE.load(Ordering::Acquire) {
+            0 => {
+                windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
+            }
+            f => {
+                std::mem::transmute::<usize, unsafe extern "system" fn(isize, i32) -> i32>(f)(-1, code as i32);
+            }
+        }
+    }
+    std::process::abort()
+}
+
 pub fn install_crash_handler() {
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
@@ -1082,6 +1099,49 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end watchdog's terminate with the hook installed and a suspended thread holding stderr
+    /// (which the hook's "process ends" line is echoed to): the process still ends.
+    #[test]
+    fn terminate_unhooked_ends_past_a_suspended_stderr_holder() {
+        const CHILD: &str = "XCL_TERMINATE_UNHOOKED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            unsafe {
+                hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let holder = std::thread::spawn(move || {
+                    let _g = std::io::stderr().lock();
+                    tx.send(()).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                });
+                rx.recv().unwrap();
+                use std::os::windows::io::AsRawHandle;
+                windows_sys::Win32::System::Threading::SuspendThread(holder.as_raw_handle() as _);
+                terminate_unhooked(7);
+            }
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "eh::tests::terminate_unhooked_ends_past_a_suspended_stderr_holder", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("the process did not end within 20 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(7));
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
