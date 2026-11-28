@@ -5442,6 +5442,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let medium = gate && worker && medium_compute_compile(kind, bytes, huge_bytes, ADAPTER_VENDOR.load(Ordering::Acquire));
     let huge = gate && worker && bytes >= huge_bytes;
     let gated = medium || huge;
+    crate::prof_zone!("driver PSO compile", format!("{kind}, {bytes} B DXIL{}", record.map_or(String::new(), |h| format!(", record {h:016x}, blob {}", if cached { "supplied" } else { "absent" }))));
     let waited = std::time::Instant::now();
     let gate_stall = gated.then(|| crate::stall::span(crate::stall::StallKind::DriverCompileGate)).flatten();
     let _slot = gated.then(|| {
@@ -5940,6 +5941,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
+    crate::prof_zone!("translate+create compute PSO");
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
@@ -7866,6 +7868,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
 }
 
 unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, cacheable: bool, depth_bounds: bool) -> Option<HRESULT> {
+    crate::prof_zone!("translate+create graphics PSO");
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
@@ -8586,6 +8589,7 @@ pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPEL
 }
 
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+    crate::prof_zone!("build compute (split)");
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_compute_pso(dev.0 as *mut c_void, dev.1, d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
 }
@@ -9585,6 +9589,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 }
 
 unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    crate::prof_zone!("translate+create mesh PSO");
     use crate::gpu::recomp::pso::{console_mesh, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
@@ -9696,6 +9701,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    crate::prof_zone!("translate+create GS PSO");
     let (tp, (ps, ps_samplers)) = match (
         crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
         two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
@@ -11501,6 +11507,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 }
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
+    crate::prof_zone!("ExecuteCommandLists", format!("{n} lists"));
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12CommandQueue", "ExecuteCommandLists")));
     // Internal XCL submits (`sparse` uploads/readbacks, `title_textures` uploads, tile zeroing)

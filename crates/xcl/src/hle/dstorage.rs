@@ -1241,6 +1241,7 @@ impl QueueInner {
 
     #[inline]
     fn run_entry(&self, e: Entry, since_status: &mut HRESULT) {
+        crate::prof_zone!("DirectStorage entry");
         if self.closed.load(Ordering::Acquire) {
             if let Entry::Status(s, i) = e {
                 if let Some(slot) = s.slots.get(i as usize) {

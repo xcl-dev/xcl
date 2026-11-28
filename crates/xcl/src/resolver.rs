@@ -318,6 +318,10 @@ pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool)
     if matches!(source, Source::GameDll(_)) && crate::hle::bink::is_bink_dll(&key) {
         addr = crate::hle::bink::wrap(&fname(what), addr);
     }
+    #[cfg(feature = "profile-tracy")]
+    if fname(what) == "_register_thread_local_exe_atexit_callback" {
+        addr = crate::prof::register_thread_local_exe_atexit_callback as usize;
+    }
     crate::xlog_debug!("import {importer}: {key}!{what} → {source:?}");
     if let Some(f) = trace_filter() {
         if f.wants(&key, &fname(what), &source) {

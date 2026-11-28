@@ -875,6 +875,7 @@ fn pool() -> &'static Arc<CompileQueue> {
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    crate::prof_zone!("DXC compile (incl. queue wait)", format!("{profile} {entry}, {} B HLSL", src.len()));
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job {
         src: src.into(),
@@ -894,6 +895,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    crate::prof_zone!("DXC compile (worker)", format!("{profile} {entry}, {} B HLSL", src.len()));
     // compute (also what MS and GS programs run as): DXC's time for its memory accesses is
     // linear this way (`emit::linked_form`). Anything wrong with it: as one program, as before.
     if profile.starts_with("cs_") && linking() {

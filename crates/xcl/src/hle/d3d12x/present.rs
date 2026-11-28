@@ -54,6 +54,7 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     // (`XCL_LOOK_STATS=2`: a frame's time on the thread that submits, added up)
     let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
+    crate::prof_zone!("PresentX");
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
@@ -63,6 +64,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
     super::frame::mark_flipped(token);
+    crate::prof_frame!();
     0
 }
 

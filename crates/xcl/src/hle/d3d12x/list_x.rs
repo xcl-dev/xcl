@@ -4831,6 +4831,7 @@ unsafe fn prepare_deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: 
 /// segment and complete its deferred store before this wait is evaluated. A prior `Write64` to
 /// another cell keeps its existing split so its signal runs before the wait.
 unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
+    crate::prof_zone!("Wait32/64BitValueX (CPU)");
     static N: AtomicU64 = AtomicU64::new(0);
     let n = width as u64;
     if !va.is_multiple_of(n) {

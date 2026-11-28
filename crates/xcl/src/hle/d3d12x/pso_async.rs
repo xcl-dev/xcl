@@ -464,6 +464,7 @@ fn run_build(build: &Arc<Build>, job: Job) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL};
     let preload = PRELOAD_WORKER.get();
     BUILDING.with(|b| *b.borrow_mut() = Some(build.clone()));
+    crate::prof_zone!("async PSO build", if preload { "preload" } else { "on demand" });
     if preload {
         let mut d = build.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };

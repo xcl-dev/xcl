@@ -454,6 +454,7 @@ fn trace_calls(what: std::fmt::Arguments) {
 pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, timeout_ms: u32, block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
     // (`XCL_LOOK_STATS=2`: a frame's time on the thread that submits, added up)
     let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::WaitFrameEvent));
+    crate::prof_zone!("WaitFrameEventX");
     trace_calls(format_args!("WaitFrameEventX(type {ty}, timeout {timeout_ms} ms, block {block:p}, flags {flags:#x}, token in {:#x})", if token.is_null() { 0 } else { *token }));
     let scheduled = with(|c| {
         ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled)

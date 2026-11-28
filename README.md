@@ -395,6 +395,17 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
 - `XCL_TEXTURE_LEVEL_PAGES=1` gives sampled title textures backing as their mip levels stream in.
   Zero-filled mip uploads in a batch share one staging span and still clear any mapped tiles.
+- **Profiling with [Tracy](https://github.com/wolfpld/tracy)**: `cargo build --release -p xcl
+  --features profile-tracy` builds an XCL that records a timeline, every thread's zones
+  (shader translation, DXC, driver PSO compiles with their record hash, async PSO builds,
+  `ExecuteCommandLists`, translated dispatches, `PresentX`, `WaitFrameEventX`,
+  `Wait32/64BitValueX`, DirectStorage entries), a frame mark at each `PresentX`, and plots of
+  commit, video memory, presents, draws, dispatches and DirectStorage MB. It shows what a frame
+  or a loading stall spent its time on, and on which thread: the 2 s `XCL_ACTIVITY` lines only
+  count what happened. Connect Tracy 0.14.1 (`tracy-profiler`, or `tracy-capture -o run.tracy`)
+  on localhost; run elevated for its CPU sampling and context switches. Without the feature
+  the zones compile to nothing. Tracy's crash handler is left out (XCL's exception handlers
+  must see the title's faults).
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.

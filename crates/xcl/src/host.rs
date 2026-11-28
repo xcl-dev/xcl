@@ -66,6 +66,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         boot.config.log_to_stderr,
     );
     crate::log::log_panics();
+    crate::prof::start();
     crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
@@ -234,6 +235,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
                     crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
                 }
+                crate::prof_plot!("commit MB", mb(private as u64));
+                crate::prof_plot!("video local MB", mb(local));
+                crate::prof_plot!("video non-local MB", mb(non_local));
+                crate::prof_plot!("presents / 2 s", d[0]);
+                crate::prof_plot!("draws / 2 s", d[2]);
+                crate::prof_plot!("dispatches / 2 s", d[3]);
+                crate::prof_plot!("DirectStorage MB / 2 s", d[9]);
                 last = Some(now);
             }
         });

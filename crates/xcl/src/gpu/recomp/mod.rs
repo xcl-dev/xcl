@@ -1754,6 +1754,7 @@ pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
 #[inline]
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let _stall = crate::stall::span(crate::stall::StallKind::ShaderTranslation);
+    crate::prof_zone!("recompile RDNA2 -> HLSL", format!("{} B", code.len()));
     translate_inner(code, opt)
 }
 

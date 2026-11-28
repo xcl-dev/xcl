@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [features]
 pipeline-resolution-bench = []
 texture-selection-bench = []
+profile-tracy = ["dep:tracy-client"]
 
 [[bin]]
 name = "xcl"
@@ -28,6 +29,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 windows-core = "0.62"
+# local profiling only (not for a PR): `--features profile-tracy`. No crash handler: XCL's own
+# vectored handlers must see the title's faults and illegal instructions first.
+tracy-client = { version = "0.19", optional = true, default-features = false, features = ["enable", "sampling", "system-tracing", "context-switch-tracing", "code-transfer", "flush-on-exit", "demangle", "only-localhost", "manual-lifetime"] }
 
 [dependencies.windows]
 version = "0.62"
