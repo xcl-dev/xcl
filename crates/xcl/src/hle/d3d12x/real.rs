@@ -1473,6 +1473,12 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// methods at 124 / 125 (PC 77 / 78). The console-only methods in between: `list_x`.
 fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
+        // the device: after its own extensions the console continues with the PC's newer device
+        // methods in PC order, at a fixed distance per run (#86 CreatePipelineState, #108
+        // GetResourceAllocationInfo2 and #127 CreateCommittedResource3 sit at those distances
+        // and are in `console_slots`). Only the methods whose arguments are the PC's; those that
+        // take a resource or heap description, a command list or a queue are left to the stub.
+        Kind::Device => DEVICE_REMAP.iter().map(|&(x, p, _)| (x, p)).collect(),
         Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
         // the DMA list: Close / Reset, then the copy methods (XDefiant calls #12 with
         // CopyTextureRegion's arguments): 11–14 = PC 15–18 (CopyBufferRegion, CopyTextureRegion,
@@ -1490,6 +1496,59 @@ pub(super) fn list_slot_name(slot: usize) -> String {
     match (pc, iface) {
         (Some(p), Some(i)) if p < i.methods.len() => i.methods[p].to_string(),
         _ => format!("console list method #{slot}"),
+    }
+}
+
+/// Console device slot, the PC device slot whose method it is, and that method's name.
+const DEVICE_REMAP: [(usize, usize, &str); 20] = [
+    (83, 44, "CreatePipelineLibrary"),
+    (84, 45, "SetEventOnMultipleFenceCompletion"),
+    (85, 46, "SetResidencyPriority"),
+    (87, 48, "OpenExistingHeapFromAddress"),
+    (88, 49, "OpenExistingHeapFromFileMapping"),
+    (89, 50, "EnqueueMakeResident"),
+    (91, 52, "CreateProtectedResourceSession"),
+    (96, 57, "CreateLifetimeTracker"),
+    (97, 58, "RemoveDevice"),
+    (98, 59, "EnumerateMetaCommands"),
+    (99, 60, "EnumerateMetaCommandParameters"),
+    (100, 61, "CreateMetaCommand"),
+    (101, 62, "CreateStateObject"),
+    (102, 63, "GetRaytracingAccelerationStructurePrebuildInfo"),
+    (103, 64, "CheckDriverMatchingIdentifier"),
+    (105, 65, "SetBackgroundProcessingMode"),
+    (106, 66, "AddToStateObject"),
+    (107, 67, "CreateProtectedResourceSession1"),
+    // after CreateCommandQueue1 (#124), which the PC has after them
+    (125, 73, "CreateShaderCacheSession"),
+    (126, 74, "ShaderCacheControl"),
+];
+
+#[cfg(test)]
+mod device_remap_tests {
+    use super::*;
+
+    /// Each remapped console device slot runs the PC method it is named for, at the distance of
+    /// its run from the slots titles are known to call, and none is also a console method.
+    #[test]
+    fn console_device_slots_run_the_pc_method_of_their_run() {
+        let dev = layout::chain("ID3D12Device")[0];
+        let at = |name: &str| layout::slot(dev, name).unwrap_or_else(|| panic!("{name} is not in {}", dev.name));
+        // the slots titles call, which fix each run's distance
+        assert_eq!((86, 108, 127), (at("CreatePipelineState") + 39, at("GetResourceAllocationInfo2") + 40, at("CreateCommittedResource3") + 51));
+        let own: Vec<usize> = console_slots(Kind::Device).iter().map(|e| e.0).collect();
+        for (x, p, name) in DEVICE_REMAP {
+            assert_eq!(at(name), p, "console #{x} is {name}");
+            let distance = match x {
+                83..=103 => 39,
+                105..=107 => 40,
+                125 | 126 => 52,
+                _ => panic!("console #{x} is outside the runs"),
+            };
+            assert_eq!(x, p + distance, "console #{x} ({name}) is PC #{p} + {distance}");
+            assert!(!own.contains(&x), "console #{x} is also a console method");
+        }
+        assert_eq!(console_remap(Kind::Device), DEVICE_REMAP.iter().map(|&(x, p, _)| (x, p)).collect::<Vec<_>>());
     }
 }
 
