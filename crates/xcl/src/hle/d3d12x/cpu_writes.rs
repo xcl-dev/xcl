@@ -18,12 +18,13 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::Threading as th;
 
-/// A bottom-of-pipe write into memory outside unified memory, applied by the CPU once the
-/// queue's fence reaches the submission that recorded it.
+/// A deferred CPU write into title memory (plain values, OS QPC timestamps, or GPU readback
+/// slots copied atomically once the queue's fence completes).
 #[derive(Clone)]
 pub(super) enum Write {
-    /// Immediate dwords to store starting at `va`.
-    Immediate(usize, Vec<u32>),
+    U32(usize, u32),
+    U64(usize, u64),
+    OsTimestamp(usize),
     /// A 64-bit value resolved by the GPU into a persistently mapped READBACK buffer slot
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
@@ -82,13 +83,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                     }
                 }
                 for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
-                        }
-                    }
+                    write_now(w);
                 }
                 if let Some(done) = job.done {
                     let _ = done.send(());
@@ -102,72 +97,69 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
     })
 }
 
-/// The dwords at `va`, if the memory is still there and writable.
-unsafe fn write_now(va: usize, words: &[u32]) {
-    let bytes = 4 * words.len();
-    if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
-        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-            return;
-        }
-        if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + bytes {
-            return;
-        }
-    }
-    for (i, &w) in words.iter().enumerate() {
-        (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
-    }
+fn protect_writable(protect: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    protect & PAGE_GUARD == 0 && protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
 }
 
-/// Whether `[va, va + 8)` is 8-byte aligned, committed, and writable without `PAGE_GUARD`.
-unsafe fn u64_writable_now(va: usize) -> bool {
-    if va == 0 || !va.is_multiple_of(8) {
+/// Whether `[va, va + bytes)` is aligned to `bytes`, committed, and writable without `PAGE_GUARD`.
+unsafe fn aligned_writable_now(va: usize, bytes: usize) -> bool {
+    if va == 0 || bytes == 0 || !va.is_multiple_of(bytes) {
         return false;
     }
-    let Some(end) = va.checked_add(8) else { return false };
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, 8)) {
+    let Some(end) = va.checked_add(bytes) else { return false };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
         return false;
     }
-    m.Protect & PAGE_GUARD == 0
-        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+    protect_writable(m.Protect) && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
 }
 
-/// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
-unsafe fn write_u64_now(va: usize, value: u64) {
-    if u64_writable_now(va) {
-        (*(va as *const AtomicU64)).store(value, Ordering::Release);
+/// Perform `w` now if its destination is still committed, writable (not `PAGE_GUARD`),
+/// and properly aligned for an atomic store.
+pub(super) unsafe fn write_now(w: &Write) {
+    let (va, bytes) = match *w {
+        Write::U32(va, _) => (va, 4usize),
+        Write::U64(va, _) | Write::OsTimestamp(va) | Write::ReadbackU64 { va, .. } => (va, 8usize),
+    };
+    if !aligned_writable_now(va, bytes) {
+        return;
+    }
+    match *w {
+        Write::U32(va, v) => (*(va as *const AtomicU32)).store(v, Ordering::Release),
+        Write::U64(va, v) => (*(va as *const AtomicU64)).store(v, Ordering::Release),
+        Write::OsTimestamp(va) => (*(va as *const AtomicU64)).store(super::frame::qpc() as u64, Ordering::Release),
+        Write::ReadbackU64 { va, src, .. } => {
+            let value = (*(src as *const AtomicU64)).load(Ordering::Acquire);
+            (*(va as *const AtomicU64)).store(value, Ordering::Release);
+        }
     }
 }
 
 /// Advance an 8-byte aligned 64-bit value at `va` to at least `value` (`fetch_max`), if the memory
 /// is still committed and writable. Best-effort check before the atomic write (same TOCTOU
-/// trade-off as `write_u64_now`: a concurrent title decommit between check and store is unguarded).
+/// trade-off as `write_now`: a concurrent title decommit between check and store is unguarded).
 pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
-    if u64_writable_now(va) {
+    if aligned_writable_now(va, 8) {
         (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
     }
 }
 
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+    let Some(end) = va.checked_add(bytes) else { return false };
+    if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
     crate::hle::kernelx::lazy::ensure(va, bytes);
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
-    found
-        && m.State == MEM_COMMIT
-        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    found && m.State == MEM_COMMIT && protect_writable(m.Protect) && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
 }
 
 /// Receipt published only after the worker has applied every deferred store in a submission.
@@ -251,12 +243,49 @@ mod tests {
             }
             let dev = dev.unwrap();
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
-            let cell = Box::new([0u32; 2]);
-            let va = cell.as_ptr() as usize;
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as usize;
             assert!(writable(va, 8));
-            let completion = after_with_completion(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]).expect("scheduled CPU write");
+            let want = 7u64 | (9u64 << 32);
+            let completion = after_with_completion(q.as_raw(), vec![Write::U64(va, want)]).expect("scheduled CPU write");
             assert!(completion.wait());
-            assert_eq!(*cell, [7, 9]);
+            assert_eq!(cell.load(Ordering::Acquire), want);
+        }
+    }
+
+    /// OS QPC timestamp writes land a QPC value in range after the queue completes, and
+    /// `PAGE_GUARD` pages are rejected without faulting.
+    #[test]
+    fn os_timestamp_writes_qpc_and_writable_rejects_page_guard() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_READWRITE};
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as usize;
+            let before = super::super::frame::qpc() as u64;
+            let completion = after_with_completion(q.as_raw(), vec![Write::OsTimestamp(va)]).expect("scheduled OS timestamp");
+            assert!(completion.wait());
+            let after_qpc = super::super::frame::qpc() as u64;
+            let got = cell.load(Ordering::Acquire);
+            assert!(got >= before && got <= after_qpc, "QPC {got} outside [{before}, {after_qpc}]");
+
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            assert!(!page.is_null());
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert!(!writable(page as usize, 8), "PAGE_GUARD must not be treated as writable");
+            write_now(&Write::U64(page as usize, 0x1234));
+            assert_ne!(VirtualProtect(page, 4096, PAGE_READWRITE, &mut old), 0);
+            assert_eq!((*(page as *const AtomicU64)).load(Ordering::Acquire), 0);
+            VirtualFree(page, 0, MEM_RELEASE);
         }
     }
 

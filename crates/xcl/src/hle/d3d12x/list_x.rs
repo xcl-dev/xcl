@@ -48,10 +48,31 @@ const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
-/// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
-/// written is a GPU / system timestamp
-const BOTTOM_TIMESTAMPS: u32 = 0x3;
-const TOP_TIMESTAMPS: u32 = 0xC;
+/// `D3D12XBOX_WRITE_VALUE_BOTTOM_OF_PIPE_FLAG`:
+/// bit 0 (`0x1`) writes the GPU timestamp; bit 1 (`0x2`) writes the OS QPC timestamp.
+const BOTTOM_GPU_TIMESTAMP: u32 = 0x1;
+const BOTTOM_OS_TIMESTAMP: u32 = 0x2;
+/// `D3D12XBOX_WRITE_VALUE_TOP_OF_PIPE_FLAG`:
+/// bit 2 (`0x4`) writes the GPU timestamp; bit 3 (`0x8`) writes the OS QPC timestamp.
+const TOP_GPU_TIMESTAMP: u32 = 0x4;
+const TOP_OS_TIMESTAMP: u32 = 0x8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Write64Kind {
+    Value,
+    GpuTimestamp,
+    OsTimestamp,
+}
+
+fn classify_write64(flags: u32, gpu_bit: u32, os_bit: u32) -> Write64Kind {
+    if flags & os_bit != 0 {
+        Write64Kind::OsTimestamp
+    } else if flags & gpu_bit != 0 {
+        Write64Kind::GpuTimestamp
+    } else {
+        Write64Kind::Value
+    }
+}
 /// fills larger than this are not done (one pattern buffer per value, up to this size)
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
@@ -813,6 +834,8 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// top-of-pipe OS QPC timestamp destinations stamped right before submission
+    os_top_writes: Vec<usize>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -1152,6 +1175,7 @@ struct KickoffEffects {
     uses_shared_view_heap: bool,
     write64_signals: Vec<(u64, u64)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
+    os_top_writes: Vec<usize>,
     native_generations: Vec<super::pso_async::NativeGeneration>,
 }
 
@@ -1164,6 +1188,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
         uses_shared_view_heap: std::mem::take(&mut state.uses_shared_view_heap),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
+        os_top_writes: std::mem::take(&mut state.os_top_writes),
         native_generations: state.take_native_generations(),
     };
     state.written_ranges.clear();
@@ -1309,6 +1334,7 @@ pub(super) struct SegmentEffects {
     texture_transitions: Vec<super::title_textures::Transition>,
     uses_shared_view_heap: bool,
     cpu_writes: Vec<super::cpu_writes::Write>,
+    os_top_writes: Vec<usize>,
     native_generations: Vec<super::pso_async::NativeGeneration>,
 }
 
@@ -1349,6 +1375,7 @@ impl SubmissionPlan {
                         texture_transitions: s.texture_transitions.clone(),
                         uses_shared_view_heap: s.uses_shared_view_heap,
                         cpu_writes: s.cpu_writes.clone(),
+                        os_top_writes: s.os_top_writes.clone(),
                         native_generations: s.native_generations.clone(),
                     })
                     .unwrap_or_default()
@@ -1424,6 +1451,14 @@ impl<'a> SubmissionChunk<'a> {
 
     pub(super) fn has_native_generations(self) -> bool {
         self.effects.iter().any(|effects| !effects.native_generations.is_empty())
+    }
+
+    pub(super) unsafe fn stamp_os_top_writes(self) {
+        for e in self.effects {
+            for &va in &e.os_top_writes {
+                super::cpu_writes::write_now(&super::cpu_writes::Write::OsTimestamp(va));
+            }
+        }
     }
 
     pub(super) unsafe fn submit_effects(self, queue: *mut c_void) -> Option<super::cpu_writes::Completion> {
@@ -1745,6 +1780,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.texture_transitions.clear();
         s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
+        s.os_top_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -3588,10 +3624,17 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.note_write(WriteProducer::CpuAfterSegment, va, n);
-                s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
-                return;
+            let entry = match words {
+                [w0] => Some(super::cpu_writes::Write::U32(va as usize, *w0)),
+                [w0, w1] => Some(super::cpu_writes::Write::U64(va as usize, (*w0 as u64) | ((*w1 as u64) << 32))),
+                _ => None,
+            };
+            if let Some(entry) = entry {
+                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                    s.note_write(WriteProducer::CpuAfterSegment, va, n);
+                    s.cpu_writes.push(entry);
+                    return;
+                }
             }
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
@@ -3708,6 +3751,27 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     }
 }
 
+/// Record an OS QPC timestamp write at `va` (`bottom`: after GPU completion via `cpu_writes`,
+/// else before submission via `os_top_writes`). Works on any command list type and any writable
+/// title memory (UMA or plain CPU memory).
+unsafe fn os_timestamp(list: *mut c_void, va: u64, bottom: bool, what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !va.is_multiple_of(8) {
+        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned"));
+    }
+    if !super::cpu_writes::writable(va as usize, 8) {
+        return warn(&N, what, format_args!("{va:#x} is not writable memory"));
+    }
+    let mut g = LISTS.lock().unwrap();
+    let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+    if bottom {
+        s.note_write(WriteProducer::CpuAfterSegment, va, 8);
+        s.cpu_writes.push(super::cpu_writes::Write::OsTimestamp(va as usize));
+    } else {
+        s.os_top_writes.push(va as usize);
+    }
+}
+
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
 ///
 /// # Safety
@@ -3721,11 +3785,14 @@ pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value
 pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
     const W: &str = "Write64BitValueBottomOfPipeX";
     record_write_trace(this, va, value, flags, "W64B");
-    if flags & BOTTOM_TIMESTAMPS != 0 {
-        return timestamp(this, va, W);
+    match classify_write64(flags, BOTTOM_GPU_TIMESTAMP, BOTTOM_OS_TIMESTAMP) {
+        Write64Kind::GpuTimestamp => timestamp(this, va, W),
+        Write64Kind::OsTimestamp => os_timestamp(this, va, true, W),
+        Write64Kind::Value => {
+            note_write64_recorded(this, va, value);
+            write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
+        }
     }
-    note_write64_recorded(this, va, value);
-    write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
 /// The title Resets its list (`title_list` `wrapper`) while the GPU has not finished the last
@@ -4328,11 +4395,14 @@ pub(super) unsafe extern "system" fn write32_top_x(this: *mut c_void, va: u64, v
 pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, value: u64, flags: u32) {
     const W: &str = "Write64BitValueTopOfPipeX";
     record_write_trace(this, va, value, flags, "W64T");
-    if flags & TOP_TIMESTAMPS != 0 {
-        return timestamp(this, va, W);
+    match classify_write64(flags, TOP_GPU_TIMESTAMP, TOP_OS_TIMESTAMP) {
+        Write64Kind::GpuTimestamp => timestamp(this, va, W),
+        Write64Kind::OsTimestamp => os_timestamp(this, va, false, W),
+        Write64Kind::Value => {
+            note_write64_recorded(this, va, value);
+            write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);
+        }
     }
-    note_write64_recorded(this, va, value);
-    write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);
 }
 
 /// command list #90 Write32BitValueBottomOfShaderX(address, value, stage)
@@ -4644,12 +4714,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let effects = match preclose_effects {
         Some(effects) => effects,
         None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
-            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(), native_generations: Vec::new(),
+            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(), os_top_writes: Vec::new(), native_generations: Vec::new(),
         }),
     };
     let KickoffEffects {
         waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap,
-        write64_signals, cpu_writes, native_generations,
+        write64_signals, cpu_writes, os_top_writes, native_generations,
     } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
@@ -4682,7 +4752,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                         track_shared_view_epochs && chunk.uses_shared_view_heap(),
                         chunk.has_native_generations(),
                         chunk.native_generations(),
-                        || {},
+                        || chunk.stamp_os_top_writes(),
                         || exec(q_raw, lists.len() as u32, lists.as_ptr()),
                     ) {
                         return (false, None);
@@ -4718,7 +4788,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             track_shared_view_epochs && uses_shared_view_heap,
             !native_generations.is_empty(),
             native_generations.iter(),
-            || {},
+            || {
+                for &va in &os_top_writes {
+                    super::cpu_writes::write_now(&super::cpu_writes::Write::OsTimestamp(va));
+                }
+            },
             || exec(q_raw, 1, one.as_ptr()),
         );
         if submitted {
@@ -4778,6 +4852,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 s.clear_waits();
                 s.texture_writes.clear();
                 s.cpu_writes.clear();
+                s.os_top_writes.clear();
                 s.bindings = bindings_copy;
                 s.take_native_generations()
             } else {
@@ -5538,6 +5613,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.texture_transitions.clear();
         s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
+        s.os_top_writes.clear();
         let old_generations = s.take_native_generations();
         s.predication = None;
         s.pred_in_state = false;
@@ -6976,7 +7052,7 @@ mod tests {
                             subresource: i as u32,
                             after: D3D12_RESOURCE_STATE_COPY_DEST,
                         }],
-                        cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x3000 + i, vec![i as u32])],
+                        cpu_writes: vec![super::super::cpu_writes::Write::U32(0x3000 + i, i as u32)],
                         ..Default::default()
                     },
                 );
@@ -6999,7 +7075,7 @@ mod tests {
             assert_eq!(effects.texture_writes, vec![super::super::title_textures::GpuWrite { res: 0x2500 + i, generation: 20 + i as u64, subresource: i as u32 }]);
             assert_eq!(effects.texture_transitions.iter().map(|t| t.res).collect::<Vec<_>>(), vec![0x2600 + i]);
             match effects.cpu_writes.as_slice() {
-                [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x3000 + i, &[i as u32][..])),
+                [super::super::cpu_writes::Write::U32(va, word)] => assert_eq!((*va, *word), (0x3000 + i, i as u32)),
                 _ => panic!("unexpected CPU write snapshot"),
             }
         }
@@ -7109,7 +7185,7 @@ mod tests {
                     subresource: 2,
                     after: D3D12_RESOURCE_STATE_COPY_SOURCE,
                 }],
-                cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x6000, vec![4])],
+                cpu_writes: vec![super::super::cpu_writes::Write::U32(0x6000, 4)],
                 ..Default::default()
             };
             state.note_write(WriteProducer::InSegmentGpu, 0x4100, 8);
@@ -7131,7 +7207,7 @@ mod tests {
                 subresource: 3,
                 after: D3D12_RESOURCE_STATE_RENDER_TARGET,
             }];
-            state.cpu_writes = vec![super::super::cpu_writes::Write::Immediate(0x8000, vec![9])];
+            state.cpu_writes = vec![super::super::cpu_writes::Write::U32(0x8000, 9)];
             state.written_ranges.clear();
             state.segment_write_producers.clear();
             state.note_write(WriteProducer::CpuAfterSegment, 0x4300, 8);
@@ -7152,7 +7228,7 @@ mod tests {
         assert!(effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4200, 8));
         assert!(!effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4300, 8));
         match effects.cpu_writes.as_slice() {
-            [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x6000, &[4][..])),
+            [super::super::cpu_writes::Write::U32(va, word)] => assert_eq!((*va, *word), (0x6000, 4)),
             _ => panic!("unexpected CPU write snapshot"),
         }
         LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
@@ -7364,7 +7440,7 @@ mod tests {
             list_type: Some(D3D12_COMMAND_LIST_TYPE_COMPUTE),
             pending_waits: vec![wait],
             texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x4800, generation: 2, subresource: 0 }],
-            cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x5000, vec![1])],
+            cpu_writes: vec![super::super::cpu_writes::Write::U32(0x5000, 1)],
             ..Default::default()
         };
         state.segment_write_producers.insert(WriteProducer::CpuAfterSegment, 0x5000, 4);
@@ -7401,7 +7477,7 @@ mod tests {
         let mut state = ListState {
             pending_waits: vec![wait],
             texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x4800, generation: 3, subresource: 1 }],
-            cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x5000, vec![1])],
+            cpu_writes: vec![super::super::cpu_writes::Write::U32(0x5000, 1)],
             ..Default::default()
         };
         state.note_write(WriteProducer::CpuAfterSegment, 0x5000, 4);
@@ -8537,16 +8613,16 @@ mod tests {
             let top_va = top_ts.as_ref() as *const u64 as u64;
 
             // Unaligned and null targets are ignored without queueing CPU writes.
-            write64_bottom_x(list_ptr, bottom_va + 4, 0, 0, BOTTOM_TIMESTAMPS);
-            write64_bottom_x(list_ptr, 0, 0, 0, BOTTOM_TIMESTAMPS);
+            write64_bottom_x(list_ptr, bottom_va + 4, 0, 0, BOTTOM_GPU_TIMESTAMP);
+            write64_bottom_x(list_ptr, 0, 0, 0, BOTTOM_GPU_TIMESTAMP);
             {
                 let g = LISTS.lock().unwrap();
                 assert!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.is_empty());
             }
 
             // Valid 8-byte aligned non-UMA targets record GPU timestamp queries + readback copies.
-            write64_top_x(list_ptr, top_va, 0, TOP_TIMESTAMPS);
-            write64_bottom_x(list_ptr, bottom_va, 0, 0, BOTTOM_TIMESTAMPS);
+            write64_top_x(list_ptr, top_va, 0, TOP_GPU_TIMESTAMP);
+            write64_bottom_x(list_ptr, bottom_va, 0, 0, BOTTOM_GPU_TIMESTAMP);
             {
                 let g = LISTS.lock().unwrap();
                 let state = &g.as_ref().unwrap()[&(list_ptr as usize)];
@@ -8572,6 +8648,45 @@ mod tests {
             assert_ne!(*bottom_ts, 0);
 
             on_release(list_ptr as usize);
+        }
+    }
+
+    #[test]
+    fn write64_os_timestamp_flags_route_to_qpc_instead_of_gpu_timestamps() {
+        assert_eq!(classify_write64(0, BOTTOM_GPU_TIMESTAMP, BOTTOM_OS_TIMESTAMP), Write64Kind::Value);
+        assert_eq!(classify_write64(BOTTOM_GPU_TIMESTAMP, BOTTOM_GPU_TIMESTAMP, BOTTOM_OS_TIMESTAMP), Write64Kind::GpuTimestamp);
+        assert_eq!(classify_write64(BOTTOM_OS_TIMESTAMP, BOTTOM_GPU_TIMESTAMP, BOTTOM_OS_TIMESTAMP), Write64Kind::OsTimestamp);
+        assert_eq!(classify_write64(0, TOP_GPU_TIMESTAMP, TOP_OS_TIMESTAMP), Write64Kind::Value);
+        assert_eq!(classify_write64(TOP_GPU_TIMESTAMP, TOP_GPU_TIMESTAMP, TOP_OS_TIMESTAMP), Write64Kind::GpuTimestamp);
+        assert_eq!(classify_write64(TOP_OS_TIMESTAMP, TOP_GPU_TIMESTAMP, TOP_OS_TIMESTAMP), Write64Kind::OsTimestamp);
+
+        // Recording top/bottom OS timestamps into plain CPU memory works without UMA or a GPU
+        // timestamp heap, and SubmissionChunk::stamp_os_top_writes stamps a live QPC value.
+        let fake_list = 0x5EED_0040usize as *mut c_void;
+        let top_cell = Box::new(AtomicU64::new(0));
+        let bot_cell = Box::new(AtomicU64::new(0));
+        let top_va = &*top_cell as *const AtomicU64 as u64;
+        let bot_va = &*bot_cell as *const AtomicU64 as u64;
+        unsafe {
+            write64_top_x(fake_list, top_va, 0, TOP_OS_TIMESTAMP);
+            write64_bottom_x(fake_list, bot_va, 0, 0, BOTTOM_OS_TIMESTAMP);
+            let plan = submission_plan(&[fake_list]);
+            let before = super::super::frame::qpc() as u64;
+            execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| chunk.stamp_os_top_writes());
+            let after = super::super::frame::qpc() as u64;
+            let got = top_cell.load(Ordering::Acquire);
+            assert!(got >= before && got <= after, "top OS QPC {got} outside [{before}, {after}]");
+            {
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().unwrap().get(&(fake_list as usize)).unwrap();
+                assert!(matches!(
+                    s.cpu_writes.as_slice(),
+                    [super::super::cpu_writes::Write::OsTimestamp(va)] if *va == bot_va as usize
+                ));
+                assert!(s.written_ranges.overlaps(WriteProducer::CpuAfterSegment, bot_va, 8));
+                assert_eq!(s.os_top_writes, vec![top_va as usize]);
+            }
+            on_release(fake_list as usize);
         }
     }
 

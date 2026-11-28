@@ -9997,6 +9997,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
                 chunk.native_generations(),
                 || {
                     let _ = super::alloc_pool::note_resubmits(this, lists);
+                    chunk.stamp_os_top_writes();
                 },
                 || {
                     let started = gpu_timing_on().then(std::time::Instant::now);
