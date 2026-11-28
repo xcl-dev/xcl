@@ -2333,12 +2333,55 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     }
 }
 
+const TEXTURE_ADDRESS_PAGE: u64 = 0x1_0000;
+const COMMITTED_BC_LAYOUT_SIZE: windows::core::GUID = windows::core::GUID::from_u128(0x049475e9_fa5f_4272_a86b_f244608d62df);
+
+fn padded_texture_address_size(payload: u64) -> Option<u64> {
+    let padded = payload.checked_add(TEXTURE_ADDRESS_PAGE)?;
+    (padded <= 1 << 30).then(|| padded.next_multiple_of(TEXTURE_ADDRESS_PAGE))
+}
+
+fn legacy_texture_address_size(d: &D3D12_RESOURCE_DESC, format: Option<u32>) -> Option<u64> {
+    let bits = format.map_or(128, |f| crate::gpu::desc::format_bytes(f).max(1) as u64 * 8);
+    let texels = d.Width.checked_mul(d.Height as u64)?.checked_mul(d.DepthOrArraySize.max(1) as u64)?;
+    padded_texture_address_size(texels.checked_mul(bits)? / 8 * 4 / 3)
+}
+
+fn is_bc_texture_format(format: Option<u32>) -> bool {
+    format.and_then(crate::gpu::tiling::element).is_some_and(|(_, side)| side > 1)
+}
+
+/// Keep the guest layout size with the committed resource before its original description is lost.
+unsafe fn remember_committed_bc_layout_size(res: *mut c_void, original: &[u8; 0x38]) {
+    let d = std::ptr::read_unaligned(original.as_ptr().cast::<D3D12_RESOURCE_DESC>());
+    let format = crate::gpu::desc::gfx10_format(d.Format);
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || !is_bc_texture_format(format) || legacy_texture_address_size(&d, format).is_some() {
+        return;
+    }
+    let Ok(texture) = crate::hle::xg::Texture::new(original) else { return };
+    let size = texture.size();
+    if size == 0 || padded_texture_address_size(size).is_none() {
+        return;
+    }
+    if let Some(resource) = ID3D12Resource::from_raw_borrowed(&res) {
+        let _ = resource.SetPrivateData(&COMMITTED_BC_LAYOUT_SIZE, size_of_val(&size) as u32, Some((&size as *const u64).cast()));
+    }
+}
+
+unsafe fn committed_bc_address_size(resource: &ID3D12Resource) -> Option<u64> {
+    let mut size = 0u64;
+    let mut len = size_of_val(&size) as u32;
+    resource.GetPrivateData(&COMMITTED_BC_LAYOUT_SIZE, &mut len, Some((&mut size as *mut u64).cast())).ok()?;
+    if len != size_of_val(&size) as u32 || size == 0 {
+        return None;
+    }
+    padded_texture_address_size(size)
+}
+
 /// Memory for a texture the title did not place itself (a committed one) asking for its
-/// address – on the console every texture has one (see `res_gpu_va_x`). Address space for the
-/// texels of the PC description (+ a third for mips and 64 KiB of padding), its pages committed
-/// as the title writes them (`kernelx::lazy`): the clears of GPU-written targets seen so far
-/// cost nothing until done. What the title writes there is not uploaded to the texture, and the
-/// memory stays with the address (not freed with the resource).
+/// address – on the console every texture has one (see `res_gpu_va_x`). Pages are committed
+/// as the title writes them (`kernelx::lazy`). What the title writes there is not uploaded
+/// to the texture, and the memory stays with the address (not freed with the resource).
 unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
     static LOCK: Mutex<()> = Mutex::new(());
@@ -2346,21 +2389,22 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     if let Some(p) = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied()) {
         return Some(p);
     }
-    let d = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc();
+    let resource = ID3D12Resource::from_raw_borrowed(&res)?;
+    let d = resource.GetDesc();
     if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         return None;
     }
-    let bits = crate::gpu::desc::gfx10_format(d.Format).map_or(128, |f| crate::gpu::desc::format_bytes(f).max(1) as u64 * 8);
-    let texels = d.Width.checked_mul(d.Height as u64)?.checked_mul(d.DepthOrArraySize.max(1) as u64)?;
-    let bytes = (texels.checked_mul(bits)? / 8 * 4 / 3 + 0x1_0000).next_multiple_of(0x1_0000);
-    if bytes > 1 << 30 {
-        return None;
-    }
+    let format = crate::gpu::desc::gfx10_format(d.Format);
+    let bytes = match legacy_texture_address_size(&d, format) {
+        Some(bytes) => bytes,
+        None if is_bc_texture_format(format) => committed_bc_address_size(resource)?,
+        None => return None,
+    };
     let p = VirtualAlloc(std::ptr::null(), bytes as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
     if p == 0 {
         return None;
     }
-    for page in (p..p + bytes as usize).step_by(0x1_0000) {
+    for page in (p..p + bytes as usize).step_by(TEXTURE_ADDRESS_PAGE as usize) {
         crate::hle::kernelx::lazy::mark(page);
     }
     note_title_address(res as usize, p);
@@ -3331,8 +3375,9 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // not placed in unified memory (e.g. its coherent window kept for readback heaps): a PC
     // resource of the PC's description – the console's flag bits (0x1000000, 0x300000 …) and
     // alignments made the PC refuse Fortnite's 3264x1836 scene targets (E_INVALIDARG, a crash)
-    let pc_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38))
-        .then(|| super::device_x::pc_resource_desc_for_device(this, &(console_desc as *const [u8; 0x38]).read_unaligned()));
+    let original = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38))
+        .then(|| (console_desc as *const [u8; 0x38]).read_unaligned());
+    let pc_full = original.as_ref().map(|d| super::device_x::pc_resource_desc_for_device(this, d));
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
     let clear = match pc_full.as_ref() {
@@ -3355,6 +3400,10 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             pw(4),
             pw(8)
         );
+    } else if !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(original) = original.as_ref() {
+            remember_committed_bc_layout_size(*ppv, original);
+        }
     }
     hr
 }
@@ -11024,6 +11073,62 @@ mod console_format_query_tests {
         let mut dev: Option<ID3D12Device> = None;
         unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.ok()?;
         dev
+    }
+
+    #[test]
+    fn gpu_console_committed_wide_bc_addresses_cover_original_layout() {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_RESERVE};
+
+        let Some(dev) = device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let mut desc = [0u8; 0x38];
+        desc[0..4].copy_from_slice(&D3D12_RESOURCE_DIMENSION_TEXTURE2D.0.to_le_bytes());
+        desc[0x10..0x18].copy_from_slice(&16384u64.to_le_bytes());
+        desc[0x18..0x1C].copy_from_slice(&16384u32.to_le_bytes());
+        desc[0x1C..0x1E].copy_from_slice(&4u16.to_le_bytes());
+        desc[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        desc[0x20..0x24].copy_from_slice(&DXGI_FORMAT_BC1_UNORM.0.to_le_bytes());
+        desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x2C..0x30].copy_from_slice(&0x109u32.to_le_bytes());
+        let console_bytes = crate::hle::xg::Texture::new(&desc).expect("console BC1 layout").size();
+        assert_eq!(console_bytes, 512 << 20);
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).expect("device adapter");
+            let adapter_name = crate::gpu::adapter::name(&adapter.GetDesc1().expect("adapter description"));
+            adopt(dev.as_raw(), Kind::Device);
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let iid = (&ID3D12Resource::IID as *const windows::core::GUID).cast();
+            let mut out = std::ptr::null_mut();
+            let hr = dev_create_committed_resource_x(
+                dev.as_raw(), &heap as *const _ as usize, 0, desc.as_ptr() as usize,
+                D3D12_RESOURCE_STATE_COMMON.0 as usize, 0, iid, &mut out,
+            );
+            assert!(hr >= 0 && !out.is_null(), "valid committed BC1 texture: {hr:#x}");
+            let resource = ID3D12Resource::from_raw(out);
+            assert!(is_adopted(resource.as_raw()));
+            let pc_desc = resource.GetDesc();
+            assert_eq!(pc_desc.Layout, D3D12_TEXTURE_LAYOUT_UNKNOWN);
+            let pc_bytes = dev.GetResourceAllocationInfo(0, &[pc_desc]).SizeInBytes;
+            assert_eq!(resource.GetGPUVirtualAddress(), 0);
+            assert_eq!(title_address(out as usize), None, "fixture must reach the committed fallback");
+
+            let address = res_gpu_va_x(out);
+            let mut bytes = 0;
+            if address != 0 {
+                assert_eq!(res_gpu_va_x(out), address, "the fallback address must be reused");
+                let mut region: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(address as *const c_void, &mut region, size_of_val(&region)), 0);
+                assert_eq!(region.AllocationBase as u64, address);
+                assert_eq!(region.State, MEM_RESERVE);
+                bytes = region.RegionSize as u64;
+            }
+            println!("{adapter_name}: created 16384x16384x4 BC1, XG {console_bytes:#x}, D3D12 {pc_bytes:#x}, CPU reserve {bytes:#x}");
+            assert_eq!(bytes, 0x2001_0000, "the fallback must cover the XG layout and padding");
+        }
     }
 
     /// CheckFeatureSupport of the PC device as `dev_check_feature_support` reaches it (vtable #13).
