@@ -2973,17 +2973,19 @@ fn prepare_history_graphics(
     let shader_keys: HashSet<_> = records.iter().flat_map(|record| record.identity().1.iter().copied())
         .filter(|key| *key != 0).collect();
     let shaders = shaders_by_key(inputs, shader_keys, progress);
-    let (ready, missing) = buildable(records.iter(), &shaders);
-    if missing != 0 || ready.len() != records.len() {
-        return Err(format!("{missing} exact graphics history recipes have missing or mismatched shaders"));
+    let (records, missing) = buildable_history_records(recipe_ids, records, &shaders);
+    if missing != 0 {
+        progress.done.fetch_add(missing, Ordering::Relaxed);
+        crate::xlog_info!("History preparation: deferring {missing} exact graphics pipelines whose shaders are unavailable");
     }
+    if records.is_empty() { return Ok(()) }
     recomp::pso::set_title_windows(windows);
     recomp::dxc::set_memory_reserve(2);
     let cache_before = crate::hle::d3d12x::real::driver_cache_stats();
     let pipelines = Pipelines::for_adapter(adapter)?;
     let device = crate::hle::d3d12x::real::prepare_device(pipelines.dev.clone());
     let mut confirmed = 0usize;
-    for (recipe_id, record) in recipe_ids.iter().copied().zip(&records) {
+    for (recipe_id, record) in &records {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()) }
         if began.elapsed() >= budget { break }
         let code = |key| shaders.get(&key).map(Vec::as_slice);
@@ -2997,7 +2999,7 @@ fn prepare_history_graphics(
             GraphicsHistoryRecord::Mesh(record) =>
                 crate::hle::d3d12x::real::replay_mesh_record(device, record, record.shaders.map(code)).is_ok(),
         }};
-        timing.record(kind, recipe_id, started.elapsed());
+        timing.record(kind, *recipe_id, started.elapsed());
         if !ok { return Err(format!("Graphics history recipe {:016x} failed", record.identity().0)) }
         confirmed += 1;
         progress.done.fetch_add(1, Ordering::Relaxed);
@@ -3192,6 +3194,21 @@ fn buildable<'a>(records: impl Iterator<Item = &'a GraphicsHistoryRecord>, shade
         }
     }
     (ok, missing)
+}
+
+fn buildable_history_records(
+    recipe_ids: Vec<u64>, records: Vec<GraphicsHistoryRecord>, shaders: &HashMap<u64, Vec<u8>>,
+) -> (Vec<(u64, GraphicsHistoryRecord)>, usize) {
+    debug_assert_eq!(recipe_ids.len(), records.len());
+    let (ready, missing) = buildable(records.iter(), shaders);
+    let mut ready = ready.into_iter();
+    let mut next = ready.next();
+    let records = recipe_ids.into_iter().zip(records).enumerate().filter_map(|(i, record)| {
+        if next != Some(i) { return None }
+        next = ready.next();
+        Some(record)
+    }).collect();
+    (records, missing)
 }
 
 /// The counts of a graphics worker's last line (`graphics pipelines: 5 made, 1 failed; driver
@@ -4093,6 +4110,9 @@ mod tests {
         ];
         let shaders = HashMap::from([(shader_key(&vs), vs), (shader_key(&ps), ps), (shader_key(&ms), ms)]);
         assert_eq!(buildable(records.iter(), &shaders), (vec![0, 1, 4], 3));
+        let (selected, missing) = buildable_history_records((10..16).collect(), records.into(), &shaders);
+        assert_eq!(selected.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [10, 11, 14]);
+        assert_eq!(missing, 3);
     }
 
     #[test]
