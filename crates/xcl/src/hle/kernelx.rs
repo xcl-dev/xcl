@@ -695,16 +695,81 @@ pub unsafe fn runtime_free(p: usize, attrs: u64) {
     }
 }
 
-/// `void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD type, XALLOC_ATTRIBUTES attributes,
-/// DWORD protect)`: VirtualAlloc with an allocator's attributes – a graphics memory type is
-/// GPU-visible memory (as MEM_GRAPHICS: sparse VRAM pool).
-pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize, t: u32, attrs: u64, p: u32) -> *mut c_void {
-    let a = XAllocAttrs::decode(attrs);
+/// XMemVirtualAlloc's 4th argument: a flags word (not an allocator's XALLOC_ATTRIBUTES)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VirtualAllocFlags {
+    /// 0x1: CPU memory
+    pub cpu: bool,
+    /// 0x2 (with 0x1: 0x3): GPU-visible memory (it needs a graphics page protection)
+    pub graphics: bool,
+    /// 0x4 (0x7): graphics memory whose address the system picks below 4 GiB
+    pub below_4g: bool,
+    /// 0x10: charged to the tools pool (one pool here)
+    pub tools: bool,
+    /// 0x20: a reservation for physical-page mapping
+    pub mappable: bool,
+    /// bits 7–9: bandwidth required / preferred (not modelled)
+    pub bandwidth: u8,
+    /// bits 12–14, n = 1…7: the address must fit in 47 − n bits
+    pub address_bits: Option<u8>,
+    /// bits 40–63: a tag for tools
+    pub tag: u32,
+}
+
+impl VirtualAllocFlags {
+    pub fn decode(w: u64) -> Self {
+        let n = ((w >> 12) & 7) as u8;
+        VirtualAllocFlags {
+            cpu: w & 0x1 != 0,
+            graphics: w & 0x2 != 0,
+            below_4g: w & 0x4 != 0,
+            tools: w & 0x10 != 0,
+            mappable: w & 0x20 != 0,
+            bandwidth: ((w >> 7) & 7) as u8,
+            address_bits: (n != 0).then(|| 47 - n),
+            tag: (w >> 40) as u32,
+        }
+    }
+
+    /// The first address the memory must stay below (None: no limit).
+    pub fn limit(&self) -> Option<u64> {
+        let bits = if self.below_4g { Some(32) } else { self.address_bits };
+        bits.map(|b| 1u64 << b)
+    }
+}
+
+/// `XCL_TRACE_MEM`: every XMemVirtualAlloc call's flags word, decoded, with its result; and,
+/// once per run, a request with an address limit and whether its address fits (PR 2 places them).
+fn trace_virtual_alloc_flags(addr: usize, size: usize, w: u64, f: &VirtualAllocFlags, got: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LIMITED: AtomicUsize = AtomicUsize::new(0);
+    keep_last_error(|| {
+        if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_MEM").is_some()) {
+            crate::xlog_info!("mem: XMemVirtualAlloc({addr:#x}, {size:#x}) flags {w:#x} = {f:?} → {got:#x}");
+        }
+        if let Some(limit) = f.limit() {
+            if LIMITED.fetch_add(1, Ordering::Relaxed) == 0 {
+                let end = (got as u64).saturating_add(size as u64);
+                let fits = if got == 0 { "failed" } else if end <= limit { "fits" } else { "is above it: not placed yet" };
+                crate::xlog_info!("mem: XMemVirtualAlloc asks for an address below {limit:#x} (flags {w:#x}): {got:#x} + {size:#x} {fits}");
+            }
+        }
+    })
+}
+
+/// `void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD type, ULONG64 flags, DWORD protect)`:
+/// Keep the existing allocation routing for callers passing allocator attributes. The separate
+/// flags decode is only for tracing. In particular, bit 0x2 does not route large heaps to sparse VRAM.
+pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize, t: u32, flags: u64, p: u32) -> *mut c_void {
+    let f = VirtualAllocFlags::decode(flags);
+    let a = XAllocAttrs::decode(flags);
     let mut t = if a.memory_type != 0 { t | MEM_GRAPHICS } else { t };
     if a.memory_type != 0 && a.page_size == 2 {
         t |= 0x8000_0000;
     }
-    VirtualAlloc(addr, size, t, p)
+    let got = VirtualAlloc(addr, size, t, p);
+    trace_virtual_alloc_flags(addr as usize, size, flags, &f, got as usize);
+    got
 }
 
 /// Fast-path `VirtualQuery` / `VirtualQueryEx` / `XMemVirtualQuery` for a committed coherent
@@ -2316,6 +2381,51 @@ mod tests {
             let q = VirtualAlloc(std::ptr::null(), 0x10000, 0x3000, 0x04); // ordinary memory: Windows
             assert!(crate::gpu::uma::get().is_none_or(|u| !u.contains(q as usize)));
             assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn virtual_alloc_flags_decode() {
+        let d = VirtualAllocFlags::decode;
+        assert_eq!(d(0x1), VirtualAllocFlags { cpu: true, ..Default::default() });
+        assert_eq!(d(0x3), VirtualAllocFlags { cpu: true, graphics: true, ..Default::default() });
+        let low = d(0x7);
+        assert!(low.graphics && low.below_4g);
+        assert_eq!(low.limit(), Some(1 << 32));
+        let mappable = d(0x23);
+        assert!(mappable.graphics && mappable.mappable && !mappable.below_4g);
+        assert_eq!(mappable.limit(), None);
+        let bits40 = d(0x7001);
+        assert_eq!((bits40.cpu, bits40.graphics, bits40.address_bits), (true, false, Some(40)));
+        assert_eq!(bits40.limit(), Some(1 << 40));
+        assert_eq!(d(0x1001).address_bits, Some(46));
+        assert_eq!(d(0x180).bandwidth, 3);
+        let tagged = d((0x41_4243u64 << 40) | 0x11);
+        assert_eq!((tagged.tag, tagged.tools, tagged.cpu, tagged.graphics), (0x41_4243, true, true, false));
+    }
+
+    #[test]
+    fn virtual_alloc_graphics_flag_keeps_the_type() {
+        unsafe {
+            // a committed heap with the flags' graphics bit (0x283, as a title passes): plain
+            // memory as for VirtualAlloc with the same type, not the GPU-visible pool
+            let p = XMemVirtualAlloc(std::ptr::null(), 0x10000, 0x3000, 0x283, mem::PAGE_READWRITE);
+            assert!(!p.is_null());
+            *(p as *mut u64) = 0xABCD;
+            assert!(crate::gpu::uma::get().is_none_or(|u| !u.contains(p as usize)), "graphics flag made the heap GPU-visible");
+            assert_eq!(VirtualFree(p, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn virtual_alloc_preserves_legacy_graphics_routing() {
+        let Some(uma) = crate::gpu::uma::get() else { return };
+        unsafe {
+            let p = XMemVirtualAlloc(std::ptr::null(), 0x10000, 0x3000, 1 << 29, mem::PAGE_READWRITE);
+            assert!(!p.is_null());
+            let in_uma = uma.contains(p as usize);
+            assert_eq!(VirtualFree(p, 0, mem::MEM_RELEASE), 1);
+            assert!(in_uma, "legacy graphics memory type allocated outside UMA");
         }
     }
 

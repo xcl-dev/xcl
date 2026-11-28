@@ -425,7 +425,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     (read, write or execute, the address, some registers and the callers on the stack), before the
     title's own handlers see them – for a title whose crash filter ends the process without a trace.
   - `XCL_TRACE_MEM=1` (any value turns it on): the title's memory allocations of 64 KiB or more
-    are logged, the first 60 (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`). The same variable
+    are logged, the first 60 (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`). Each
+    `XMemVirtualAlloc` call also logs its decoded flags and result. The same variable
     also logs XCL's own allocations of 1 MB or more in the title's committed memory window, and
     the ones that fail.
   - `XCL_TRACE_IMPORTS`: logs the arguments and the result of every call of the imports it names.
