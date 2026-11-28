@@ -337,6 +337,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default. Expiry stops the title before later GPU work is submitted; it never treats elapsed
     time as proof that the waited-for work completed.
+  - On machines with less than 24 GiB of RAM, the coherent window (GPU-visible system
+    memory) is capped at an eighth of the RAM, at least 1 GiB; `XCL_COHERENT_MB` still sets
+    the size, and `XCL_COHERENT_AUTO_CAP=0` turns the automatic cap off.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
   Loading a cached shader without split pieces reuses the file buffer, avoiding a second
