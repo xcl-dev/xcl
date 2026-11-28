@@ -4928,6 +4928,30 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch_flags(this, x, y, z, flags);
 }
 
+/// The textures of the texture barriers in the `n` barrier groups at `groups` (list #146), in
+/// their order; groups and barrier arrays that are not readable memory are passed over.
+unsafe fn barrier_group_textures(n: u32, groups: *const c_void) -> Vec<usize> {
+    let mut out = Vec::new();
+    let count = (n as usize).min(256);
+    if count == 0 || groups.is_null() || !crate::gpu::shader::readable(groups as usize, count * std::mem::size_of::<D3D12_BARRIER_GROUP>()) {
+        return out;
+    }
+    for g in std::slice::from_raw_parts(groups as *const D3D12_BARRIER_GROUP, count) {
+        let m = (g.NumBarriers as usize).min(4096);
+        let p = g.Anonymous.pTextureBarriers;
+        if g.Type != D3D12_BARRIER_TYPE_TEXTURE || m == 0 || p.is_null() || !crate::gpu::shader::readable(p as usize, m * std::mem::size_of::<D3D12_TEXTURE_BARRIER>()) {
+            continue;
+        }
+        for b in std::slice::from_raw_parts(p, m) {
+            let r: usize = transmute_copy(&b.pResource);
+            if r != 0 && !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
 unsafe fn emit_uav_barrier_pc(this: *mut c_void) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4941,8 +4965,14 @@ unsafe fn emit_uav_barrier_pc(this: *mut c_void) {
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, barriers: *const c_void) {
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
+    // (a superseded target the title moves is used again: `placements`)
+    if super::placements::any_superseded() {
+        for r in barrier_group_textures(n, barriers) {
+            super::placements::note_use(r);
+        }
+    }
     emit_uav_barrier_pc(this);
 }
 
@@ -6668,6 +6698,8 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
+    // (a superseded target the title clears is used again: `placements`)
+    super::placements::note_dsv_use(dsv);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 
@@ -11727,6 +11759,36 @@ mod tests {
             console_heap::unregister(co);
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
+        }
+    }
+
+    /// List #146's groups: the textures of the texture barriers, each once, and nothing of the
+    /// buffer and global groups or of a group without an array.
+    #[test]
+    fn the_texture_barriers_of_barrier_groups_name_their_textures() {
+        unsafe {
+            let tex = |r: usize| {
+                let mut b: D3D12_TEXTURE_BARRIER = std::mem::zeroed();
+                std::ptr::write(&mut b.pResource as *mut _ as *mut usize, r);
+                b
+            };
+            let first = [tex(0x1000), tex(0), tex(0x2000)];
+            let second = [tex(0x2000), tex(0x3000)];
+            let mut buffer: D3D12_BUFFER_BARRIER = std::mem::zeroed();
+            std::ptr::write(&mut buffer.pResource as *mut _ as *mut usize, 0x9000);
+            let global: D3D12_GLOBAL_BARRIER = std::mem::zeroed();
+            let groups = [
+                D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 3, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: first.as_ptr() } },
+                D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_BUFFER, NumBarriers: 1, Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: &buffer } },
+                D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_GLOBAL, NumBarriers: 1, Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: &global } },
+                D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 2, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: second.as_ptr() } },
+                D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 4, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: std::ptr::null() } },
+            ];
+            let at = groups.as_ptr() as *const c_void;
+            assert_eq!(barrier_group_textures(5, at), vec![0x1000, 0x2000, 0x3000]);
+            assert_eq!(barrier_group_textures(3, at), vec![0x1000, 0x2000], "the groups past the count are not read");
+            assert!(barrier_group_textures(0, at).is_empty());
+            assert!(barrier_group_textures(5, std::ptr::null()).is_empty());
         }
     }
 }

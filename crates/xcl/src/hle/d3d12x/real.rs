@@ -2838,6 +2838,24 @@ fn note_mixed_copy() {
     }
 }
 
+/// RTVs or DSVs copied, destination and source ranges (start, length) walked in step: each
+/// destination names the target its source names, as if the view were made there
+/// (`present::rtv_resource`, `placements::note_dsv_use`).
+unsafe fn target_views_copied(dev: *mut c_void, ty: u32, dsts: &[(u64, u32)], srcs: &[(u64, u32)]) {
+    let rtv = ty == D3D12_DESCRIPTOR_HEAP_TYPE_RTV.0 as u32;
+    if !rtv && ty != D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+        return;
+    }
+    let inc = dev_increment_size_x(dev, ty) as u64;
+    for (dst, src, n) in super::depth_uav::pieces(dsts, srcs, inc) {
+        if rtv {
+            super::present::rtvs_copied(n, dst, src, inc);
+        } else {
+            super::placements::dsvs_copied(n, dst, src, inc);
+        }
+    }
+}
+
 /// #24 CopyDescriptorsSimple(n, dst, src, type)
 unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) {
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailViewDescriptor);
@@ -2854,6 +2872,7 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
     if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
         super::depth_uav::dsvs_copied(this, n, dst, src);
     }
+    target_views_copied(this, ty, &[(dst, n)], &[(src, n)]);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
 }
@@ -2874,6 +2893,12 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         }
         if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
             super::depth_uav::dsv_ranges_copied(this, nd, dsts, dsizes, ns, srcs, ssizes);
+        }
+        if (ty == D3D12_DESCRIPTOR_HEAP_TYPE_RTV.0 as u32 || ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32) && !dsts.is_null() && !srcs.is_null() {
+            let ranges = |starts: *const u64, sizes: *const u32, n: u32| -> Vec<(u64, u32)> {
+                (0..n as usize).map(|r| (*starts.add(r), if sizes.is_null() { 1 } else { *sizes.add(r) })).collect()
+            };
+            target_views_copied(this, ty, &ranges(dsts, dsizes, nd), &ranges(srcs, ssizes, ns));
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
@@ -3083,6 +3108,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     }
     let flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::placements::note_dsv(cpu as usize, res as usize);
     super::depth_uav::note_dsv(cpu as usize, res as usize, flags);
 }
 
@@ -10904,6 +10930,12 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::lut3d::wrote(r, false, || format!("ClearRenderTargetView {rtv:#x} to {:?}, {n} rects", color.as_ref()));
         }
     }
+    // (a superseded target the title clears is used again: `placements`)
+    if super::placements::any_superseded() {
+        if let Some(r) = super::present::rtv_resource(rtv) {
+            super::placements::note_use(r);
+        }
+    }
     f(this, rtv, color, n, rects)
 }
 
@@ -10917,6 +10949,17 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    // (a superseded target the title binds is used again: `placements`)
+    if super::placements::any_superseded() {
+        if !dsv.is_null() {
+            super::placements::note_dsv_use(*dsv);
+        }
+        for h in super::list_x::bound_render_targets(this) {
+            if let Some(r) = super::present::rtv_resource(h) {
+                super::placements::note_use(r);
+            }
+        }
+    }
     let _ = super::capture::op(this, || Some(super::capture::targets_op(this)));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -14655,6 +14698,245 @@ mod depth_uav_twin_tests {
             let rows: Vec<Vec<u8>> = (0..16).map(|y| std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * pitch), 16).to_vec()).collect();
             rb.Unmap(0, None);
             assert!(rows.iter().all(|r| r.iter().all(|&v| v == 0x5A)), "the twin was not cleared: {:x?}", &rows[0]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod superseded_target_tests {
+    use super::super::{device_x, late_release, list_x, present, vram};
+    use super::*;
+    use std::mem::ManuallyDrop;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    const K64: usize = 0x1_0000;
+
+    /// `obj` as the PC made it. The adapter's device is one object for the process, and a test
+    /// before this one may have left it adopted: what it makes then is a title's, and a title's
+    /// queue is kept for the process once it executes (`present::note_execute`).
+    unsafe fn pc<T: Interface>(obj: T) -> T {
+        let p = obj.as_raw();
+        if is_adopted(p) {
+            *(p as *mut usize) = *(*(p as *const *const usize)).sub(1);
+        }
+        obj
+    }
+
+    /// A device as a title's (the default adapter's, else WARP's; `XCL_ADAPTER=warp`: WARP's)
+    /// with a queue, a list and four RTV and DSV handles of the PC's.
+    struct Gpu {
+        dev: ID3D12Device,
+        queue: ID3D12CommandQueue,
+        _alloc: ID3D12CommandAllocator,
+        list: ID3D12GraphicsCommandList,
+        _heaps: [ID3D12DescriptorHeap; 2],
+        rtv: [usize; 4],
+        dsv: [usize; 4],
+    }
+
+    impl Gpu {
+        /// None: skipped, there is no device.
+        unsafe fn new() -> Option<Gpu> {
+            let warp_only = crate::gpu::adapter::Selector::from_env_or("auto") == crate::gpu::adapter::Selector::Warp;
+            let mut dev: Option<ID3D12Device> = None;
+            if warp_only || D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                dev = None;
+                if let Ok(warp) = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) {
+                    let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+                }
+            }
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return None;
+            };
+            // the view heaps, the queue and the list are the PC's; then the device as a title's
+            let heap = |ty| -> (ID3D12DescriptorHeap, [usize; 4]) {
+                let h: ID3D12DescriptorHeap = pc(dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 4, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 }).unwrap());
+                let (at, step) = (h.GetCPUDescriptorHandleForHeapStart().ptr, dev.GetDescriptorHandleIncrementSize(ty) as usize);
+                (h, std::array::from_fn(|k| at + k * step))
+            };
+            let ((rtvs, rtv), (dsvs, dsv)) = (heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV), heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV));
+            let queue: ID3D12CommandQueue = pc(dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap());
+            let alloc: ID3D12CommandAllocator = pc(dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap());
+            let list: ID3D12GraphicsCommandList = pc(dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap());
+            adopt(dev.as_raw(), Kind::Device);
+            Some(Gpu { dev, queue, _alloc: alloc, list, _heaps: [rtvs, dsvs], rtv, dsv })
+        }
+
+        unsafe fn mapped(&self, r: &ID3D12Resource) -> bool {
+            vram::mapped_tiles_for(self.dev.as_raw() as usize, r.as_raw() as usize).is_some()
+        }
+
+        /// A 512x512 target the title places at `va` (CreatePlacedResourceX) and a 128x128 one it
+        /// then places on the last of the first one's pages: the newer one supersedes the older,
+        /// whose tiles are off the shared pages when this returns. None: skipped, the adapter
+        /// makes no reserved texture of the format.
+        unsafe fn superseded(&self, va: usize, format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES) -> Option<(ID3D12Resource, ID3D12Resource)> {
+            let d = self.dev.as_raw();
+            let place = |va: usize, side: u32| {
+                let console = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: side as u64,
+                    Height: side,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut raw = std::ptr::null_mut();
+                let hr = device_x::create_placed_resource_x(d, va as u64, &console as *const _ as *const u8, state.0 as u32, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut raw);
+                assert!(hr >= 0 && !raw.is_null(), "a {side}x{side} target at {va:#x}: {hr:#x}");
+                ID3D12Resource::from_raw(raw)
+            };
+            let older = place(va, 512);
+            let Some((pages, _)) = vram::mapped_tiles_for(d as usize, older.as_raw() as usize).filter(|(pages, _)| pages.len() >= 2) else {
+                crate::gpu::recomp::runner::skip_test("no tiled resources");
+                return None;
+            };
+            let newer = place(va + (pages.len() - 1) * K64, 128);
+            // (its tiles leave once the queues are past the work submitted before: `late_release::hold_unmap`)
+            let start = Instant::now();
+            while self.mapped(&older) && start.elapsed() < Duration::from_secs(10) {
+                late_release::drain_known(true);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!self.mapped(&older), "the older target is superseded: its tiles are off the shared pages");
+            assert!(self.mapped(&newer));
+            Some((older, newer))
+        }
+
+        /// The list's own table back after the title's calls on it (`adopt`), then level 0 of
+        /// `res` (in state `before`) copied out and read: its rows of `row` bytes.
+        unsafe fn read_back(&self, res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, row: usize) -> Vec<u8> {
+            let l = self.list.as_raw();
+            *(l as *mut usize) = *(*(l as *const *const usize)).sub(1);
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            self.dev.GetCopyableFootprints(&res.GetDesc(), 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+            let buffer = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            self.dev
+                .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+                .expect("readback buffer");
+            let rb = rb.unwrap();
+            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(res),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: before,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    }),
+                },
+            }]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            self.list.Close().expect("close list");
+            // (as a title's submit: the queue waits for the tile mappings made so far)
+            vram::before_execute(&self.queue);
+            self.queue.ExecuteCommandLists(&[Some(self.list.cast().unwrap())]);
+            let fence: ID3D12Fence = self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            self.queue.Signal(&fence, 1).expect("signal");
+            crate::gpu::fence::wait(&fence, 1, &self.dev, None, 5000).expect("the list completes");
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).expect("map readback");
+            let pitch = fp.Footprint.RowPitch as usize;
+            let rows = (0..fp.Footprint.Height as usize).flat_map(|y| std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * pitch), row).to_vec()).collect();
+            rb.Unmap(0, None);
+            rows
+        }
+    }
+
+    /// A render target under a newer placement gets its tiles back when the title binds it
+    /// (OMSetRenderTargets, also through an RTV it copied: CopyDescriptorsSimple), clears it
+    /// (ClearRenderTargetView) or names it in a texture barrier of list #146's groups, and the
+    /// clear is in it. Before, only a legacy barrier or a copy gave them back: the target stayed
+    /// without tiles, what was drawn to it was dropped.
+    #[test]
+    fn gpu_a_superseded_render_target_the_title_binds_clears_or_moves_is_mapped_again() {
+        let _vram = vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(g) = Gpu::new() else { return };
+            let at = 0x13_5e00_0000usize;
+            let target = |va| g.superseded(va, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            let Some((bound, _b)) = target(at) else { return };
+            let Some((cleared, _c)) = target(at + (2 << 20)) else { return };
+            let Some((moved, _m)) = target(at + (4 << 20)) else { return };
+            let Some((copied, _k)) = target(at + (6 << 20)) else { return };
+            let d = g.dev.as_raw();
+            dev_create_rtv(d, bound.as_raw(), std::ptr::null(), g.rtv[0]);
+            dev_create_rtv(d, cleared.as_raw(), std::ptr::null(), g.rtv[1]);
+            dev_create_rtv(d, copied.as_raw(), std::ptr::null(), g.rtv[2]);
+            dev_copy_descriptors_simple_x(d, 1, g.rtv[3] as u64, g.rtv[2] as u64, D3D12_DESCRIPTOR_HEAP_TYPE_RTV.0 as u32);
+
+            // the title's calls, on the adopted list
+            let l = g.list.as_raw();
+            adopt(l, Kind::CommandList);
+            cl_om_set_render_targets(l, 2, [g.rtv[0], g.rtv[3]].as_ptr(), 0, std::ptr::null());
+            cl_clear_rtv(l, g.rtv[1], &[0.25; 4], 0, std::ptr::null());
+            let mut barrier: D3D12_TEXTURE_BARRIER = std::mem::zeroed();
+            std::ptr::write(&mut barrier.pResource as *mut _ as *mut usize, moved.as_raw() as usize);
+            let group = D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 1, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: &barrier } };
+            list_x::uav_barrier_x(l, 1, &group as *const _ as *const c_void);
+            let uses = [("OMSetRenderTargets", &bound), ("OMSetRenderTargets with a copied RTV", &copied), ("ClearRenderTargetView", &cleared), ("a texture barrier in list #146's groups", &moved)];
+            let left: Vec<&str> = uses.into_iter().filter(|(_, r)| !g.mapped(r)).map(|(what, _)| what).collect();
+            assert!(left.is_empty(), "still without tiles after {left:?}");
+
+            let got = g.read_back(&cleared, D3D12_RESOURCE_STATE_RENDER_TARGET, 512 * 4);
+            assert!(got.chunks_exact(4).all(|t| f32::from_le_bytes(t.try_into().unwrap()) == 0.25), "the clear is not in the target: {:x?}", &got[..8]);
+            for h in g.rtv {
+                present::note_rtv(h, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// A depth buffer under a newer placement gets its tiles back when the title binds it
+    /// (OMSetRenderTargets) or clears it (ClearDepthStencilView, also through a DSV it copied:
+    /// CopyDescriptors), and the clear is in it.
+    #[test]
+    fn gpu_a_superseded_depth_buffer_the_title_binds_or_clears_is_mapped_again() {
+        let _vram = vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(g) = Gpu::new() else { return };
+            let at = 0x13_6e00_0000usize;
+            let buffer = |va| g.superseded(va, DXGI_FORMAT_D16_UNORM, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            let Some((bound, _b)) = buffer(at) else { return };
+            let Some((cleared, _c)) = buffer(at + (2 << 20)) else { return };
+            let Some((copied, _k)) = buffer(at + (4 << 20)) else { return };
+            let d = g.dev.as_raw();
+            let view = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D16_UNORM, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() };
+            dev_create_dsv_x(d, bound.as_raw(), &view, g.dsv[0] as u64);
+            dev_create_dsv_x(d, cleared.as_raw(), &view, g.dsv[1] as u64);
+            dev_create_dsv_x(d, copied.as_raw(), &view, g.dsv[2] as u64);
+            let (to, from) = (g.dsv[3] as u64, g.dsv[2] as u64);
+            dev_copy_descriptors_x(d, 1, &to, std::ptr::null(), 1, &from, std::ptr::null(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32);
+
+            // the title's calls, on the adopted list
+            let l = g.list.as_raw();
+            adopt(l, Kind::CommandList);
+            cl_om_set_render_targets(l, 0, std::ptr::null(), 0, &g.dsv[0]);
+            list_x::clear_depth_stencil_x(l, g.dsv[1], D3D12_CLEAR_FLAG_DEPTH.0 as u32, 1.0, 0, 0, std::ptr::null());
+            list_x::clear_depth_stencil_x(l, g.dsv[3], D3D12_CLEAR_FLAG_DEPTH.0 as u32, 1.0, 0, 0, std::ptr::null());
+            let left: Vec<&str> = [("OMSetRenderTargets", &bound), ("ClearDepthStencilView", &cleared), ("ClearDepthStencilView with a copied DSV", &copied)].into_iter().filter(|(_, r)| !g.mapped(r)).map(|(what, _)| what).collect();
+            assert!(left.is_empty(), "still without tiles after {left:?}");
+
+            let got = g.read_back(&cleared, D3D12_RESOURCE_STATE_DEPTH_WRITE, 512 * 2);
+            assert!(got.iter().all(|&b| b == 0xFF), "the clear is not in the buffer: {:x?}", &got[..8]);
         }
     }
 }

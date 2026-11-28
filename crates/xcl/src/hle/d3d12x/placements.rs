@@ -9,8 +9,10 @@
 //! A placement over other pages of a live target supersedes it (`supersedes`; `XCL_PLACE_RETIRE=0`
 //! turns it off): what is uploaded into or drawn to the newer one then no longer shows in the
 //! older one's tiles. Its tiles leave the shared pages once the queues are past the work submitted
-//! before (`late_release::hold_unmap`), and come back when the title uses it again (a barrier or a
-//! copy of it: `note_use`) or releases the newer ones over it while it still holds it.
+//! before (`late_release::hold_unmap`), and come back when the title uses it again (`note_use`: a
+//! barrier of it, also a texture barrier in list #146's groups; a copy of it; its view bound as a
+//! render target or depth buffer, or cleared) or releases the newer ones over it while it still
+//! holds it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
@@ -563,11 +565,97 @@ pub(super) fn note_use(res: usize) {
     drop(held);
 }
 
+/// Whether the title holds superseded targets: with none a use has nothing to map again, and the
+/// callers that have to look for the texture first (`note_dsv_use`, list #146's groups) do not.
+pub(super) fn any_superseded() -> bool {
+    SUPERSEDED.load(Ordering::Relaxed) != 0
+}
+
+/// DSV handle → the placed texture it names (`note_dsv`). The view is made long before a newer
+/// placement supersedes its texture, so the handles of all placed ones are kept; an entry whose
+/// texture is gone names no live placement and does nothing (`Registry::use_again`).
+static DSVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// CreateDepthStencilView of `res` at `handle`: kept when `res` is a placed texture.
+pub(super) fn note_dsv(handle: usize, res: usize) {
+    let placed = res != 0 && REGISTRY.lock().unwrap().as_ref().is_some_and(|r| r.live.contains_key(&res));
+    let mut g = DSVS.lock().unwrap();
+    if placed {
+        g.get_or_insert_with(HashMap::new).insert(handle, res);
+    } else if let Some(m) = g.as_mut() {
+        m.remove(&handle);
+    }
+}
+
+/// `n` DSVs copied from `src` to `dst` (handles `inc` apart): each destination names the placed
+/// texture its source names, or none.
+pub(super) fn dsvs_copied(n: u32, dst: u64, src: u64, inc: u64) {
+    let mut g = DSVS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    for k in 0..n as u64 {
+        let to = (dst + k * inc) as usize;
+        match m.get(&((src + k * inc) as usize)).copied() {
+            Some(res) => m.insert(to, res),
+            None => m.remove(&to),
+        };
+    }
+}
+
+/// The placed texture the DSV at `handle` names.
+fn dsv_texture(handle: usize) -> Option<usize> {
+    DSVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
+/// The title binds or clears the depth buffer of the DSV at `handle`: a use of it (`note_use`).
+pub(super) fn note_dsv_use(handle: usize) {
+    if !any_superseded() {
+        return;
+    }
+    if let Some(res) = dsv_texture(handle) {
+        note_use(res);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const K64: usize = 0x1_0000;
+
+    /// A DSV is kept for a placed texture only, and a handle written again (made there, or
+    /// copied there) names the new one.
+    #[test]
+    fn a_dsv_handle_names_the_placed_texture_it_was_last_made_of() {
+        // (addresses and handles no other test uses: the registry and the table are the module's)
+        let (a, b, other) = (0x7e57_0000_1000usize, 0x7e57_0000_2000usize, 0x7e57_0000_3000usize);
+        let (h1, h2) = (0x7e57_d000usize, 0x7e57_d020usize);
+        {
+            let mut g = REGISTRY.lock().unwrap();
+            let r = g.get_or_insert_with(Registry::default);
+            r.place(a, 0x7e57_4000_0000, (0x7e57_4000_0000, 0x7e57_4000_0000 + 6 * K64), Backing::Pages(0x7e57), Kind::Target, Desc::default(), Instant::now(), false, false);
+            r.place(b, 0x7e57_5000_0000, (0x7e57_5000_0000, 0x7e57_5000_0000 + 8 * K64), Backing::Pages(0x7e57), Kind::Target, Desc::default(), Instant::now(), false, false);
+        }
+        note_dsv(h1, a);
+        note_dsv(h2, other);
+        assert_eq!((dsv_texture(h1), dsv_texture(h2)), (Some(a), None), "a view of a texture that is not placed is not kept");
+        note_dsv(h1, b);
+        assert_eq!(dsv_texture(h1), Some(b));
+        // (copies: two handles 0x20 apart from h1, then from a handle that names nothing)
+        let (h3, nothing) = (0x7e57_d100usize, 0x7e57_d200usize);
+        note_dsv(h2, a);
+        dsvs_copied(2, h3 as u64, h1 as u64, 0x20);
+        assert_eq!((dsv_texture(h3), dsv_texture(h3 + 0x20)), (Some(b), Some(a)));
+        dsvs_copied(1, h3 as u64, nothing as u64, 0x20);
+        assert_eq!((dsv_texture(h3), dsv_texture(h3 + 0x20)), (None, Some(a)), "a copy of a view that names no placed texture");
+        note_dsv(h2, other);
+        note_dsv(h3 + 0x20, other);
+        note_dsv(h1, other);
+        assert_eq!(dsv_texture(h1), None, "the handle names a texture that is not placed now");
+        let mut g = REGISTRY.lock().unwrap();
+        let r = g.as_mut().unwrap();
+        r.remove(a);
+        r.remove(b);
+    }
     const MIB: usize = 1 << 20;
 
     /// A placement looked at, not retiring: (its sequence number, its cases).
