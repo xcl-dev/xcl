@@ -104,6 +104,9 @@ impl Init {
         s.m.set_block(self.entry);
         let i32 = s.m.i32();
         let p = s.m.alloca(i32, 4);
+        // The slot lives in entry, but a DispatchX EXEC mask is defined at the
+        // prologue join. Initialize there so the store sees the selected mask.
+        s.m.set_block(s.m.def_block(v).unwrap_or(self.entry));
         s.m.store(p, v, 4);
         s.m.set_block(cur);
         s.m.set_insert_before_term(before);

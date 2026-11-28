@@ -3212,6 +3212,38 @@ fn gpu_static_samplers_from_constants_in_code() {
         assert_eq!([fl(10), fl(11), fl(12), fl(13)], [2.0, 0.0, 2.0, 1.0], "lane {l}: static point sampler");
         assert_eq!([fl(20), fl(21), fl(22), fl(23)], [1.5, 0.0, 1.5, 1.0], "lane {l}: static linear sampler");
     }
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32");
+    }
+    // The compute prologue branches on DispatchX thread limits. Both sampler handles
+    // must dominate their uses on either path, including lanes masked off at entry.
+    let mut compute = vec![
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 8), ("SRC0", 131), ("VSRC1", 0)], None), // lane * 8 bytes
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 9), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 0), ("SRC0", 255)], Some(f(0.5))),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", 255)], Some(f(0.125))),
+    ];
+    compute.extend(list);
+    compute.extend([
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", V + 20)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", vec![("ADDR", 8), ("DATA", 10), ("SADDR", 0x7D)], None),
+    ]);
+    let refs: Vec<_> = compute.iter().map(|(n, e, fields, literal)| (*n, *e, fields.as_slice(), *literal)).collect();
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 24, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let options = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let translated = crate::gpu::dxil::kernel::translate_compute(&prog(&refs), options, &cs).unwrap();
+    assert_eq!(translated.static_samplers, [(point, false), (linear, false)]);
+    let sentinel = 0xa5a5_5a5a;
+    let initial = [sentinel; 64];
+    for (limit, active) in [(0, 32), (17, 17)] {
+        st.sgpr[super::IO_THREAD_LIMIT[0]] = limit;
+        let result = runner::run_with_statics(&translated.dxil, &st, &initial, &tex, &[], &translated.static_samplers).unwrap();
+        let mut expected = initial;
+        for lane in expected[..active * 2].chunks_exact_mut(2) {
+            lane.copy_from_slice(&[f(2.0), f(1.5)]);
+        }
+        assert_eq!(result.mem, expected, "DispatchX thread limit {limit}");
+    }
 }
 
 /// A static sampler's S# word that the compiler writes bit-reversed (`s_brev_b32 s26, 40` is
