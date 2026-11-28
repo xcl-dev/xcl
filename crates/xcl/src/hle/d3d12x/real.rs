@@ -6979,8 +6979,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     };
     let mut samplers = vs_c.samplers;
     let vs_dxil = vs_c.dxil;
+    let rt32 = rt32_mask_d3d12(d.NumRenderTargets, &d.RTVFormats);
     let ps_dxil = match shader_bytes(&d.PS) {
-        Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
+        Some(p) if is_console(p) => match crate::gpu::recomp::pso::console_ps_to_dxil_for(p, samplers.len() as u32, split, rt32) {
             Ok(b) => {
                 samplers.extend(b.samplers);
                 Some(b.dxil)
@@ -8132,12 +8133,35 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 #[allow(dead_code)] // Two-pass identities are consumed by the next stacked cache stage.
 mod two_pass_identity;
 
-/// The console PS of a two-pass pipeline (a PC PS passes as it is).
+/// Bitmask of render targets 0..8 whose D3D12 format has 32-bit per-channel components.
+fn rt32_mask_d3d12(count: u32, formats: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT]) -> u8 {
+    let mut raw = [0u32; 8];
+    let n = (count as usize).min(formats.len()).min(8);
+    for i in 0..n {
+        raw[i] = formats[i].0 as u32;
+    }
+    crate::gpu::recomp::rt32_mask_from_formats(&raw[..n])
+}
+
+/// Extract PC-mapped render target formats and count from a PSO subobject stream.
+fn stream_rt_formats(subs: &[(u32, &[u8])]) -> (u32, [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8]) {
+    let mut rt_count = 0u32;
+    let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
+    if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
+        for k in 0..8 {
+            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+            rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
+        rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
+    }
+    (rt_count, rt_formats)
+}
+
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
-fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool, rt32_mask: u8) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
+    use crate::gpu::recomp::pso::{console_ps_to_dxil_for, is_console};
     match ps {
-        Some(p) if is_console(p) => console_to_dxil_for(p, Stage::Pixel, 0, split_wave64).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
+        Some(p) if is_console(p) => console_ps_to_dxil_for(p, 0, split_wave64, rt32_mask).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
         Some(p) => Ok((Some(p.to_vec()), Vec::new())),
         None => Ok((None, Vec::new())),
     }
@@ -8428,7 +8452,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let console_ps = ps;
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
+    let (rt_count, rt_formats) = stream_rt_formats(&subs);
+    let rt32 = rt32_mask_d3d12(rt_count, &rt_formats);
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this), rt32)) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -8442,17 +8468,6 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
-    // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
-    // integer RTVs regardless of subobject order in the stream.
-    let mut rt_count = 0u32;
-    let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
-    if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
-        for k in 0..8 {
-            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
-            rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
-        }
-        rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
-    }
     for (ty, payload) in &subs {
         let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
@@ -8492,9 +8507,10 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let rt32 = rt32_mask_d3d12(d.NumRenderTargets, &d.RTVFormats);
     let (tp, (ps, ps_samplers)) = match (
         crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
-        two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
+        two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this), rt32),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -9288,8 +9304,10 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
     let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) { Ok(b) => b, Err(e) => { note_translation_error(format!("VS: {e}")); return Some(E_INVALIDARG); } };
     let mut samplers = vs_c.samplers;
     let console_ps = subs.iter().find(|s| s.0 == 2).and_then(|s| payload_shader(s.1));
+    let (rt_count, rt_formats) = stream_rt_formats(&subs);
+    let rt32 = rt32_mask_d3d12(rt_count, &rt_formats);
     let ps_dxil = match console_ps {
-        Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
+        Some(p) if is_console(p) => match crate::gpu::recomp::pso::console_ps_to_dxil_for(p, samplers.len() as u32, split, rt32) {
             Ok(b) => { samplers.extend(b.samplers); Some(b.dxil) }
             Err(e) => { note_translation_error(format!("PS: {e}")); return Some(E_INVALIDARG); }
         },

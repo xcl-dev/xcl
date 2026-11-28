@@ -15,6 +15,50 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
 }
 
 #[test]
+fn ps_32bit_rt_export_patches_pkrtz_in_both_backends() {
+    use crate::gpu::dxbc::SigElement as S;
+    use crate::gpu::recomp::{translate, Mode, Options, PsInterface};
+    let el = |name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8| S {
+        name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0,
+    };
+    const V: u64 = 256;
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 242)], None), // 1.0f
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 128)], None), // 0
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(0x781d_3718)),
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", &[("VDST", 0), ("SRC0", V + 2), ("VSRC1", 3)], None),
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 3), ("VSRC1", 2)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("COMPR", 1), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 0), ("VSRC3", 0)], None),
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 6), ("VSRC1", 6)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 1), ("EN", 0x3), ("COMPR", 1), ("DONE", 1), ("VM", 1), ("VSRC0", 6), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0)], None),
+    ]);
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![
+            el("SV_Target", 0, 64, 3, 0, 0xF),
+            el("SV_Target", 1, 64, 1, 1, 0x1),
+        ],
+        input_ena: 0x2,
+        attrs: None,
+    };
+
+    let unpatched = translate(&code, &Options { mode: Mode::Pixel(psi.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(unpatched.hlsl.contains("xo.t1[0] = (v6 & 0xFFFFu);"), "unpatched HLSL:\n{}", unpatched.hlsl);
+
+    let patched = translate(&code, &Options { mode: Mode::Pixel(psi.clone()), wave64: false, ps_rt32_mask: 1 << 1, ..Default::default() }).unwrap();
+    assert!(patched.hlsl.contains("xo.t0[0] = f16tof32("), "RT0 must remain compressed:\n{}", patched.hlsl);
+    assert!(patched.hlsl.contains("xo.t1[0] = v6;"), "RT1 must export raw 32-bit v6:\n{}", patched.hlsl);
+    assert!(!patched.hlsl.contains("v6 = f16_rtz("), "RT1 pkrtz must be NOPed so v6 keeps its bits:\n{}", patched.hlsl);
+
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_pixel_rt32(&code, ko, &psi, 1 << 1)
+        .unwrap_or_else(|e| panic!("direct DXIL PS rt32 failed: {}", &e[..e.len().min(800)]));
+    super::validate::validate(&k.dxil).expect("valid direct DXIL for rt32 PS");
+    let dis = super::validate::disassemble(&k.dxil).expect("disassemble direct DXIL");
+    assert!(dis.contains("2015180568"), "direct DXIL must store literal 0x781d3718 (2015180568) to RT1:\n{dis}");
+}
+
+#[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
