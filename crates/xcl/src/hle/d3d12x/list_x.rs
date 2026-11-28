@@ -1429,6 +1429,21 @@ struct QueueInfo {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
+/// Closed standbys from `reserve_closed_segment` → the private allocator their empty recording is
+/// on, kept while the list may be submitted with it. Not in `LISTS`: the allocator's last Release
+/// takes `LISTS` (`on_allocator_release`), so it is always dropped with no lock held.
+static STANDBY_ALLOCS: Mutex<Option<HashMap<usize, ID3D12CommandAllocator>>> = Mutex::new(None);
+
+/// Forget `list`'s standby allocator (its recording is gone, or so is the list). `in_flight`: the
+/// GPU may still run that recording, so the allocator is leaked rather than released.
+fn drop_standby_alloc(list: usize) {
+    let a = STANDBY_ALLOCS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
+    if let Some(a) = a {
+        if unsafe { super::alloc_pool::allocator_in_flight(a.as_raw() as usize) } {
+            std::mem::forget(a);
+        }
+    }
+}
 static POISONED_EVER: AtomicBool = AtomicBool::new(false);
 
 /// `f` with what is kept of every list.
@@ -1865,6 +1880,7 @@ pub(super) fn on_release(list: usize) {
     release_copy_scratch(list);
     super::real::dispatch_chain::list_reset(list);
     super::lut3d::list_reset(list);
+    drop_standby_alloc(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
         if old.has_sparse() {
@@ -4754,8 +4770,16 @@ unsafe fn reserve_closed_segment(
     let close_is_hooked = false;
     if !close_is_hooked {
         if let Some(made) = real::create_closed_pc_command_list(dev.as_raw(), ty) {
-            note_reserved_closed(made as usize, ty);
-            return Some(made);
+            // A list from CreateCommandList1 that was never recorded is not executable: submitting
+            // it removes the device (DXGI_ERROR_INVALID_CALL). The failed-split route submits this
+            // standby, so record it empty once on a private allocator first.
+            if let Some(alloc) = record_empty_closed(wrapper, dev, made, ty) {
+                note_reserved_closed(made as usize, ty);
+                let old = STANDBY_ALLOCS.lock().unwrap().get_or_insert_with(HashMap::new).insert(made as usize, alloc);
+                drop(old);
+                return Some(made);
+            }
+            pc::<unsafe extern "system" fn(*mut c_void) -> u32>(made, 2)(made);
         }
     }
     let temp: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
@@ -4777,6 +4801,24 @@ unsafe fn reserve_closed_segment(
     }
 }
 
+/// Reset `made` (closed, never recorded) on a private allocator and Close it with nothing recorded,
+/// so that it can be submitted. Returns that allocator, which must outlive the recording.
+unsafe fn record_empty_closed(wrapper: *mut c_void, dev: &ID3D12Device, made: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<ID3D12CommandAllocator> {
+    let Ok(temp) = dev.CreateCommandAllocator::<ID3D12CommandAllocator>(ty) else {
+        return None;
+    };
+    if !real::is_adopted(temp.as_raw()) {
+        real::adopt(temp.as_raw(), real::Kind::CommandAllocator);
+    }
+    let ext = *(made as *const usize);
+    let reset = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(made, PC_RESET)(made, temp.as_raw() as usize, 0);
+    // (the PC Reset may put the runtime's vtable back: restore ours before the Close)
+    real::preserve_vtable(made, ext);
+    let ok = reset >= 0 && segment_close(wrapper, made) >= 0;
+    real::preserve_vtable(made, ext);
+    ok.then_some(temp)
+}
+
 /// A closed standby must not look recordable if its Reset as the continuation later fails.
 fn note_reserved_closed(list: usize, ty: D3D12_COMMAND_LIST_TYPE) {
     clear_segment_state(list);
@@ -4793,6 +4835,8 @@ unsafe fn reset_reserved_segment(list: *mut c_void, alloc: usize, ty: D3D12_COMM
     });
     real::preserve_vtable(list, ext);
     if hr >= 0 {
+        // (it records on the title's allocator now, not on its standby one)
+        drop_standby_alloc(list as usize);
         reset_copy_scratch(list);
         true
     } else {
@@ -7471,6 +7515,38 @@ mod tests {
             fence.Signal(3).unwrap();
             let s = internal_waits_summary();
             assert!(!s.contains("test wait 7d1c"), "{s}");
+        }
+    }
+
+    /// The closed standby the failed-split route submits must be executable: a list straight from
+    /// CreateCommandList1 was never recorded and removes the device when submitted.
+    #[test]
+    fn a_reserved_closed_standby_can_be_submitted() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let Some(standby) = reserve_closed_segment(0x5ba5_d000 as *mut c_void, &dev, ty) else {
+                crate::gpu::recomp::runner::skip_test("no ID3D12Device4");
+                return;
+            };
+            let list = ID3D12CommandList::from_raw_borrowed(&standby).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.clone())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            let t = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 && t.elapsed().as_secs() < 5 && dev.GetDeviceRemovedReason().is_ok() {
+                std::thread::yield_now();
+            }
+            assert!(dev.GetDeviceRemovedReason().is_ok(), "submitting the standby removed the device: {:?}", dev.GetDeviceRemovedReason());
+            assert!(fence.GetCompletedValue() >= 1);
         }
     }
 
