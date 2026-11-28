@@ -11225,7 +11225,10 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 }
             }
         },
-        15 if is_fence(a1) => super::queue_submit::with(this as usize, || {
+        // the newer layout's #37 WaitX(fence, value, top-of-pipe sync parameters): a Wait whose
+        // last argument only picks which parts of the command processor wait and what is
+        // flushed after, which the PC's Wait does not need
+        w if is_fence(a1) && (w == 15 || (shifted && w == 35)) => super::queue_submit::with(this as usize, || {
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(PC_WAIT));
             let hr = f(this, a1, a2);
             if hr >= 0 {
@@ -11263,6 +11266,10 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
         29 if crate::hle::kernelx::mirrors::page_mappings() => q_copy_page_mappings(a1 as u32, a2, a3, a4 as u32) as u32 as usize,
+        // the newer layout's #34 Signal2X(fence, value, bottom-of-pipe sync parameters, top-of-pipe
+        // sync parameters): SignalX with the cache flushes given by pointer. As a stub it left
+        // the fence unsignalled.
+        32 if shifted && is_fence(a1) => q_signal_x(this, a1 as *mut c_void, a2 as u64, 0) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -11307,7 +11314,7 @@ macro_rules! queue_slots {
         }),*];
     };
 }
-queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
+queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37);
 
 /// The calls of the queue's page-mapping method recorded so far and what they did, summed, and
 /// when their line was logged last.
@@ -12720,10 +12727,14 @@ mod queue_tests {
         }
     }
 
+    /// Held by the tests that set the queue layout (`QUEUE_SHIFTED` / `QUEUE_OLDER`).
+    static QUEUE_LAYOUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
     /// layout) it is GetDesc with all 16.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        let _layout = QUEUE_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
         const SLOT: usize = size_of::<usize>();
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
@@ -12755,6 +12766,61 @@ mod queue_tests {
             let mut out = [0xAAAA_AAAAu32; 4];
             queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
+        }
+    }
+
+    /// The newer layout's queue #34 Signal2X and #37 WaitX reach the PC's Signal and Wait with the
+    /// fence and value; the older layout's #32 / #35 reach neither.
+    #[test]
+    fn newer_queue_signal2x_and_waitx_reach_signal_and_wait() {
+        static SIGNALLED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        static WAITED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn pc_signal(_: *mut c_void, fence: usize, value: usize) -> i32 {
+            SIGNALLED.lock().unwrap().push((fence, value));
+            0
+        }
+        unsafe extern "system" fn pc_wait(_: *mut c_void, fence: usize, value: usize) -> i32 {
+            WAITED.lock().unwrap().push((fence, value));
+            0
+        }
+        let _layout = QUEUE_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
+        const SLOT: usize = size_of::<usize>();
+        let mut pc = [0usize; 32];
+        pc[14] = pc_signal as usize;
+        pc[15] = pc_wait as usize;
+        let mut ext = [0usize; 1 + size_of::<ID3D12CommandQueue_Vtbl>() / SLOT];
+        ext[0] = pc.as_ptr() as usize;
+        // the Signal path asks the queue for its type
+        ext[1 + offset_of!(ID3D12CommandQueue_Vtbl, GetDesc) / SLOT] = get_desc as usize;
+        let vtbl = unsafe { ext.as_ptr().add(1) } as usize;
+        let mut obj = [vtbl];
+        let this = obj.as_mut_ptr() as *mut c_void;
+        let mut fence_vtbl = [0usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtbl[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fake_fence_completed as usize;
+        let fake_fence = FakeFence { vtable: fence_vtbl.as_ptr() };
+        let fence = (&fake_fence as *const FakeFence) as usize;
+        let _cleanup = Cleanup { fence, queue: this as usize };
+        FENCES.write().unwrap().push(fence);
+        let sync = [0u32; 8];
+        unsafe {
+            // the older layout: #32 / #35 are not Signal / Wait
+            QUEUE_SHIFTED.store(false, Ordering::Release);
+            QUEUE_OLDER.store(true, Ordering::Release);
+            queue_dispatch(32, this, fence, 5, sync.as_ptr() as usize, sync.as_ptr() as usize);
+            queue_dispatch(35, this, fence, 6, sync.as_ptr() as usize, 0);
+            assert!(SIGNALLED.lock().unwrap().is_empty() && WAITED.lock().unwrap().is_empty(), "older #32 / #35 are not Signal / Wait");
+
+            QUEUE_OLDER.store(false, Ordering::Release);
+            QUEUE_SHIFTED.store(true, Ordering::Release);
+            assert_eq!(queue_dispatch(34, this, fence, 7, sync.as_ptr() as usize, sync.as_ptr() as usize), 0);
+            assert_eq!(*SIGNALLED.lock().unwrap(), vec![(fence, 7)], "#34 signals the fence with its value");
+            assert_eq!(queue_dispatch(37, this, fence, 8, sync.as_ptr() as usize, 0), 0);
+            assert_eq!(*WAITED.lock().unwrap(), vec![(fence, 8)], "#37 waits on the fence for its value");
+            // not a fence: still the stub, nothing called
+            queue_dispatch(34, this, 0x1000, 9, 0, 0);
+            queue_dispatch(37, this, 0x1000, 9, 0, 0);
+            assert_eq!(SIGNALLED.lock().unwrap().len() + WAITED.lock().unwrap().len(), 2);
+            QUEUE_SHIFTED.store(false, Ordering::Release);
         }
     }
 
