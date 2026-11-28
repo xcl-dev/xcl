@@ -6160,8 +6160,13 @@ mod tests {
         assert!(!gate.failed());
     }
 
+    /// Tests that sweep the process's retiring generations: a concurrent sweep may hold another
+    /// test's retired pin a moment after its batch has left the list.
+    static RETIRING_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn receipted_title_submission_retires_the_exact_generation_on_completion() {
+        let _serial = RETIRING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let standin = 0x7E57_B027usize;
         let vtable = Box::leak(Box::new([0usize, generation_add_ref as usize, generation_release as usize]));
         let native = Box::leak(Box::new(ReentrantGenerationPso {
@@ -6190,6 +6195,55 @@ mod tests {
         completed.store(1, Ordering::Release);
         super::super::pso_async::sweep_native_generations_for_test();
         assert_eq!(native.refs.load(Ordering::Relaxed), 0, "completed receipt retained its generation");
+    }
+
+    /// Stand-in `standin`'s one-shot generation pinned by an executed submission still in
+    /// flight; the title has not released the stand-in yet.
+    fn pinned_in_flight(standin: usize) -> (&'static ReentrantGenerationPso, &'static AtomicU64) {
+        let vtable = Box::leak(Box::new([0usize, generation_add_ref as usize, generation_release as usize]));
+        let native = Box::leak(Box::new(ReentrantGenerationPso {
+            vtable: vtable.as_ptr(), refs: AtomicUsize::new(1), release_outside_lists: std::ptr::null(),
+        }));
+        let raw = native as *mut ReentrantGenerationPso as usize;
+        super::super::pso_async::submit_lazy(standin, false, Box::new(move || raw), 0);
+        assert_eq!(super::super::pso_async::resolve_wait(standin), raw);
+        let resolution = super::super::pso_async::begin_pipeline_resolution(standin).unwrap();
+        let super::super::pso_async::PipelineChoice::Available { generation, .. } = resolution.resolve_for_emission()
+            else { panic!("completed one-shot generation unavailable") };
+        let (receipt, completed) = super::super::alloc_pool::submission_receipt_for_test(0, 1);
+        let executed = super::super::alloc_pool::ReceiptedSubmission::Executed(receipt);
+        assert!(finish_title_submission(executed, None, false, true, std::iter::once(&generation)));
+        (native, completed)
+    }
+
+    /// A later submission whose receipt is already complete still sweeps the batches before it:
+    /// otherwise a generation pinned by an in-flight submission stays pinned for good when every
+    /// submission after it has completed by the time it is retired.
+    #[test]
+    fn a_completed_later_submission_retires_earlier_generations() {
+        let _serial = RETIRING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_B029usize;
+        let (native, completed) = pinned_in_flight(standin);
+        super::super::pso_async::release(super::super::pso_async::released(standin));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 1, "in-flight receipt released its generation");
+
+        completed.store(1, Ordering::Release);
+        let (later, _) = super::super::alloc_pool::submission_receipt_for_test(1, 1);
+        let later = super::super::alloc_pool::ReceiptedSubmission::Executed(later);
+        assert!(finish_title_submission(later, None, false, true, std::iter::empty()));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0, "a completed later submission left the generation pinned");
+    }
+
+    /// The title's last release of a stand-in whose pinning submission has completed releases
+    /// the real pipeline at once, with no later submission.
+    #[test]
+    fn releasing_a_standin_after_its_submission_completed_releases_the_pipeline() {
+        let _serial = RETIRING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_B02Ausize;
+        let (native, completed) = pinned_in_flight(standin);
+        completed.store(1, Ordering::Release);
+        super::super::pso_async::release(super::super::pso_async::released(standin));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0, "a completed submission kept the released pipeline");
     }
 
     #[test]
