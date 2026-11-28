@@ -4124,6 +4124,18 @@ mod tests {
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
 
+    #[test]
+    fn per_lane_sweep_totals_include_only_matched_outputs() {
+        let mut sweep = LaneSweep::default();
+        sweep.record(Ok(15), Some(10));
+        sweep.record(Ok(20), None);
+        sweep.record(Err("validator: refused".into()), Some(30));
+
+        assert_eq!((sweep.tried, sweep.translated, sweep.paired), (3, 2, 1));
+        assert_eq!((sweep.lane_bytes, sweep.instruction_bytes), (15, 10));
+        assert_eq!(sweep.refusals.get("validator: refused"), Some(&1));
+    }
+
     pub(super) fn compute_sample() -> Vec<u8> {
         let mut compute = fssm(&CODE, &[(6, 3)]);
         for offset in [0x13C, 0x140, 0x144] {
@@ -4368,7 +4380,34 @@ fn name_hash(name: &str) -> u64 {
     h
 }
 
-/// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
+#[derive(Default)]
+struct LaneSweep {
+    tried: usize,
+    translated: usize,
+    paired: usize,
+    lane_bytes: usize,
+    instruction_bytes: usize,
+    refusals: HashMap<String, usize>,
+}
+
+impl LaneSweep {
+    fn record(&mut self, lane: Result<usize, String>, instruction_size: Option<usize>) {
+        self.tried += 1;
+        match lane {
+            Ok(size) => {
+                self.translated += 1;
+                if let Some(other) = instruction_size {
+                    self.paired += 1;
+                    self.lane_bytes += size;
+                    self.instruction_bytes += other;
+                }
+            }
+            Err(e) => *self.refusals.entry(survey_key(&e)).or_default() += 1,
+        }
+    }
+}
+
+/// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W] [--lanes]`:
 /// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
 /// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
 /// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
@@ -4396,14 +4435,9 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     let max_bytes = opts.max_bytes;
     let timeout = std::time::Duration::from_secs(opts.timeout);
     let skipped = AtomicUsize::new(0);
-    // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
-    // translates, its DXIL size against the per-instruction form's, and the refusals ranked
+    // `--lanes`: measure the compute per-lane form too, with sizes for the programs both forms produce.
     let lanes = opts.lanes;
-    let lanes_tried = AtomicUsize::new(0);
-    let lanes_ok = AtomicUsize::new(0);
-    let lanes_bytes = AtomicUsize::new(0);
-    let lanes_vs = AtomicUsize::new(0);
-    let lanes_why: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+    let lane_sweep = Mutex::new(LaneSweep::default());
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
@@ -4459,24 +4493,27 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                         };
                         let time = t.elapsed();
                         if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
-                            lanes_tried.fetch_add(1, Ordering::Relaxed);
                             // under the sweep's timeout too (the thread is left to finish)
                             let (tx, rx) = std::sync::mpsc::channel();
                             let (c, csc) = (code.to_vec(), cs.clone());
                             std::thread::spawn(move || {
-                                let _ = tx.send(recomp::lower_dxil::compute_with(&c, &csc, o));
-                            });
-                            match rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs()))) {
-                                Ok(k) => {
-                                    lanes_ok.fetch_add(1, Ordering::Relaxed);
-                                    lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
-                                    lanes_vs.fetch_add(r.as_ref().map_or(0, |d| d.len()), Ordering::Relaxed);
-                                    if trace {
-                                        eprintln!("per-lane: {name} FSSM#{fi}: {} B, per-instruction {:?} B", k.dxil.len(), r.as_ref().map(|d| d.len()));
+                                let lane = recomp::lower_dxil::compute_with(&c, &csc, o).and_then(|k| {
+                                    if validate {
+                                        crate::gpu::dxil::validate::validate(&k.dxil)
+                                            .map_err(|e| format!("validator: {}", e.lines().next().unwrap_or("")))?;
                                     }
+                                    Ok(k.dxil.len())
+                                });
+                                let _ = tx.send(lane);
+                            });
+                            let lane = rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())));
+                            let instruction_size = r.as_ref().ok().map(Vec::len);
+                            if trace {
+                                if let Ok(bytes) = &lane {
+                                    eprintln!("per-lane: {name} FSSM#{fi}: {bytes} B, per-instruction {instruction_size:?} B");
                                 }
-                                Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
                             }
+                            lane_sweep.lock().unwrap().record(lane, instruction_size);
                         }
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
@@ -4521,10 +4558,11 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     } else {
         println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
         if lanes {
-            let mut why: Vec<(String, usize)> = lanes_why.into_inner().unwrap().into_iter().collect();
+            let LaneSweep { tried, translated, paired, lane_bytes, instruction_bytes, refusals } = lane_sweep.into_inner().unwrap();
+            let mut why: Vec<(String, usize)> = refusals.into_iter().collect();
             why.sort_by(|a, b| b.1.cmp(&a.1));
             why.truncate(top);
-            println!("per-lane form: {} of {} compute programs; where it translates, {} B against {} B per instruction; refused for: {why:?}", lanes_ok.load(Ordering::Relaxed), lanes_tried.load(Ordering::Relaxed), lanes_bytes.load(Ordering::Relaxed), lanes_vs.load(Ordering::Relaxed));
+            println!("per-lane form: {translated} of {tried} compute programs; {paired} matched for DXIL size: {lane_bytes} B against {instruction_bytes} B per instruction; refused for: {why:?}");
         }
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());

@@ -45,6 +45,8 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+      --direct --lanes: report per-lane compute coverage and sizes for matched outputs.
+      With --validate, validate both direct forms before counting successful translations.
   xcl pso-precompile <game folder | shaders.rpf> [--threads N] [--records FILE] [--used]
       Before a run: translates the game's compute programs (its shaders.rpf) and has the
       driver compile their pipelines, the ones an earlier run used first, biggest first.
