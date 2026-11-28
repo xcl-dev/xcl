@@ -340,6 +340,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   after the bounded in-memory blob cache fills. This is off by default on AMD;
   `XCL_PSO_DISK_CACHE=1` forces it on, and `XCL_PSO_DISK_CACHE=0` disables it elsewhere.
   Compute blobs with different ordered static-sampler root signatures use separate entries.
+- Pipelines with console shaders are built lazily: each gets a stand-in when the title makes
+  it and is built on first use, so pipelines the title never uses are never built.
+  `XCL_LAZY_PSO=0` turns that off and sends them to the background workers when they are made
+  instead. It applies only while background pipeline building is on.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
