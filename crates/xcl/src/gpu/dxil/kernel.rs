@@ -1036,3 +1036,40 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     lw.wr(base, none);
     lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, maxt, rec });
 }
+
+#[cfg(test)]
+#[test]
+fn gpu_compact_slots_use_the_dispatch_prologues_exec_mask() {
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{runner, IO_THREAD_LIMIT};
+
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32");
+    }
+    // Each active lane stores its id in mem[id]. The execution mask itself
+    // is the ALU/store predicate, so a stale full mask overwrites sentinels.
+    let mut code = Vec::new();
+    for (name, enc, fields) in [
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 256)][..]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 0), ("SRC0", 130), ("VSRC1", 0)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D)]),
+        ("S_ENDPGM", "ENC_SOPP", &[]),
+    ] {
+        code.extend(encode(name, enc, fields, None).unwrap());
+    }
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let kernel = translate_entry(&code, options, Entry::Compute(cs), Some(true), None).unwrap();
+    let initial = [0xa5a5_5a5a; 32];
+    for (limit, active) in [(0, 32), (17, 17)] {
+        let mut io = [0; 128];
+        io[IO_THREAD_LIMIT[0]] = limit;
+        let got = runner::dispatch(&kernel.dxil, [1, 1, 1], &io, &initial).unwrap();
+        let mut expected = initial;
+        for (lane, word) in expected[..active].iter_mut().enumerate() {
+            *word = lane as u32;
+        }
+        assert_eq!(&got[..initial.len()], &expected, "DispatchX thread limit {limit}");
+    }
+}
