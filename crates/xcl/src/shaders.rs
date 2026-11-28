@@ -35,7 +35,7 @@ fn warm_settings(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::O
             "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
             "XCL_PRECOMPILE_SLICE" | "XCL_PRECOMPILE_COVERAGE_MAP" | "XCL_PRECOMPILE_COVERAGE_DIR" |
             "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PIPELINE_LIBRARY_OUT" | "XCL_PREPARE" |
-            "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" | "XCL_PRESS_AT" |
+            "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_USED_ONLY" | "XCL_PREPARE_ALL" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" | "XCL_PRESS_AT" |
             "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" | "XCL_FRAME_DUMP" |
             "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS") {
             continue;
@@ -53,6 +53,7 @@ fn warm_settings_ignore_worker_identity_but_keep_backend_changes() {
     let offline = key(&[("XCL_DIRECT_DXIL", "1")]);
     let worker = key(&[("XCL_PRECOMPILE_PARENT", "812"), ("XCL_DXC_THREADS", "2"), ("xcl_direct_dxil", "1")]);
     assert_eq!(offline, worker);
+    assert_eq!(offline, key(&[("XCL_DIRECT_DXIL", "1"), ("XCL_PREPARE_USED_ONLY", "1"), ("XCL_PREPARE_ALL", "1")]));
     assert_ne!(offline, key(&[("xcl_direct_dxil", "all")]));
 }
 
@@ -2446,6 +2447,45 @@ fn pipeline_key(blob: &[u8]) -> u64 {
     crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()])
 }
 
+/// `XCL_PREPARE_USED_ONLY=1` (`gate`; `all` is `XCL_PREPARE_ALL`): the startup preparation builds a
+/// driver pipeline only for the compute records an earlier run used (`used`, from
+/// `used-pipelines.txt`). Off by default. Every record is built when `all` is `1`, when there is no
+/// history, or when no record's key (`record_keys`) is in it (a list of another pack or build).
+fn startup_used_only(gate: Option<&str>, all: Option<&str>, used: std::collections::HashSet<u64>, record_keys: impl IntoIterator<Item = u64>) -> (Option<std::collections::HashSet<u64>>, Option<&'static str>) {
+    if gate.map(str::trim) != Some("1") { return (None, None); }
+    if all.map(str::trim) == Some("1") { return (None, Some("XCL_PREPARE_ALL=1: every compute record is built")); }
+    if used.is_empty() { return (None, Some("no earlier run's used pipelines: every compute record is built")); }
+    if !record_keys.into_iter().any(|k| used.contains(&k)) {
+        return (None, Some("no record matches the used pipelines (another pack or build?): every compute record is built"));
+    }
+    (Some(used), None)
+}
+
+/// The used keys of `XCL_PREPARE_USED_ONLY=1` for a pack (`startup_used_only`), with what it does
+/// logged before any building starts; `None`: every compute record is built.
+fn used_only_selection(input: &Input) -> Option<std::collections::HashSet<u64>> {
+    let gate = std::env::var("XCL_PREPARE_USED_ONLY").ok()?;
+    if gate.trim() != "1" { return None; }
+    let all = std::env::var("XCL_PREPARE_ALL").ok();
+    let used = if all.as_deref().map(str::trim) == Some("1") {
+        HashSet::new()
+    } else {
+        crate::hle::d3d12x::pso_async::earlier_used_keys()
+    };
+    let keys: Vec<u64> = if used.is_empty() {
+        Vec::new()
+    } else {
+        (0..input.len()).filter_map(|i| input.get(i).1).map(|b| pipeline_key(&b)).collect()
+    };
+    let (only, note) = startup_used_only(Some(&gate), all.as_deref(), used, keys.iter().copied());
+    match (&only, note) {
+        (Some(used), _) => crate::xlog_info!("Shader preparation: selected {} of {} records, those an earlier run used; the title builds the others when it first uses them", keys.iter().filter(|k| used.contains(k)).count(), keys.len()),
+        (None, Some(note)) => crate::xlog_info!("Shader preparation: {note}"),
+        _ => {}
+    }
+    only
+}
+
 fn parse_pipeline_keys(text: &str) -> std::collections::HashSet<u64> {
     text.lines().filter_map(|line| u64::from_str_radix(line.trim(), 16).ok()).filter(|&key| key != 0).collect()
 }
@@ -2658,11 +2698,13 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Optio
         // about two pipelines at a time for one process, whatever the processors)
         if workers > 1 && matches!(input, Input::Pack { .. }) {
             let n = input.len();
+            // Report the selection before translating the stages, which takes minutes.
+            let used_only = used_only_selection(input).is_some();
             precompile(input, usize::MAX, windows, None, None, false, None, None, None,
                 std::time::Instant::now(), Some(progress), coverage.as_ref())?;
             if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
             if coverage.as_ref().is_some_and(ComputeCoverage::all_staged) { continue; }
-            pipelines_in_workers(&pack, windows, workers, n, progress, coverage.as_ref())?;
+            pipelines_in_workers(&pack, windows, workers, n, progress, coverage.as_ref(), used_only)?;
             continue;
         }
         precompile(input, usize::MAX, windows, None, None, true, None, None, None,
@@ -2836,7 +2878,7 @@ mod claim_tests {
 /// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
 /// slice of the records (`XCL_PRECOMPILE_SLICE`). A failed worker prevents guest entry.
 fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation,
-                        coverage: Option<&ComputeCoverage>) -> Result<(), String> {
+                        coverage: Option<&ComputeCoverage>, used_only: bool) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let map = coverage.map(|c| c.slice_file()).transpose()?.flatten();
     let t0 = std::time::Instant::now();
@@ -2845,6 +2887,7 @@ fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usiz
         let mut c = worker_command(&me);
         if let Some((file, dir)) = &map { c.env(COVERAGE_MAP, &file.0).env(COVERAGE_DIR, dir); }
         c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+        if used_only { c.arg("--used-only"); }
         if std::env::var_os("XCL_ADAPTER").is_none() && !progress.adapter.is_empty() { c.env("XCL_ADAPTER", &progress.adapter); }
         c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
         c
@@ -3339,6 +3382,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
     if startup.is_none() { recomp::dxc::set_memory_reserve(2); }
+    // `XCL_PREPARE_USED_ONLY=1`: the pipelines of the compute records an earlier run used, here
+    // (with workers it is `pipelines_in_workers`)
+    let used_only = if startup.is_some() && pipelines.is_some() { used_only_selection(input) } else { None };
+    let (compute_records, compute_built) = (AtomicUsize::new(0), AtomicUsize::new(0));
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let startup_device = pipelines.filter(|_| startup.is_some());
@@ -3431,7 +3478,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                if mandatory {
+                                if used_only.is_some() { compute_records.fetch_add(1, Ordering::Relaxed); }
+                                if used_only.as_ref().is_some_and(|u| !u.contains(&pipeline_key(&blob))) {
+                                    // not used earlier: the title builds it when it first uses it
+                                } else if mandatory {
                                     if let Err(e) = p.prepare_compiled_compute(&c) {
                                         failed.fetch_add(1, Ordering::Relaxed);
                                         let mut logs = errors.lock().unwrap();
@@ -3439,6 +3489,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                                         record_done();
                                         continue;
                                     }
+                                    if used_only.is_some() { compute_built.fetch_add(1, Ordering::Relaxed); }
                                 } else {
                                     let used = used_earlier.contains(&pipeline_key(&blob));
                                     let prewarm_indirect = indirect.is_some_and(|i| used_indirect_split(&blob, i));
@@ -3554,6 +3605,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         if startup.is_none() {
             make_pipelines(p, pipeline_jobs.into_inner().unwrap());
+        }
+        if used_only.is_some() {
+            crate::xlog_info!("Shader preparation: prepared pipelines for {} of {} translated compute records", compute_built.load(Ordering::Relaxed), compute_records.load(Ordering::Relaxed));
         }
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         if let Some(book) = &p.warm_blobs {
@@ -4123,6 +4177,38 @@ mod tests {
 
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    fn keys(k: &[u64]) -> std::collections::HashSet<u64> { k.iter().copied().collect() }
+
+    #[test]
+    fn startup_used_only_is_off_unless_asked() {
+        for gate in [None, Some("0"), Some("")] {
+            assert_eq!(startup_used_only(gate, None, keys(&[1]), [1]), (None, None));
+        }
+    }
+
+    #[test]
+    fn startup_used_only_without_history_builds_all() {
+        let (only, note) = startup_used_only(Some("1"), None, keys(&[]), [1, 2]);
+        assert!(only.is_none() && note.unwrap().contains("no earlier run"));
+    }
+
+    #[test]
+    fn startup_used_only_with_matching_keys_builds_the_used() {
+        assert_eq!(startup_used_only(Some("1"), Some("0"), keys(&[2, 9]), [1, 2, 3]), (Some(keys(&[2, 9])), None));
+    }
+
+    #[test]
+    fn startup_used_only_with_stale_keys_builds_all_and_says_so() {
+        let (only, note) = startup_used_only(Some("1"), None, keys(&[8, 9]), [1, 2, 3]);
+        assert!(only.is_none() && note.unwrap().contains("no record matches"));
+    }
+
+    #[test]
+    fn startup_prepare_all_overrides_used_only() {
+        let (only, note) = startup_used_only(Some("1"), Some("1"), keys(&[2]), [1, 2]);
+        assert!(only.is_none() && note.unwrap().contains("XCL_PREPARE_ALL"));
+    }
 
     pub(super) fn compute_sample() -> Vec<u8> {
         let mut compute = fssm(&CODE, &[(6, 3)]);
