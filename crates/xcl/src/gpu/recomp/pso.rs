@@ -226,6 +226,14 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
 
+/// `console_to_dxil_for` for a pixel shader whose PSO binds one or more 32-bit-channel render
+/// targets (`rt32_mask`: bit `k` set when `RTVFormats[k]` is `R32*` / `R32G32*` / `R32G32B32*` /
+/// `R32G32B32A32*`). When `rt32_mask == 0`, this uses the exact same cache key as
+/// `console_to_dxil_for`.
+pub fn console_ps_to_dxil_for(blob: &[u8], sampler_base: u32, split_wave64: bool, rt32_mask: u8) -> Result<Compiled, String> {
+    console_to_dxil_in_with(blob, Stage::Pixel, sampler_base, split_wave64, mem_windows(), rt32_mask)
+}
+
 /// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
 fn shader_cache() -> &'static Mutex<ShaderCache> {
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
@@ -235,8 +243,13 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    console_to_dxil_in_with(blob, stage, sampler_base, split_wave64, windows, 0)
+}
+
+fn console_to_dxil_in_with(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32, rt32_mask: u8) -> Result<Compiled, String> {
     let windows = windows_for_stage(windows, stage);
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    let rt32_mask = if stage == Stage::Pixel { rt32_mask } else { 0 };
+    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64, rt32_mask);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
     }
@@ -246,11 +259,12 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         sampler_base,
         windows,
         split_wave64,
+        rt32_mask,
         cache_dir: dxc::cache_dir(),
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached_for(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, rt32_mask, compile_one);
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -373,11 +387,17 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
+    #[cfg(test)]
     pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+        file_for(dir, ident, blob, stage, sampler_base, windows, split, 0)
+    }
+
+    pub(super) fn file_for(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool, rt32_mask: u8) -> PathBuf {
+        let suffix = if rt32_mask != 0 { format!("_rt32_{rt32_mask:02x}") } else { String::new() };
         dir.join("translated")
             .join("v2")
             .join(format!("{ident:016x}"))
-            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{suffix}.bin", crate::gpu::shader::fnv64(blob), split as u8))
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -611,6 +631,7 @@ mod translated {
     /// `translate` through the disk (`identity()` zero: not used). An enormous compute program
     /// the direct translator made (`translate` says so) is kept under `rerouted_identity`, which
     /// follows that translator's version: the HLSL path's identity does not.
+    #[cfg(test)]
     pub(super) fn cached(
         dir: &Path,
         blob: &[u8],
@@ -620,7 +641,20 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_for(dir, blob, stage, sampler_base, windows, split, 0, translate)
+    }
+
+    pub(super) fn cached_for(
+        dir: &Path,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        rt32_mask: u8,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
+        cached_rerouted_for(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, rt32_mask, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -659,6 +693,7 @@ mod translated {
         identity_for(&format!("{ident:016x}"), &format!("xcl-enormous-direct-{direct:016x}"))
     }
 
+    #[cfg(test)]
     pub(super) fn cached_rerouted(
         dir: &Path,
         ident: u64,
@@ -670,17 +705,32 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
+        cached_rerouted_for(dir, ident, direct, blob, stage, sampler_base, windows, split, 0, translate)
+    }
+
+    pub(super) fn cached_rerouted_for(
+        dir: &Path,
+        ident: u64,
+        direct: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        rt32_mask: u8,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
         if ident == 0 {
             return translate().map(|(c, _)| c);
         }
         let rerouted = rerouted_identity(ident, direct);
         for id in [ident, rerouted] {
-            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
+            if let Some(c) = load_in(&file_for(dir, id, blob, stage, sampler_base, windows, split, rt32_mask), id, blob) {
                 super::dxc::note_memory_hit();
                 return Ok(c);
             }
         }
-        let err_path = file(dir, rerouted, blob, stage, sampler_base, windows, split).with_extension("err");
+        let err_path = file_for(dir, rerouted, blob, stage, sampler_base, windows, split, rt32_mask).with_extension("err");
         if let Some(reason) = load_err_in(&err_path, rerouted, blob) {
             return Err(reason);
         }
@@ -691,7 +741,7 @@ mod translated {
                     let _ = std::fs::remove_file(&err_path);
                 }
                 let id = if direct { rerouted } else { ident };
-                store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
+                store_in(&file_for(dir, id, blob, stage, sampler_base, windows, split, rt32_mask), id, blob, &c);
                 Ok(c)
             }
             Err(reason) => {
@@ -717,7 +767,7 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, rt32_mask: u8) -> Result<(Compiled, bool), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
@@ -752,7 +802,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
-        match direct_graphics(blob, stage, sampler_base, windows, split_wave64) {
+        match direct_graphics(blob, stage, sampler_base, windows, split_wave64, rt32_mask) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
                 return Ok((c, false));
@@ -760,7 +810,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64, false)?;
+    let (mut t, profile) = console_translation_with(blob, stage, sampler_base, windows, split_wave64, false, rt32_mask)?;
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
@@ -880,6 +930,7 @@ struct ShaderKey {
     sampler_base: u32,
     windows: u32,
     split_wave64: bool,
+    rt32_mask: u8,
     cache_dir: PathBuf,
 }
 
@@ -1204,7 +1255,7 @@ fn dump_direct(blob: &[u8], dxil: &[u8]) {
 }
 
 /// A console vertex / pixel shader through the direct DXIL translator.
-fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, rt32_mask: u8) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let want = if stage == Stage::Vertex { 4 } else { 5 };
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == want)).ok_or("no hardware variant")?;
@@ -1215,7 +1266,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, s
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
-        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel_rt32(code, o, ps, rt32_mask)?,
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
     dump_direct(blob, &k.dxil);
@@ -1223,6 +1274,10 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, s
 }
 
 pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, no_remap: bool) -> Result<(super::Translation, &'static str), String> {
+    console_translation_with(blob, stage, sampler_base, windows, split_wave64, no_remap, 0)
+}
+
+pub(crate) fn console_translation_with(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, no_remap: bool, rt32_mask: u8) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
@@ -1257,7 +1312,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, no_remap, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, no_remap, ps_rt32_mask: rt32_mask, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1362,9 +1417,10 @@ fn console_mesh_with(
             sampler_base: 0,
             windows,
             split_wave64: split,
+            rt32_mask: 0,
             cache_dir: cache_dir.to_path_buf(),
         };
-        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
+        let from_disk = || translated::cached_for(cache_dir, blob, Stage::Mesh, 0, windows, split, 0, || compile_one().map(|c| (c, false)));
         cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
     } else {
         compile_one()?
@@ -2093,6 +2149,7 @@ mod shader_cache_tests {
             sampler_base: 0,
             windows: 1,
             split_wave64: false,
+            rt32_mask: 0,
             cache_dir: "cache".into(),
         }
     }
@@ -2755,11 +2812,11 @@ mod direct_probe_tests {
             return crate::gpu::recomp::runner::skip_test("no direct compute route (XCL_DIRECT_HUGE=0)");
         }
         let blob = b"not a console shader";
-        let (r, missed) = dxc::cached_only(|| compile_console_shader(blob, Stage::Compute, 0, 1, false));
+        let (r, missed) = dxc::cached_only(|| compile_console_shader(blob, Stage::Compute, 0, 1, false, 0));
         assert!(missed, "a cached-only probe must mark the direct route as not compiled yet");
         assert_eq!(r.err().as_deref(), Some("DXIL not compiled yet"));
         // outside a probe the direct route runs (this blob then fails in translation, not deferral)
-        let e = compile_console_shader(blob, Stage::Compute, 0, 1, false).err().unwrap_or_default();
+        let e = compile_console_shader(blob, Stage::Compute, 0, 1, false, 0).err().unwrap_or_default();
         assert_ne!(e, "DXIL not compiled yet");
         assert!(!dxc::in_cached_only());
     }
@@ -2770,6 +2827,32 @@ mod direct_probe_tests {
         assert!(defer_direct_compute().is_ok());
         let (r, missed) = dxc::cached_only(defer_direct_compute);
         assert!(missed && r.is_err());
+    }
+
+    #[test]
+    fn rt32_mask_formats_and_cache_key() {
+        assert_eq!(crate::gpu::recomp::rt32_mask_from_formats(&[10, 28, 29, 34]), 0);
+        assert_eq!(crate::gpu::recomp::rt32_mask_from_formats(&[10, 42]), 1 << 1);
+        assert_eq!(crate::gpu::recomp::rt32_mask_from_formats(&[2, 17, 41, 43]), 0b1111);
+        assert_eq!(crate::gpu::recomp::rt32_mask_from_formats(&[40]), 0);
+
+        let dir = std::path::Path::new("cache");
+        let blob = b"ps-rt32-cache-key";
+        let base = translated::file(dir, 0x1234, blob, Stage::Pixel, 0, 1, false);
+        let zero = translated::file_for(dir, 0x1234, blob, Stage::Pixel, 0, 1, false, 0);
+        let rt1 = translated::file_for(dir, 0x1234, blob, Stage::Pixel, 0, 1, false, 1 << 1);
+        assert_eq!(base, zero, "rt32_mask == 0 must preserve the existing cache filename");
+        assert_ne!(base, rt1, "non-zero rt32_mask must use a distinct cache filename");
+        assert!(rt1.to_string_lossy().ends_with("_rt32_02.bin"));
+
+        let cache = Mutex::new(ShaderCache::new(1 << 20));
+        let k0 = ShaderKey { hash: 99, stage: Stage::Pixel, sampler_base: 0, windows: 1, split_wave64: false, rt32_mask: 0, cache_dir: "cache".into() };
+        let k1 = ShaderKey { rt32_mask: 1 << 1, ..k0.clone() };
+        let mk = |m: u8| Compiled { dispatch_chain: None, dxil: vec![m; 68], samplers: Vec::new(), dispatch_remap: None };
+        let a = cached_shader(&cache, k0, blob, || Ok(mk(1))).unwrap();
+        let b = cached_shader(&cache, k1, blob, || Ok(mk(2))).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(b.dxil[67], 2);
     }
 }
 

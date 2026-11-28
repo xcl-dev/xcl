@@ -165,6 +165,171 @@ pub struct PsInterface {
     pub attrs: Option<Vec<PsAttr>>,
 }
 
+/// Whether a DXGI_FORMAT value has 32-bit per-channel components (`R32*`, `R32G32*`,
+/// `R32G32B32*`, `R32G32B32A32*`).
+pub fn is_rt32_format(dxgi_fmt: u32) -> bool {
+    matches!(dxgi_fmt, 1..=8 | 15..=18 | 39 | 41..=43)
+}
+
+/// Bitmask of render targets 0..8 whose DXGI format has 32-bit per-channel components.
+pub fn rt32_mask_from_formats(formats: &[u32]) -> u8 {
+    let mut mask = 0u8;
+    for (i, &fmt) in formats.iter().take(8).enumerate() {
+        if is_rt32_format(fmt) {
+            mask |= 1u8 << i;
+        }
+    }
+    mask
+}
+
+/// Patch a console pixel shader's default FP16 compressed export epilogue (`v_cvt_pkrtz_f16_f32`
+/// + `exp mrtK ... compr`) into an uncompressed 32-bit export for every MRT `K` whose bit is set
+/// in `rt32_mask`. Both the HLSL and direct-DXIL backends run this right after decoding.
+pub(crate) fn patch_ps_32bit_exports(insts: &mut [Decoded], rt32_mask: u8) {
+    if rt32_mask == 0 || insts.is_empty() {
+        return;
+    }
+    let mut branch_targets = BTreeSet::new();
+    for d in insts.iter() {
+        if let Some(t) = rdna2::branch_target(d) {
+            branch_targets.insert(t);
+        }
+    }
+    let pkrtz_srcs = |d: &Decoded| -> Option<(u64, u64)> {
+        if d.inst.name != "V_CVT_PKRTZ_F16_F32" {
+            return None;
+        }
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+        match d.enc.name {
+            "ENC_VOP2" => {
+                let s0 = f("SRC0");
+                let s1 = f("VSRC1");
+                ((256..512).contains(&s0) && s1 < 256).then(|| (s0 - 256, s1))
+            }
+            "ENC_VOP3" => {
+                if f("ABS") != 0 || f("NEG") != 0 || f("CLMP") != 0 || f("OMOD") != 0 {
+                    return None;
+                }
+                let s0 = f("SRC0");
+                let s1 = f("SRC1");
+                ((256..512).contains(&s0) && (256..512).contains(&s1)).then(|| (s0 - 256, s1 - 256))
+            }
+            _ => None,
+        }
+    };
+    let find_pkrtz = |insts: &[Decoded], exp_idx: usize, dst_vgpr: u64| -> Option<(usize, u64, u64)> {
+        let mut j = exp_idx;
+        while j > 0 {
+            if branch_targets.contains(&insts[j].pc) {
+                break;
+            }
+            j -= 1;
+            let d = &insts[j];
+            if rdna2::branch_target(d).is_some() || d.inst.flags & rdna2::F_TERMINATOR != 0 {
+                break;
+            }
+            let (_, writes) = rdna2::vgpr_uses(d);
+            if writes.contains(&dst_vgpr) {
+                let (a, b) = pkrtz_srcs(d)?;
+                return Some((j, a, b));
+            }
+        }
+        None
+    };
+
+    for i in 0..insts.len() {
+        if insts[i].enc.name != "ENC_EXP" {
+            continue;
+        }
+        let f = |n: &str| rdna2::field_value(insts[i].enc, &insts[i].words, n).unwrap_or(0);
+        let (en, tgt, compr) = (f("EN"), f("TGT"), f("COMPR") != 0);
+        if tgt >= 8 || !compr || (rt32_mask >> tgt) & 1 == 0 {
+            continue;
+        }
+        let (vsrc0, vsrc1) = (f("VSRC0"), f("VSRC1"));
+        let need_lo = (en & 0x3) != 0;
+        let need_hi = (en & 0xC) != 0;
+        let lo = if need_lo {
+            match find_pkrtz(&insts, i, vsrc0) {
+                Some(m) => Some(m),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        let hi = if need_hi {
+            match find_pkrtz(&insts, i, vsrc1) {
+                Some(m) => Some(m),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        let lo_idx = lo.map(|(idx, _, _)| idx);
+        let hi_idx = hi.map(|(idx, _, _)| idx);
+        let clobbered = |def_idx: usize, a: u64, b: u64| -> bool {
+            ((def_idx + 1)..i).any(|k| {
+                if Some(k) == lo_idx || Some(k) == hi_idx {
+                    return false;
+                }
+                let (_, writes) = rdna2::vgpr_uses(&insts[k]);
+                writes.contains(&a) || writes.contains(&b)
+            })
+        };
+        if let Some((idx, a, b)) = lo {
+            if clobbered(idx, a, b) {
+                continue;
+            }
+        }
+        if let Some((idx, a, b)) = hi {
+            if clobbered(idx, a, b) {
+                continue;
+            }
+        }
+
+        let (c0, c1) = lo.map_or((0, 0), |(_, a, b)| (a, b));
+        let (c2, c3) = hi.map_or((0, 0), |(_, a, b)| (a, b));
+        insts[i].words[0] &= !(1u32 << 10); // clear COMPR
+        insts[i].words[1] = (c0 as u32) | ((c1 as u32) << 8) | ((c2 as u32) << 16) | ((c3 as u32) << 24);
+
+        // Replace matched v_cvt_pkrtz_f16_f32 with s_nop 0 when its dst is not read elsewhere in
+        // the block (or when it overwrote an input VGPR that the uncompressed export now reads).
+        let used_srcs = [c0, c1, c2, c3];
+        for (idx, dst_v) in [lo_idx.map(|x| (x, vsrc0)), hi_idx.map(|x| (x, vsrc1))].into_iter().flatten() {
+            if insts[idx].inst.name != "V_CVT_PKRTZ_F16_F32" {
+                continue;
+            }
+            let overwrites_src = (need_lo && (dst_v == used_srcs[0] || dst_v == used_srcs[1]))
+                || (need_hi && (dst_v == used_srcs[2] || dst_v == used_srcs[3]));
+            let mut read_elsewhere = false;
+            if !overwrites_src {
+                for k in (idx + 1)..insts.len() {
+                    if branch_targets.contains(&insts[k].pc) {
+                        break;
+                    }
+                    if k == i || Some(k) == lo_idx || Some(k) == hi_idx {
+                        continue;
+                    }
+                    let (reads, writes) = rdna2::vgpr_uses(&insts[k]);
+                    if reads.contains(&dst_v) {
+                        read_elsewhere = true;
+                        break;
+                    }
+                    if writes.contains(&dst_v) || rdna2::branch_target(&insts[k]).is_some() || insts[k].inst.flags & rdna2::F_TERMINATOR != 0 {
+                        break;
+                    }
+                }
+            }
+            if overwrites_src || !read_elsewhere {
+                let (pc, len) = (insts[idx].pc, insts[idx].len);
+                let mut nop = rdna2::decode(&0xBF80_0000u32.to_le_bytes(), pc).expect("decode s_nop");
+                nop.len = len;
+                insts[idx] = nop;
+            }
+        }
+    }
+}
+
 /// Mesh (NGG) shader interface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MsInterface {
@@ -545,11 +710,14 @@ pub struct Options {
     pub structured: bool,
     /// force the console-sized form used when an indirect dispatch cannot scale GPU arguments
     pub no_remap: bool,
+    /// Pixel shader only: bitmask of render targets 0..8 whose PSO format has 32-bit per-channel
+    /// components (`R32*`, `R32G32*`, `R32G32B32*`, `R32G32B32A32*`).
+    pub ps_rt32_mask: u8,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, no_remap: false }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, no_remap: false, ps_rt32_mask: 0 }
     }
 }
 
@@ -1645,6 +1813,9 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
         insts.push(d);
     }
     rdna2::resolve_far_jumps(&mut insts);
+    if matches!(opt.mode, Mode::Pixel(_)) {
+        patch_ps_32bit_exports(&mut insts, opt.ps_rt32_mask);
+    }
     let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
     let mut leaders: BTreeSet<u64> = BTreeSet::from([0]);
     let mut branches = 0usize;

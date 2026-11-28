@@ -117,7 +117,12 @@ pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Resu
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None)
+    translate_pixel_rt32(code, o, ps, 0)
+}
+
+/// `translate_pixel` with a bitmask of 32-bit-channel render targets (`ps_rt32_mask`).
+pub fn translate_pixel_rt32(code: &[u8], o: KernelOptions, ps: &PsInterface, ps_rt32_mask: u8) -> Result<Kernel, String> {
+    translate_entry_rt32(code, o, Entry::Pixel(ps.clone()), None, None, ps_rt32_mask)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
@@ -178,6 +183,17 @@ fn translate_entry(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
 ) -> Result<Kernel, String> {
+    translate_entry_rt32(code, o, entry, compact, nest, 0)
+}
+
+fn translate_entry_rt32(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    ps_rt32_mask: u8,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
@@ -189,7 +205,7 @@ fn translate_entry(
         .spawn(move || {
             #[cfg(test)]
             super::module::NO_SELECT_FOLD.with(|c| c.set(no_select_fold));
-            translate_on_this_thread(&code, o, entry, compact, nest)
+            translate_on_this_thread(&code, o, entry, compact, nest, ps_rt32_mask)
         })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
@@ -220,15 +236,19 @@ fn translate_on_this_thread(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
+    ps_rt32_mask: u8,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
     };
-    let cfg = match &geo {
+    let mut cfg = match &geo {
         Some(g) => Cfg::build_geometry(code, g.gs_start)?,
         None => Cfg::build(code)?,
     };
+    if matches!(entry, Entry::Pixel(_)) {
+        crate::gpu::recomp::patch_ps_32bit_exports(&mut cfg.insts, ps_rt32_mask);
+    }
     let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
