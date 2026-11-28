@@ -11476,8 +11476,13 @@ mod tests {
             assert!(mirrored(va, bytes).is_some());
             let mut old = 0u32;
             assert_ne!(VirtualProtect(src as *const _, len, PAGE_NOACCESS, &mut old), 0);
-            assert!(!crate::gpu::shader::readable(va as usize, bytes));
-            assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
+            // on a thread of its own: `readable` takes the pages this thread found readable
+            // a moment ago (the first bind's) as readable still (`shader::SEEN`)
+            let again = std::thread::spawn(move || {
+                assert!(!crate::gpu::shader::readable(va as usize, bytes));
+                gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true)
+            });
+            assert_eq!(again.join().unwrap(), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
         }

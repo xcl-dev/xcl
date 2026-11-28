@@ -529,7 +529,8 @@ unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
     if in_page >= most {
         return most;
     }
-    (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
+    // (fresh: the next page may have been freed since another check found it readable)
+    (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable_fresh(rip, n)).unwrap_or(in_page)
 }
 
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU

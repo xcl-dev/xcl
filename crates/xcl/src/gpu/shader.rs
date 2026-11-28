@@ -204,7 +204,16 @@ fn dump_dir() -> PathBuf {
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
 pub fn readable(p: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    readable_with(p, len, true)
+}
+
+/// `readable` without the pages this thread found readable a moment ago (`SEEN`): for memory
+/// that may have been freed since, as the next page of an instruction (`eh::code_bytes_at`).
+pub fn readable_fresh(p: usize, len: usize) -> bool {
+    readable_with(p, len, false)
+}
+
+fn readable_with(p: usize, len: usize, recent: bool) -> bool {
     if p == 0 || len == 0 || len > 256 << 20 {
         return false;
     }
@@ -215,6 +224,109 @@ pub fn readable(p: usize, len: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
         return true;
     }
+    let (first, last) = (p >> 12, (end - 1) >> 12);
+    let short = last - first < SEEN_PAGES;
+    if recent && short && seen_readable(first, last) {
+        return true;
+    }
+    // Under Wine the questions below are system calls under its virtual-memory lock:
+    // 20-130 µs each, more while another thread commits or frees memory, and a retail game's
+    // world asked ~10,000 times a second. A range of up to 16 pages is read instead, a byte a
+    // page (`IsBadReadPtr`: it catches the page fault of a page that cannot be read).
+    // `XCL_READABLE_PROBE=0`: asked of the system, as before.
+    if last - first < 16 && probe_on() {
+        PROBING.with(|f| f.set(true));
+        let ok = unsafe { windows_sys::Win32::System::Memory::IsBadReadPtr(p as *const _, len) } == 0;
+        PROBING.with(|f| f.set(false));
+        if ok && short {
+            note_readable(first, last);
+        }
+        return ok;
+    }
+    let ok = readable_asked(p, end);
+    if ok && short {
+        note_readable(first, last);
+    }
+    ok
+}
+
+/// Whether `readable` reads ranges of up to 16 pages instead of asking the system: under
+/// Wine, unless `XCL_READABLE_PROBE=0`.
+fn probe_on() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let on = crate::util::under_wine() && std::env::var("XCL_READABLE_PROBE").map_or(true, |v| v.trim() != "0");
+        if on {
+            unsafe { windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(probe_guard_page)) };
+        }
+        on
+    })
+}
+
+thread_local! {
+    /// This thread is in `readable`'s `IsBadReadPtr`.
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Wine's `IsBadReadPtr` catches access violations only: a guard page it read ended the
+/// process (`STATUS_GUARD_PAGE_VIOLATION` unhandled). During the probe the page is made a guard
+/// page again (the fault took that away) and the fault is passed on as an access violation, so
+/// the probe answers "not readable" as on Windows and the guard stays.
+unsafe extern "system" fn probe_guard_page(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_GUARD};
+    const GUARD_PAGE_VIOLATION: i32 = 0x8000_0001u32 as i32;
+    const ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+    let rec = &mut *(*info).ExceptionRecord;
+    if rec.ExceptionCode == GUARD_PAGE_VIOLATION && rec.NumberParameters >= 2 && PROBING.with(|f| f.get()) {
+        let page = (rec.ExceptionInformation[1] & !0xFFF) as *const std::ffi::c_void;
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let mut old = 0u32;
+        if VirtualQuery(page, &mut mbi, std::mem::size_of_val(&mbi)) != 0 {
+            VirtualProtect(page, 1 << 12, mbi.Protect | PAGE_GUARD, &mut old);
+        }
+        rec.ExceptionCode = ACCESS_VIOLATION;
+    }
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Ranges of up to this many pages are remembered when readable (`SEEN`).
+const SEEN_PAGES: usize = 4;
+/// How long a page found readable is taken as readable without asking again.
+const SEEN_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+thread_local! {
+    /// Pages this thread found readable a moment ago (page number, when), a ring. Translating a
+    /// retail game's world frames asked ~100,000 times per 2 s (objects' vtables in `is_adopted`,
+    /// the title's view descs), ~20 µs each under Wine (a system call under its virtual-memory lock):
+    /// 1.5–2.8 s of the title's threads per 2 s.
+    /// shortcut: a page freed within `SEEN_FOR` of a check still reads as readable on this thread;
+    /// the checks guard against garbage pointers, which point at pages never seen readable.
+    static SEEN: std::cell::RefCell<([(usize, std::time::Instant); 64], usize)> =
+        std::cell::RefCell::new(([(usize::MAX, std::time::Instant::now()); 64], 0));
+}
+
+fn seen_readable(first: usize, last: usize) -> bool {
+    SEEN.with(|s| {
+        let s = s.borrow();
+        (first..=last).all(|pg| s.0.iter().any(|&(q, at)| q == pg && at.elapsed() < SEEN_FOR))
+    })
+}
+
+fn note_readable(first: usize, last: usize) {
+    let now = std::time::Instant::now();
+    SEEN.with(|s| {
+        let mut s = s.borrow_mut();
+        for pg in first..=last {
+            let at = s.1;
+            s.0[at] = (pg, now);
+            s.1 = (at + 1) % s.0.len();
+        }
+    })
+}
+
+/// `readable` asked of the system: the working set first, `VirtualQuery` when it cannot say.
+fn readable_asked(p: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if let Some(answer) = pages_readable(p, end) {
         return answer;
     }
@@ -594,7 +706,8 @@ mod tests {
             assert_eq!(pages_readable(page(5), page(5) + 8), None);
             assert!(readable(page(5), 8));
             assert!(readable(page(6), 1 << 12));
-            assert_eq!(pages_readable(page(5), page(7)), None);
+            // under Wine `readable` reads a byte of each page instead (`probe_on`): resident then
+            assert_eq!(pages_readable(page(5), page(7)), if probe_on() { Some(true) } else { None });
             assert_eq!(pages_readable(page(3), page(3) + 8), None, "a guard page is not touched to answer");
             assert!(!readable(page(2), 8));
             assert!(!readable(page(3), 8));
