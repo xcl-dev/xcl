@@ -1444,6 +1444,283 @@ pub fn mesh_draw_split(
     }
 }
 
+/// One mesh pipeline-state stream with a depth-stencil target (`MeshStream` plus the DSV
+/// format subobject, which the output-merger needs for depth test/write).
+#[repr(C)]
+struct MeshDepthStream {
+    rs: Sub<*mut std::ffi::c_void>,
+    ms: Sub<D3D12_SHADER_BYTECODE>,
+    ps: Sub<D3D12_SHADER_BYTECODE>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    rast: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+    dsv: Sub<DXGI_FORMAT>,
+    rtv: Sub<D3D12_RT_FORMAT_ARRAY>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+}
+
+/// What `mesh_poison` found: the phases that completed, in order, and the first one that
+/// failed (its name and the device-removed reason / timeout / error), or `None` if the whole
+/// sequence ran. A removal poisons the shared device, so the run stops at the first failure.
+pub struct PoisonReport {
+    pub completed: Vec<String>,
+    pub failed: Option<(String, String)>,
+}
+
+impl PoisonReport {
+    /// The whole sequence completed with no device removal.
+    pub fn ok(&self) -> bool {
+        self.failed.is_none()
+    }
+}
+
+/// A mesh pass into the game's target shape, then the operations a normal frame does after it
+/// (depth read, colour resolve/copy, readback), each a separately fenced submission so a hang
+/// or device removal is pinned to the phase it first happens in. Unlike `mesh_draw`, this
+/// binds a real depth buffer (`dsv_format`) and an `rt_format` colour target, and primes depth
+/// compression by writing it in a first pass before reading it in a second – the state a
+/// minimal single-dispatch repro never reaches. `cs` writes one record per group (u1) as in
+/// `mesh_draw`; `ms`/`ps` are its pass-through and pixel shader. `frames` extra clear→write→
+/// read→copy frames follow the first, to catch a delayed effect under sustained load.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_poison(
+    cs: &[u8],
+    ms: &[u8],
+    ps: &[u8],
+    groups: u32,
+    split: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    rt_format: DXGI_FORMAT,
+    dsv_format: DXGI_FORMAT,
+    size: u32,
+    frames: u32,
+) -> Result<PoisonReport, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let dev = gpu.dev.clone();
+    let queue = gpu.queue.clone();
+    let fence = gpu.fence.clone();
+    let rs = gpu.rs.clone();
+    let mut value = gpu.value;
+    let has_stencil = matches!(dsv_format, DXGI_FORMAT_D24_UNORM_S8_UINT | DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+    unsafe {
+        let bytecode = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+        let cpso: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs),
+                CS: bytecode(cs),
+                ..Default::default()
+            })
+            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+        // the two graphics PSOs differ only in the depth-stencil state: the first writes depth
+        // (compressing it), the second reads it with depth-write off (what a later pass does)
+        let make_pso = |ds: D3D12_DEPTH_STENCIL_DESC| -> Result<ID3D12PipelineState, String> {
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
+            let mut rtv_formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+            rtv_formats.RTFormats[0] = rt_format;
+            let mut stream = MeshDepthStream {
+                rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: rs.as_raw() },
+                ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: bytecode(ms) },
+                ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: bytecode(ps) },
+                blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
+                mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
+                rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+                depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: ds },
+                dsv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, v: dsv_format },
+                rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
+                samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
+            };
+            let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
+            dev2.CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: std::mem::size_of::<MeshDepthStream>(),
+                pPipelineStateSubobjectStream: &mut stream as *mut MeshDepthStream as *mut std::ffi::c_void,
+            })
+            .map_err(|x| format!("CreatePipelineState (mesh): {x}"))
+        };
+        let pso_write = make_pso(D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+            ..Default::default()
+        })?;
+        let pso_read = make_pso(D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+            DepthFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+            ..Default::default()
+        })?;
+
+        // colour target (optimised clear), a copy target to force decompression on resolve,
+        // and the depth buffer in its cleared/compressed first-use state
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size as u64,
+            Height: size,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: rt_format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let cv_color = D3D12_CLEAR_VALUE { Format: rt_format, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0, 0.0, 0.0, 1.0] } };
+        let cv_depth = D3D12_CLEAR_VALUE { Format: dsv_format, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 } } };
+        let committed = |desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES, clear: Option<&D3D12_CLEAR_VALUE>| -> Result<ID3D12Resource, String> {
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, clear.map(|c| c as *const _), &mut r).map_err(e)?;
+            r.ok_or_else(|| "resource".into())
+        };
+        let rt = committed(&tex, D3D12_RESOURCE_STATE_RENDER_TARGET, Some(&cv_color))?;
+        let copy_tex = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_NONE, ..tex };
+        let copy_rt = committed(&copy_tex, D3D12_RESOURCE_STATE_COPY_DEST, None)?;
+        let depth_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size as u64,
+            Height: size,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: dsv_format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let depth = committed(&depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, Some(&cv_depth))?;
+
+        let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+        let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&rt, None, rtv);
+        let dsv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+        let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateDepthStencilView(&depth, None, dsv);
+
+        // records (u1) written by the compute pass; io (u0) / mem (u2) as in `mesh_draw`
+        let mut io = sgprs.to_vec();
+        io.resize(KERNEL_SGPRS, 0);
+        let io_bytes = (io.len() * 4) as u64;
+        let mem_len = mem.len().max(64);
+        let mem_bytes = (mem_len * 4) as u64;
+        let res_bytes = (record_dwords * groups as usize * 4) as u64;
+        let upload = buffer(&dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+        let mut p = std::ptr::null_mut();
+        upload.Map(0, None, Some(&mut p)).map_err(e)?;
+        std::ptr::copy_nonoverlapping(io.as_ptr(), p as *mut u32, io.len());
+        let mut m = mem.to_vec();
+        m.resize(mem_len, 0);
+        std::ptr::copy_nonoverlapping(m.as_ptr(), (p as *mut u32).add(io.len()), m.len());
+        upload.Unmap(0, None);
+        let io_buf = buffer(&dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mem_buf = buffer(&dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(&dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+        let readback = buffer(&dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso).map_err(e)?;
+        let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
+        let viewport = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let scissor = windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 };
+        let clear_flags = if has_stencil { D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL } else { D3D12_CLEAR_FLAG_DEPTH };
+
+        // close, execute and fence-wait the current list; the wait turns a device removal into
+        // an error carrying `GetDeviceRemovedReason`, and a hang into a 10 s timeout error
+        let flush = |list: &ID3D12GraphicsCommandList, value: &mut u64, name: &str| -> Result<(), String> {
+            list.Close().map_err(e)?;
+            queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+            *value += 1;
+            wait_for_submission(&dev, &queue, &fence, *value, name)
+        };
+
+        let mut completed: Vec<String> = Vec::new();
+        let mut failed: Option<(String, String)> = None;
+        // heaps bound per list (the directly-indexed root signature) must outlive their submit
+        let mut _bounds: Vec<Bound> = Vec::new();
+        'run: {
+            // --- compute: write the records ---
+            list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
+            list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
+            list.ResourceBarrier(&[
+                transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ]);
+            _bounds.push(bind_resources(&dev, &list, &[], &[])?);
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+            list.Dispatch(groups, 1, 1);
+            list.ResourceBarrier(&[uav_barrier(&res_buf)]);
+            if let Err(err) = flush(&list, &mut value, "compute") {
+                failed = Some(("compute".into(), err));
+                break 'run;
+            }
+            completed.push("compute".into());
+
+            // --- one normal frame, then `frames` more: clear, mesh write (compress depth +
+            // colour), mesh read (sample the compressed depth), resolve/copy, readback ---
+            for fi in 0..=frames {
+                if let Err(x) = alloc.Reset() {
+                    failed = Some((format!("frame {fi} reset"), e(x)));
+                    break 'run;
+                }
+                if let Err(x) = list.Reset(&alloc, &pso_write) {
+                    failed = Some((format!("frame {fi} reset"), e(x)));
+                    break 'run;
+                }
+                _bounds.push(bind_resources(&dev, &list, &[], &[])?);
+                // write pass
+                list.SetPipelineState(&pso_write);
+                list.SetGraphicsRootSignature(&rs);
+                list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+                list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+                list.ClearDepthStencilView(dsv, clear_flags, 1.0, 0, None);
+                list.RSSetViewports(&[viewport]);
+                list.RSSetScissorRects(&[scissor]);
+                list6.DispatchMesh(groups * split, 1, 1);
+                // read pass: the output-merger orders it after the write on the same targets
+                list.SetPipelineState(&pso_read);
+                list6.DispatchMesh(groups * split, 1, 1);
+                // resolve/copy the colour target (decompresses DCC) + a texture readback
+                list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyResource(&copy_rt, &rt);
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                let name = format!("frame {fi}");
+                if let Err(err) = flush(&list, &mut value, &name) {
+                    failed = Some((name, err));
+                    break 'run;
+                }
+                completed.push(name);
+            }
+
+            // map the readback (the CPU-visible result of the last frame): a removal would
+            // already have surfaced in the frame's fence wait, this only touches the data
+            let mut q = std::ptr::null_mut();
+            if let Err(x) = readback.Map(0, None, Some(&mut q)) {
+                failed = Some(("readback map".into(), e(x)));
+                break 'run;
+            }
+            std::ptr::read_volatile(q as *const u8);
+            readback.Unmap(0, None);
+            completed.push("readback".into());
+        }
+        gpu.value = value;
+        Ok(PoisonReport { completed, failed })
+    }
+}
+
 /// Process memory regions for `run_in_region` (see `gpu::uma`): the memory windows.
 struct Arena {
     pub windows: Vec<(*mut u8, usize)>,

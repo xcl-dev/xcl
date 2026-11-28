@@ -3771,6 +3771,81 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// Poison test: one game-shaped mesh pass into the title's target shape – an `R8G8B8A8_UNORM`
+/// colour target (delta-colour-compressed, unlike `mesh_draw`'s `R32G32B32A32_FLOAT`) and a
+/// `D32_FLOAT_S8X24_UINT` depth buffer primed into its compressed first-use state – then the
+/// operations a normal frame runs afterwards (a depth-reading pass, a colour resolve/copy, a
+/// readback), each separately fenced (`runner::mesh_poison`). A completed dispatch that leaves
+/// depth/colour compression metadata corrupted shows up as a later phase (not the mesh pass)
+/// being the first to hang or remove the device; the report names that phase. If every phase
+/// completes, the mesh pass leaves nothing behind that these frame operations trip over.
+#[test]
+fn gpu_mesh_poison() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::{MsInterface, MESH_HEADER};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R8G8B8A8_UNORM};
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    // a game-shaped pass: 128 threads, 128 vertices / 128 primitives, 4 output rows
+    let params = 4u32;
+    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..params {
+        outputs.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let split = passthrough_split(&ms, passthrough_elements(&ms, None));
+    let (vd, vdq, rd) = (ms.vert_dwords(), ms.vert_dwords() / 4, ms.record_dwords());
+    let tri_base = MESH_HEADER + ms.max_vertices as usize * vd;
+    let (mv, mp) = (ms.max_vertices, ms.max_primitives);
+    let cs_src = format!(
+        "RWByteAddressBuffer res : register(u1);
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {{
+    uint rec = gid.x * {rd}u;
+    res.Store(rec * 4u, {mv}u);
+    res.Store(rec * 4u + 4u, {mp}u);
+    for (uint i = 0u; i < {mv}u; i++) {{
+        uint b = (rec + {MESH_HEADER}u + i * {vd}u) * 4u;
+        float fi = (float)i;
+        float x = -1.0 + 2.0 * frac(fi * 0.123 + 0.05);
+        float y = -1.0 + 2.0 * frac(fi * 0.371 + 0.05);
+        res.Store4(b, asuint(float4(x, y, 0.0, 1.0)));
+        for (uint p = 1u; p < {vdq}u; p++) res.Store4(b + p * 16u, uint4(0u, 0u, 0u, 0u));
+    }}
+    for (uint j = 0u; j < {mp}u; j++) {{
+        uint a = j % {mv}u;
+        uint bb = (j + 1u) % {mv}u;
+        uint cc = (j + 2u) % {mv}u;
+        res.Store((rec + {tri_base}u + j) * 4u, a | (bb << 10u) | (cc << 20u));
+    }}
+}}
+"
+    );
+    let cs = super::dxc::compile(&cs_src, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("cs: {e}"));
+    let pass = mesh_passthrough(&ms);
+    let msb = super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("ms: {e}\n{pass}"));
+    let fields: String = (0..params).map(|k| format!(" float4 p{k} : TEXCOORD{k};")).collect();
+    let ps_src = format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return float4(1, 1, 1, 1); }}\n");
+    let ps = super::dxc::compile(&ps_src, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("ps: {e}"));
+
+    // a 1024x1024 target so depth/colour compression metadata (HiZ/ZCull/DCC) is actually
+    // allocated – small targets may skip it, which would hide the thing we are testing for;
+    // 8 extra frames after the first to catch a delayed effect under sustained load
+    let report = runner::mesh_poison(&cs, &msb, &ps, 1, split, rd, &[], &[], DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 1024, 8).unwrap();
+    assert!(report.ok(), "mesh pass poisoned a later operation: failed at {:?}; completed {:?}", report.failed, report.completed);
+}
+
 #[test]
 fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
     use super::{mesh_passthrough, MsInterface};
