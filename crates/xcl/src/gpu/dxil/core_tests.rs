@@ -887,3 +887,36 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// The console's quad sample mask (#142, `IO_QUAD_KILL`): a PS starts with the mask's test –
+/// on the HLSL path the prologue `emit::quad_mask_prologue` right after the output's zeroing
+/// (before EXEC is taken), with the io dwords 117 / 118 and one uniform branch; on the direct
+/// path one discard more than the program's own (its DONE export's).
+#[test]
+fn quad_sample_mask_starts_pixel_shaders_on_both_paths() {
+    use crate::gpu::recomp::{dxc, emit::quad_mask_prologue, runner, translate as translate_hlsl, Mode, Options, PsInterface, IO_QUAD_KILL};
+    assert_eq!(IO_QUAD_KILL, [117, 118], "the io slots the host writes (`quad_mask::kill_words`)");
+    let p = quad_mask_prologue();
+    assert!(p.contains("io.Load(468u)") && p.contains("io.Load(472u)"), "{p}");
+    assert!(p.contains("[branch] if ((xcl_qk0 | xcl_qk1) != 0u)"), "one uniform test when nothing is masked:\n{p}");
+    assert!(p.contains("uint2(xi.xcl_pos.xy) & 1u") && p.contains("discard;"), "{p}");
+    let color = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)][..], None);
+    let code = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)], None), color]);
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let t = translate_hlsl(&code, &Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() }).unwrap();
+    let start = format!("XclOut main(XclIn xi)\n{{\n    XclOut xo = (XclOut)0;\n{p}");
+    assert!(t.hlsl.contains(&start), "HLSL\n{}", t.hlsl);
+    // the mask is tested before EXEC is taken
+    let main = &t.hlsl[t.hlsl.find("XclOut main(").unwrap()..];
+    assert!(main.find("xcl_qk0").unwrap() < main.find("ballot(true)").unwrap(), "{}", t.hlsl);
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC (the HLSL text is checked)");
+    }
+    let discards = |c: &[u8]| super::validate::disassemble(c).unwrap_or_else(|e| panic!("{e}")).matches("@dx.op.discard(i32 82").count();
+    let compiled = dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let direct = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    // the program's own discard (lanes without a DONE export), and the mask's
+    assert_eq!(discards(&direct.dxil), 2, "direct path's discards");
+    assert!(discards(&compiled) >= 1, "HLSL path's discards");
+}

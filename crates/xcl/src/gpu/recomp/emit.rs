@@ -5438,6 +5438,10 @@ impl Em {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
                 h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                // the console's quad sample mask (#142). A pixel shader given early depth
+                // (`[earlydepthstencil]`) must not get it: the depth of the pixels it discards
+                // would still be written
+                h.push_str(&quad_mask_prologue());
                 if self.ps_writes_mask {
                     h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
                 }
@@ -5483,6 +5487,21 @@ impl Em {
         }
         h
     }
+}
+
+/// The start of every pixel shader: the console's quad sample mask
+/// (`IO_QUAD_KILL`, command list #142). The pixel at (x & 1, y & 1) of its quad is discarded
+/// when the mask takes all 16 of its samples away; nothing is done (one uniform branch) when it
+/// takes none, which is every draw the title does not mask and every draw without
+/// `XCL_SAMPLE_MASK=1`. Discarded before the program's EXEC is taken (`ballot(true)`), the
+/// pixel is a helper lane for its quad's derivatives and out of EXEC, as a pixel the console's
+/// mask leaves uncovered. (A mask that keeps some samples of a pixel keeps the whole pixel; the
+/// retail title only sets 0 or 0xFFFF per pixel.)
+pub fn quad_mask_prologue() -> String {
+    let [lo, hi] = super::IO_QUAD_KILL.map(|k| k * 4);
+    format!(
+        "    uint xcl_qk0 = io.Load({lo}u);\n    uint xcl_qk1 = io.Load({hi}u);\n    [branch] if ((xcl_qk0 | xcl_qk1) != 0u) {{\n        uint2 xcl_qp = uint2(xi.xcl_pos.xy) & 1u;\n        if ((((xcl_qp.y != 0u ? xcl_qk1 : xcl_qk0) >> (xcl_qp.x << 4u)) & 0xFFFFu) == 0xFFFFu)\n            discard;\n    }}\n"
+    )
 }
 
 /// Vertex output struct shared by the VS mode and the mesh pass-through: SV_Position, then

@@ -37,6 +37,9 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// the console's quad sample mask (#142, `quad_mask`) as the io words of the next draws
+    /// (`recomp::IO_QUAD_KILL`: the samples it takes away; [0, 0] = all ones)
+    quad_kill: [u32; 2],
 }
 
 const STATE_SHARDS: usize = 64;
@@ -302,6 +305,7 @@ fn install_reset(
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.quad_kill = [0; 2];
         (old, std::mem::take(&mut s.uma), old_resolution)
     });
     console_list::hold_until_reset(old, blocks);
@@ -377,9 +381,15 @@ fn install_clear_state(
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.quad_kill = [0; 2];
         old_resolution
     });
     drop(old_resolution);
+}
+
+/// #142 `SetQuadSampleMaskX`: the io words of the list's next draws (`quad_mask::kill_words`).
+pub(super) fn set_quad_kill(list: *mut c_void, words: [u32; 2]) {
+    with(list, |s| s.quad_kill = words);
 }
 
 /// Allocation-bearing root state captured before a mid-list split commits. Preparation also
@@ -394,6 +404,7 @@ pub(super) struct PreparedSplit {
     rs_gfx: usize,
     pso: usize,
     resolution: Option<super::pso_async::PipelineResolution>,
+    quad_kill: [u32; 2],
 }
 
 impl PreparedSplit {
@@ -423,9 +434,9 @@ pub(super) fn initial_pipeline(list: *mut c_void) -> (usize, Option<super::pso_a
 
 pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize) -> PreparedSplit {
     let backing = native_backing(to, allocator);
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution) = with(from, |s| {
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution, quad_kill) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso,
-            s.resolution.clone())
+            s.resolution.clone(), s.quad_kill)
     });
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, 0);
@@ -433,12 +444,12 @@ pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
-    PreparedSplit { to: to as usize, allocator: backing, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution }
+    PreparedSplit { to: to as usize, allocator: backing, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution, quad_kill }
 }
 
 /// Install a preflighted split state without cloning or growing the state map.
 pub(super) fn install_prepared_split(prepared: PreparedSplit) {
-    let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution } = prepared;
+    let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution, quad_kill } = prepared;
     let entry = STATES.get(to).expect("prepared split destination state");
     let old_resolution = {
         let mut s = entry.state.lock().unwrap();
@@ -451,6 +462,7 @@ pub(super) fn install_prepared_split(prepared: PreparedSplit) {
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
+        s.quad_kill = quad_kill;
         std::mem::replace(&mut s.resolution, resolution)
     };
     drop(old_resolution);
@@ -1680,6 +1692,8 @@ struct PreparedAbiState {
     io_at: usize,
     res_at: usize,
     allocator: usize,
+    /// the quad sample mask's io words (graphics only)
+    quad_kill: [u32; 2],
 }
 
 fn prepare_abi_state(
@@ -1707,7 +1721,8 @@ fn prepare_abi_state(
             &mut state.uma,
         ).ok_or("unified memory is full")? as usize;
         let res_at = state.arena.take(u, 256, 256, &mut state.uma).ok_or("unified memory is full")? as usize;
-        Ok(PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator: state.allocator })
+        let quad_kill = if gfx { state.quad_kill } else { [0; 2] };
+        Ok(PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator: state.allocator, quad_kill })
     })
 }
 
@@ -1728,6 +1743,18 @@ fn prepared_abi_io(
         }
     }
     io
+}
+
+/// A draw's quad sample mask into its pixel shader's io (`recomp::IO_QUAD_KILL`; nothing to
+/// write when it takes nothing away: the slots are 0).
+fn quad_kill_io(io: &mut [u32], words: [u32; 2]) {
+    if words == [0; 2] {
+        return;
+    }
+    for (k, w) in words.into_iter().enumerate() {
+        io[crate::gpu::recomp::IO_QUAD_KILL[k]] = w;
+    }
+    super::quad_mask::note_masked_draw();
 }
 
 unsafe fn bind_abi_resolved(
@@ -1770,9 +1797,11 @@ unsafe fn bind_abi_with_root_resolved(
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs_exact(pso) };
     let prepared = prepare_abi_state(this, u, gfx, user_sgprs)?;
-    let PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator } = prepared;
+    let PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator, quad_kill } = prepared;
     std::ptr::copy_nonoverlapping(args[inline..].as_ptr(), table_at as *mut u8, args.len() - inline);
-    let io = prepared_abi_io(layout.as_deref(), &args, table_at, gfx, user_sgprs, u.base(), limits);
+    let mut io = prepared_abi_io(layout.as_deref(), &args, table_at, gfx, user_sgprs, u.base(), limits);
+    // the quad sample mask for the pixel shader (graphics only; [0, 0] when all ones)
+    quad_kill_io(&mut io, quad_kill);
     let io_bytes = io.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
     std::ptr::copy_nonoverlapping(io_bytes.as_ptr(), io_at as *mut u8, io_bytes.len());
     std::ptr::write_bytes(res_at as *mut u8, 0, 256);
@@ -3396,6 +3425,36 @@ void main(uint t : SV_GroupIndex) {
         for block in state.uma {
             assert!(u.free(block));
         }
+    }
+
+    /// The quad sample mask (#142): a list's draws get its io words until the list's reset or
+    /// ClearState, and a mid-list split carries them; an all-ones mask writes nothing (the io
+    /// slots stay 0).
+    #[test]
+    fn quad_sample_mask_reaches_the_io_of_the_lists_draws() {
+        let (list, split) = (0x5151_0000usize as *mut c_void, 0x5151_1000usize as *mut c_void);
+        let words = super::super::quad_mask::kill_words(0x0000_FFFF_FFFF_0000);
+        assert_eq!(words, [0xFFFF, 0xFFFF_0000]);
+        set_quad_kill(list, words);
+        assert_eq!(with(list, |s| s.quad_kill), words);
+        let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
+        quad_kill_io(&mut io, words);
+        assert_eq!((io[117], io[118]), (0xFFFF, 0xFFFF_0000));
+        assert!(io.iter().enumerate().all(|(k, &w)| w == 0 || k == 117 || k == 118));
+        let taken = [crate::gpu::recomp::IO_UMA_BASE_HI, crate::gpu::recomp::IO_THREAD_LIMIT[0], crate::gpu::recomp::IO_THREAD_LIMIT[1], crate::gpu::recomp::IO_THREAD_LIMIT[2]];
+        assert!(!crate::gpu::recomp::IO_QUAD_KILL.iter().any(|&k| taken.contains(&k) || k >= crate::gpu::recomp::KERNEL_SCC_SLOT));
+        let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
+        quad_kill_io(&mut io, super::super::quad_mask::kill_words(u64::MAX));
+        assert!(io.iter().all(|&w| w == 0));
+        inherit_for_split(list, split, 0);
+        assert_eq!(with(split, |s| s.quad_kill), words);
+        clear_state(list, 0);
+        assert_eq!(with(list, |s| s.quad_kill), [0; 2]);
+        set_quad_kill(list, words);
+        reset(list, 0, 0);
+        assert_eq!(with(list, |s| s.quad_kill), [0; 2]);
+        forget(list);
+        forget(split);
     }
 
     #[test]

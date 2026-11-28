@@ -219,6 +219,14 @@ pub const IO_UMA_BASE_HI: usize = 112;
 /// the lanes past it out of EXEC. Written by D3D12.X and read by both compute backends.
 /// (113 is left for the group-limit slot of #1428.)
 pub const IO_THREAD_LIMIT: [usize; 3] = [114, 115, 116];
+/// io slots of the console's quad sample mask (command list #142 `SetQuadSampleMaskX(u64)`,
+/// the two PA_SC_AA_MASK registers: 16 sample bits for each pixel of a 2×2 quad), stored
+/// inverted – the samples the mask takes away – so an io block that does not write them (0)
+/// takes nothing away: [117] = pixels (x, y) = (0, 0) in bits 0..15, (1, 0) in 16..31;
+/// [118] = (0, 1), (1, 1). A pixel shader discards a pixel all of whose 16 bits are set
+/// (`emit::quad_mask_prologue`, `Lw::quad_mask_prologue`). 113 is left for #1428's group
+/// limit, 114..116 are the DispatchX thread limits.
+pub const IO_QUAD_KILL: [usize; 2] = [117, 118];
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

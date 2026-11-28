@@ -2033,6 +2033,62 @@ fn gpu_ps_exp_vm_controls_pixel_survival() {
     }
 }
 
+/// The console's quad sample mask (#142, `IO_QUAD_KILL`) on the GPU, through the HLSL and
+/// the direct DXIL pixel shaders: each pixel (x, y) is drawn when the mask keeps the 16-bit
+/// word of its quad position (x & 1) + 2 (y & 1), cleared otherwise – the retail title's
+/// masks (all ones, both diagonals, 3 of 4, 1 of 4) and none.
+#[test]
+fn gpu_quad_sample_mask_discards_the_quad_pixels_it_takes_away() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface, IO_QUAD_KILL, KERNEL_SGPRS};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let ps_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![el("POSITION", 0, 0, 3, 0, 3)], outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], attr_base: 4, params: None };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
+    let vs_hlsl = super::dxc::compile(&translate(&vs_code, &vo).unwrap().hlsl, "main", "vs_6_6", &[]).unwrap();
+    let vs_dxil = translate_vertex(&vs_code, ko, &vsi).unwrap().dxil;
+    let verts = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let clear = [0.0f32, 0.0, 1.0, 1.0];
+    let masks = [u64::MAX, 0x0000_FFFF_FFFF_0000, 0xFFFF_0000_0000_FFFF, 0xFFFF_0000_FFFF_FFFF, 0x0000_FFFF_0000_0000, 0];
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    let pt = translate(&ps_code, &po).unwrap();
+    let ps_hlsl = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let ps_dxil = translate_pixel(&ps_code, ko, &psi).unwrap().dxil;
+    for (backend, vs, ps) in [("hlsl", &vs_hlsl, &ps_hlsl), ("direct_dxil", &vs_dxil, &ps_dxil)] {
+        for mask in masks {
+            let kill = !mask;
+            let mut sgprs = vec![0u32; KERNEL_SGPRS];
+            sgprs[IO_QUAD_KILL[0]] = kill as u32;
+            sgprs[IO_QUAD_KILL[1]] = (kill >> 32) as u32;
+            let px = runner::draw(vs, ps, &layout, &verts, 8, &sgprs, &[], 16, clear).unwrap();
+            for y in 0..16usize {
+                for x in 0..16usize {
+                    let word = (mask >> (16 * ((x & 1) + 2 * (y & 1)))) & 0xFFFF;
+                    let want = if word != 0 { [1.0; 4] } else { clear };
+                    let got = px[y * 16 + x];
+                    assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{backend}, mask {mask:#018x}: pixel ({x},{y}) = {got:?}, expected {want:?}");
+                }
+            }
+        }
+    }
+}
+
 /// `emit::rect_list_gs` declares the VS's output struct; the fourth vertex is v[0] with its
 /// float outputs continued from the other three, its integer (flat) ones left as v[0]'s.
 #[test]

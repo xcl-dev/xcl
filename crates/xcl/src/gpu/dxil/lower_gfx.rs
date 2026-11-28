@@ -236,6 +236,9 @@ impl Lw {
         if let Some(v) = sys(14) {
             vgpr.insert(v as u32, io.coverage(&mut self.s));
         }
+        // the console's quad sample mask (#142), before EXEC is taken (a pixel shader given
+        // early depth must not get it: the depth of the pixels it discards would be written)
+        self.quad_mask_prologue(&mut io, pos);
         self.gfx_common_init(vgpr);
         for (o, _) in targets.values_mut() {
             o.vars = self.out_vars(4);
@@ -249,6 +252,33 @@ impl Lw {
         self.wr(live_var, f);
         self.wr(live_vm_var, f);
         self.gfx = Some(GfxCtx { io, vs: None, ps: Some(ps.clone()), pos: None, params: Vec::new(), ps_in, targets, depth, ps_done: false, ps_vm: false, live_var, live_vm_var });
+    }
+
+    /// The console's quad sample mask (`IO_QUAD_KILL`; the HLSL path's
+    /// `emit::quad_mask_prologue`): the pixel at (x & 1, y & 1) of its quad is discarded when
+    /// the mask takes all 16 of its samples away. Straight-line: two loads of the same io
+    /// dwords for every lane and a few integer operations; a discard whose condition is false
+    /// in every draw the title does not mask (io slots 0).
+    fn quad_mask_prologue(&mut self, io: &mut GraphicsIo, pos: Sig) {
+        let Some(buf) = self.init.io else { return };
+        let [lo, hi] = crate::gpu::recomp::IO_QUAD_KILL;
+        let o = self.c(lo as u32 * 4);
+        let k0 = self.s.raw_load(buf, o, 1)[0];
+        let o = self.c(hi as u32 * 4);
+        let k1 = self.s.raw_load(buf, o, 1)[0];
+        let x = io.load_input(&mut self.s, pos, 0, 0);
+        let y = io.load_input(&mut self.s, pos, 0, 1);
+        let x = self.ftoui(x);
+        let y = self.ftoui(y);
+        let x = self.andc(x, 1);
+        let y = self.andc(y, 1);
+        let odd_row = self.nz(y);
+        let word = self.sel(odd_row, k1, k0);
+        let shift = self.shlc(x, 4);
+        let bits = self.lshr(word, shift);
+        let bits = self.andc(bits, 0xFFFF);
+        let dead = self.cmpc(Pred::Eq, bits, 0xFFFF);
+        io.discard(&mut self.s, dead);
     }
 
     /// SGPRs from `io`, SCC 0, EXEC = `ballot(true)`.

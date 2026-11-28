@@ -30,6 +30,7 @@ pub mod memory_report;
 pub mod null;
 pub mod present;
 pub mod pso_async;
+mod quad_mask;
 mod queue_submit;
 mod pso_manifest;
 pub mod real;

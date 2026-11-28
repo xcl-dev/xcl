@@ -1469,6 +1469,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                // the quad sample mask (newer layout; `quad_mask`)
+                (142, super::quad_mask::set_quad_sample_mask_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -10730,6 +10732,15 @@ mod readback_routing_tests {
         let slots = console_slots(Kind::CommandList);
         assert!(slots.contains(&(53, l::clear_uav_uint_x as usize)));
         assert!(slots.contains(&(54, l::clear_uav_float_x as usize)));
+    }
+
+    /// Newer-layout #142 SetQuadSampleMaskX is the quad sample mask's handler, not the stub
+    /// (and not a pair of `NEWER_LIST_SLOTS`: the older layout's #142 is another method).
+    #[test]
+    fn list_142_sets_the_quad_sample_mask() {
+        let slots = console_slots(Kind::CommandList);
+        assert!(slots.contains(&(142, super::super::quad_mask::set_quad_sample_mask_x as usize)));
+        assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, older)| newer == 142 || older == 142));
     }
 
     /// Bug #6: `Kind::DmaList` must install `cl_release` so releasing a DMA command list removes
