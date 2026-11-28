@@ -37,7 +37,11 @@ const IID_XBOX_DMA_COMMAND_LIST: GUID = GUID::from_u128(0x30bc77b9_8379_4b25_95d
 const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
-const XBOX_ARG_DISPATCH_X: u32 = 105;
+/// console indirect-argument types: padding (SizeInBytes skipped), DispatchX (X, Y, Z, dispatch
+/// flags) and Dispatch with the flags in the desc (the PC's 12-byte record)
+const XBOX_ARG_PADDING: u32 = 100;
+const XBOX_ARG_DISPATCH_X: u32 = 104;
+const XBOX_ARG_DISPATCH: u32 = 105;
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchMesh (a UE5 title's mesh dispatch
 /// signature: this one argument, stride 16)
 const XBOX_ARG_DISPATCH_MESH_X: u32 = 107;
@@ -1324,12 +1328,9 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     }
 }
 
-/// The PC argument type of a console one: DispatchX (105) is a PC Dispatch, DispatchMeshX (107)
-/// a PC DispatchMesh (the PC refuses both console types: debug layer 743, "Unexpected
-/// parameter type"); the others are the PC's own.
 fn pc_argument_type(t: u32) -> u32 {
     match t {
-        XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+        XBOX_ARG_DISPATCH => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
         XBOX_ARG_DISPATCH_MESH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32,
         t => t,
     }
@@ -1348,8 +1349,30 @@ fn indirect_arg_bytes(arg: &[u32; 4]) -> u32 {
     }
 }
 
-/// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument
-/// types become the PC's (`pc_argument_type`); the root signature only goes with arguments
+/// A title's indirect arguments as the PC's, where a PC argument takes the same record: 105 (Dispatch
+/// with its flags in the desc) anywhere, and, as the last argument, 104 (DispatchX: the PC's 12-byte
+/// record and a flags dword, which the title's stride covers) is a Dispatch and a padding (100) is
+/// dropped. Mesh dispatch keeps the PC mapping. A layout-changing argument in
+/// the middle of a record would need the argument buffer repacked.
+fn pc_indirect_args(title: &[[u32; 4]]) -> Vec<[u32; 4]> {
+    let dispatch = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+    let mut list = title.to_vec();
+    while list.len() > 1 && list.last().is_some_and(|a| a[0] == XBOX_ARG_PADDING) {
+        list.pop();
+    }
+    let last = list.len().wrapping_sub(1);
+    for (k, a) in list.iter_mut().enumerate() {
+        if a[0] == XBOX_ARG_DISPATCH || (a[0] == XBOX_ARG_DISPATCH_X && k == last) {
+            *a = [dispatch, 0, 0, 0];
+        } else {
+            a[0] = pc_argument_type(a[0]);
+        }
+    }
+    list
+}
+
+/// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument types
+/// as `pc_indirect_args`; the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
@@ -1359,11 +1382,10 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     std::ptr::copy_nonoverlapping(desc, pc.as_mut_ptr(), 24);
     let n = u32::from_le_bytes(pc[4..8].try_into().unwrap()) as usize;
     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
-    let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
-    for a in list.iter_mut() {
-        a[0] = pc_argument_type(a[0]);
-    }
+    let title: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
+    let list = pc_indirect_args(&title);
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
+    pc[4..8].copy_from_slice(&(list.len() as u32).to_le_bytes());
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
     if hr < 0 {
@@ -1394,6 +1416,13 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
             }
         }
     }
+    if title.iter().any(|a| a[0] >= XBOX_ARG_PADDING) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            let types: Vec<u32> = title.iter().map(|a| a[0]).collect();
+            crate::xlog_info!("D3D12.X: command signature with console argument types {types:?}, stride {}: {hr:#x}", u32::from_le_bytes(pc[..4].try_into().unwrap()));
+        }
+    }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         // (noted at every creation, so a signature made at a freed one's address does not keep
         // the old one's kind)
@@ -1422,6 +1451,20 @@ mod tests {
             assert_eq!(alloc, 0x1000);
             0x2000
         }), 0x2000);
+    }
+
+    /// A trailing DispatchX (104) is a Dispatch with the title's stride, a trailing padding is dropped,
+    /// 105 is a Dispatch anywhere, and other console types are left for the PC to refuse.
+    #[test]
+    fn console_indirect_arguments_become_the_pcs_where_the_record_is_the_same() {
+        let dispatch = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+        let constant = [D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT.0 as u32, 0, 0, 1];
+        assert_eq!(pc_indirect_args(&[constant, [104, 0, 0, 0]]), vec![constant, [dispatch, 0, 0, 0]]);
+        assert_eq!(pc_indirect_args(&[[dispatch, 0, 0, 0], [100, 4, 0, 0]]), vec![[dispatch, 0, 0, 0]]);
+        assert_eq!(pc_indirect_args(&[[105, 7, 0, 0]]), vec![[dispatch, 0, 0, 0]]);
+        let draw = [D3D12_INDIRECT_ARGUMENT_TYPE_DRAW.0 as u32, 0, 0, 0];
+        assert_eq!(pc_indirect_args(&[[101, 0, 0, 0], draw]), vec![[101, 0, 0, 0], draw], "a topology record is not the PC's");
+        assert_eq!(pc_indirect_args(&[[104, 0, 0, 0], draw]), vec![[104, 0, 0, 0], draw], "a DispatchX in the middle is a 16-byte record");
     }
 
     #[test]
