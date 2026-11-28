@@ -337,6 +337,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default. Expiry stops the title before later GPU work is submitted; it never treats elapsed
     time as proof that the waited-for work completed.
+- `XCL_UMA_WINDOWS` and `XCL_HEAP_WINDOWS`: the title's graphics memory is split into 4 GiB
+    windows, 4 by default. `XCL_UMA_WINDOWS=8` or `16` widens the layout only together with
+  `XCL_HEAP_WINDOWS=1` (heap-backed shaders; only the exact value `1` enables it). Any other
+  `XCL_UMA_WINDOWS` value, or 8/16 without `XCL_HEAP_WINDOWS=1`, logs a warning and keeps 4.
+  Use the same settings for offline preparation and play: they change the pipeline keys.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
   Loading a cached shader without split pieces reuses the file buffer, avoiding a second
