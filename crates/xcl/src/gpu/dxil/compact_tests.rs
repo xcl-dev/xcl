@@ -46,6 +46,98 @@ fn size(copies: usize, o: KernelOptions, compact: bool) -> usize {
     translate_full_as(&repeated(copies), o, compact).unwrap_or_else(|e| panic!("{copies} copies, compact {compact}: {e}")).dxil.len()
 }
 
+fn repeated_scalar_loads(copies: usize, addresses: usize) -> Vec<u8> {
+    let inst = |name, encoding, fields: &[(&str, u64)]| encode(name, encoding, fields, None).unwrap();
+    let add = inst("S_ADD_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 12)]);
+    let branch = inst("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]);
+    let count = inst("S_ADD_U32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 21), ("SSRC1", 129)]);
+    let loads: Vec<_> = (0..addresses).map(|address| {
+        inst("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", (address * 4) as u64), ("SOFFSET", 125)])
+    }).collect();
+    let mut code = Vec::new();
+    for reg in [20, 21] {
+        code.extend(inst("S_MOV_B32", "ENC_SOP1", &[("SDST", reg), ("SSRC0", 128)]));
+    }
+    for i in 0..copies {
+        code.extend_from_slice(&loads[i % addresses]);
+        code.extend_from_slice(&add);
+        code.extend_from_slice(&branch);
+        code.extend_from_slice(&count);
+    }
+    // Leave the accumulated value observable for the compute entry, which does not return SGPRs.
+    code.extend(inst("S_ADD_U32", "ENC_SOP2", &[("SDST", 22), ("SSRC0", 20), ("SSRC1", 21)]));
+    code.extend(inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 22)]));
+    code.extend(inst("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)]));
+    code.extend(inst("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 6), ("OFFSET", 0)]));
+    code.extend(inst("S_ENDPGM", "ENC_SOPP", &[]));
+    code
+}
+
+/// A CPU-only whole-translation comparison for the compact path and its ordinary counterpart.
+#[test]
+fn scalar_load_compact_reload_comparison() {
+    use super::{cfg::Cfg, compact, kernel::Entry, lower::Lw, reload};
+    use crate::gpu::recomp::CsInterface;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    let output = std::env::var_os("XCL_2746_DXIL_DIR").map(PathBuf::from);
+    let baseline = std::env::var_os("XCL_2746_BASELINE_DIR").map(PathBuf::from);
+    let check_output = |name: &str, contents: &[u8]| {
+        if let Some(dir) = &baseline {
+            let expected = std::fs::read(dir.join(name)).unwrap();
+            assert!(expected == contents, "{name} differs from baseline DXIL");
+            println!("{name}: all {} bytes match baseline", contents.len());
+        }
+        if let Some(dir) = &output {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), contents).unwrap();
+        }
+    };
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let code = repeated_scalar_loads(128, 8);
+    let cfg = Cfg::build(&code).unwrap();
+    assert_eq!(reload::analyze(&cfg).counts(), (128, 120), "ordinary lowering has live repeat loads");
+    let ordinary = translate_full_as(&code, o, false).unwrap();
+    let packed = translate_full_as(&code, o, true).unwrap();
+    assert!(ordinary.dxil != packed.dxil, "the compact and ordinary emission paths must both be exercised");
+    check_output("kernel-ordinary.dxil", &ordinary.dxil);
+    check_output("kernel-compact.dxil", &packed.dxil);
+    println!("scalar reload fixture: ordinary={} B, compact={} B", ordinary.dxil.len(), packed.dxil.len());
+
+    if std::env::var("XCL_2746_BENCH").ok().as_deref() != Some("1") {
+        return;
+    }
+    assert!(compact_mode().is_none(), "benchmark the automatic compact plan");
+    let code = repeated_scalar_loads(8192, 128);
+    let cfg = Cfg::build(&code).unwrap();
+    assert_eq!((cfg.insts.len(), cfg.rpo.len()), (32_775, 16_385));
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 8, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let lw = Lw::new(&cfg.insts, &leaders, o, &Entry::Compute(cs.clone()));
+    let plan = compact::automatic_plan(&cfg, &lw, true)
+        .expect("large scalar-load fixture selects compact");
+    println!("automatic plan: blocks={}, representatives={}, words={}", plan.order.len(), plan.rep.len(), plan.words());
+    drop((plan, lw, cfg));
+
+    let translate = || {
+        let translated = super::kernel::translate_compute(&code, o, &cs).unwrap();
+        assert!(translated.dispatch_chain.is_none(), "the fixture emits a whole pipeline");
+        translated.dxil
+    };
+    let reference = translate();
+    let mut samples = [0u128; 3];
+    for sample in &mut samples {
+        let begin = Instant::now();
+        let dxil = translate();
+        *sample = begin.elapsed().as_micros();
+        assert!(dxil == reference, "repeated automatic translation changed its DXIL");
+    }
+    samples.sort_unstable();
+    println!("automatic compact whole translation: {} B, samples_us={samples:?}, median_us={}", reference.len(), samples[1]);
+    check_output("compute-automatic.dxil", &reference);
+}
+
 #[test]
 fn the_compact_form_lowers_a_repeated_block_once() {
     for (wave64, split) in [(false, false), (true, true), (true, false)] {

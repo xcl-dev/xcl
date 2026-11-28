@@ -380,8 +380,9 @@ fn translate_on_this_thread(
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
-    // the other stages enter their code by edges the CFG does not hold)
-    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
+    // the other stages enter their code by edges the CFG does not hold; the compact form
+    // lowers its blocks without them)
+    let reloads = if follow_loads && plan.is_none() { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
         match nest {
