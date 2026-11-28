@@ -824,8 +824,16 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&pc_resource_flags(flags).to_le_bytes());
     d
+}
+
+/// The PC resource flags of a console desc's `flags`: 0x1-0x20 as they are; the console's 0x80 is
+/// a raytracing acceleration-structure buffer (the PC's 0x80 is a video-encode reference), which
+/// the PC wants as ALLOW_UNORDERED_ACCESS; 0x40 and the texture-compatibility flags (0x100,
+/// 0x200) and above are console-only and dropped.
+pub fn pc_resource_flags(flags: u32) -> u32 {
+    (flags & 0x3F) | if flags & 0x80 != 0 { 4 } else { 0 }
 }
 
 /// The PC initial state of a resource the console creates in `state` with resource flags
@@ -1414,6 +1422,19 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_resource_flags_map_to_pc_ones() {
+        use super::pc_resource_flags;
+        assert_eq!(pc_resource_flags(0x80), 0x4, "console acceleration structure: UAV, not a video flag");
+        assert_eq!(pc_resource_flags(0x84), 0x4);
+        assert_eq!((pc_resource_flags(0x100), pc_resource_flags(0x200)), (0, 0));
+        assert_eq!(pc_resource_flags(0x40), 0);
+        for f in 0x1..=0x20u32 {
+            assert_eq!(pc_resource_flags(f), f);
+        }
+        assert_eq!(pc_resource_flags(0x10_0000 | 0x2), 0x2);
+    }
+
     use super::*;
 
     #[test]

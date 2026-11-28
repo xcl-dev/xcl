@@ -2108,7 +2108,7 @@ fn uma_shadowed() -> bool {
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
 fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize, cross_adapter: bool) -> (D3D12_RESOURCE_DESC, u32) {
     let mut d = *desc;
-    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF);
+    d.Flags = D3D12_RESOURCE_FLAGS(super::device_x::pc_resource_flags(d.Flags.0 as u32) as i32);
     // a shadowed window's heap is video memory, not a cross-adapter heap over process memory;
     // nor is a driver heap (`uma_driver`)
     if cross_adapter && !uma_shadowed() {
