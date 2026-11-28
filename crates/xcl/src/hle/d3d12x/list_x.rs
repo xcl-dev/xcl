@@ -6166,6 +6166,20 @@ fn is_occlusion(ty: D3D12_QUERY_TYPE) -> bool {
     ty == D3D12_QUERY_TYPE_OCCLUSION || ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION
 }
 
+/// the console's predication-status query type (12): the PC has none, so it never reaches it
+fn is_predication_status(ty: D3D12_QUERY_TYPE) -> bool {
+    ty.0 == 12
+}
+
+/// A console predication-status query is not kept: logged once, answered 0 at resolve ("not
+/// predicated").
+fn note_predication_status() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if once(&N, 1) {
+        crate::xlog_info!("D3D12.X: predication-status query (type 12) – not on the PC: it resolves to 0");
+    }
+}
+
 type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32);
 
 /// command list #10 Reset(allocator, initial pipeline) as console code calls it on a PC list.
@@ -6835,6 +6849,10 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
 /// command list #28 BeginQuery(heap, type, index) (PC #52)
 pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
+    if is_predication_status(ty) {
+        note_predication_status();
+        return;
+    }
     if is_occlusion(ty) {
         let outer = LISTS.lock()
             .unwrap()
@@ -6858,6 +6876,10 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
 
 /// command list #29 EndQuery(heap, type, index) (PC #53)
 pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
+    if is_predication_status(ty) {
+        note_predication_status();
+        return;
+    }
     if is_occlusion(ty) {
         let (forward, force_visible) = LISTS.lock()
             .unwrap()
@@ -6886,13 +6908,22 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
     note_copy_into(this as usize, dest, offset, count as u64 * if ty == D3D12_QUERY_TYPE_PIPELINE_STATISTICS { 88 } else { 8 });
     let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
-    if !is_occlusion(ty) {
+    let predication = is_predication_status(ty);
+    if predication {
+        note_predication_status();
+    } else {
+        pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
+    }
+    if !is_occlusion(ty) && !predication {
         return;
     }
-    let visible: Vec<(u32, u64)> = match VISIBLE.lock().unwrap().as_ref() {
-        Some(m) if !m.is_empty() => (first..first.saturating_add(count)).filter_map(|i| m.get(&(heap, i)).map(|&v| (i, v))).collect(),
-        _ => return,
+    let visible: Vec<(u32, u64)> = if predication {
+        (first..first.saturating_add(count)).map(|i| (i, 0)).collect()
+    } else {
+        match VISIBLE.lock().unwrap().as_ref() {
+            Some(m) if !m.is_empty() => (first..first.saturating_add(count)).filter_map(|i| m.get(&(heap, i)).map(|&v| (i, v))).collect(),
+            _ => return,
+        }
     };
     let dest = dest as *mut c_void;
     if dest.is_null() || visible.is_empty() {
@@ -9106,6 +9137,54 @@ mod tests {
                 ]
             );
         });
+    }
+
+    /// A console predication-status query (type 12) never reaches the PC: Begin / End are
+    /// dropped and the resolve writes 0 for each query through WriteBufferImmediate.
+    #[test]
+    fn predication_status_query_resolves_to_zero_without_a_pc_call() {
+        use std::sync::atomic::AtomicUsize;
+        static PC_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static WRITES: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+
+        unsafe extern "system" fn fake_query(_: *mut c_void, _: usize, _: D3D12_QUERY_TYPE, _: u32) {
+            PC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "system" fn fake_resolve(_: *mut c_void, _: usize, _: D3D12_QUERY_TYPE, _: u32, _: u32, _: usize, _: u64) {
+            PC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "system" fn fake_write_immediate(_: *mut c_void, count: u32, params: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, _: *const D3D12_WRITEBUFFERIMMEDIATE_MODE) {
+            for p in std::slice::from_raw_parts(params, count as usize) {
+                WRITES.lock().unwrap().push((p.Dest, p.Value));
+            }
+        }
+        unsafe extern "system" fn fake_gpu_va(_: *mut c_void) -> u64 {
+            0x2_0000_0000
+        }
+        #[repr(C)]
+        struct FakeCom {
+            vt: *const usize,
+        }
+        let mut orig = [0usize; 70];
+        orig[PC_BEGIN_QUERY] = fake_query as usize;
+        orig[PC_END_QUERY] = fake_query as usize;
+        orig[PC_RESOLVE_QUERY_DATA] = fake_resolve as usize;
+        orig[PC_WRITE_BUFFER_IMMEDIATE] = fake_write_immediate as usize;
+        let ext = [orig.as_ptr() as usize, 0usize];
+        let mut list = FakeCom { vt: unsafe { ext.as_ptr().add(1) } };
+        let mut res_vt = [0usize; 16];
+        res_vt[11] = fake_gpu_va as usize;
+        let mut res = FakeCom { vt: res_vt.as_ptr() };
+        let ty = D3D12_QUERY_TYPE(12);
+        let l = &mut list as *mut FakeCom as *mut c_void;
+        unsafe {
+            begin_query_x(l, 0x5555_0002, ty, 0);
+            end_query_x(l, 0x5555_0002, ty, 0);
+            resolve_query_data_x(l, 0x5555_0002, ty, 1, 2, &mut res as *mut FakeCom as usize, 0x40);
+        }
+        assert_eq!(PC_CALLS.load(Ordering::Relaxed), 0, "type 12 must not reach the PC");
+        let a = 0x2_0000_0000u64 + 0x40;
+        assert_eq!(*WRITES.lock().unwrap(), vec![(a, 0), (a + 4, 0), (a + 8, 0), (a + 12, 0)]);
     }
 
     /// SetDescriptorHeaps(0, NULL) unbinds every heap: the list must not still count the

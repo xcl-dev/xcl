@@ -4833,7 +4833,47 @@ unsafe fn suspend_other_threads(keep: u32) {
         CloseHandle(snap);
     }
 }
-creator!(dev_create_query_heap, "CreateQueryHeap", Kind::QueryHeap, [a1]);
+creator!(dev_create_query_heap_pc, "CreateQueryHeap", Kind::QueryHeap, [a1]);
+
+/// A console query-heap type as the PC's: 9 / 10 are the console's occlusion / timestamp heaps
+/// that a resolve does not wait on (the PC's resolve is always ordered): 0 / 1; 7 / 11 are its
+/// copy-engine timestamp heaps (the PC's 7 is PIPELINE_STATISTICS1): COPY_QUEUE_TIMESTAMP (5)
+/// where the device has it, else a plain timestamp heap (1). The others are the PC's.
+fn pc_query_heap_type(console: i32, copy_timestamps: bool) -> i32 {
+    match console {
+        9 => 0,
+        10 => 1,
+        7 | 11 => if copy_timestamps { 5 } else { 1 },
+        t => t,
+    }
+}
+
+/// CreateQueryHeap: the console's heap types as the PC's (`pc_query_heap_type`).
+pub(super) unsafe extern "system" fn dev_create_query_heap(this: *mut c_void, desc: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    static COPY_TS: AtomicU32 = AtomicU32::new(0);
+    static N: AtomicU32 = AtomicU32::new(0);
+    if desc == 0 || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_QUERY_HEAP_DESC>()) {
+        return dev_create_query_heap_pc(this, desc, riid, ppv);
+    }
+    let mut d: D3D12_QUERY_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_QUERY_HEAP_DESC);
+    if !matches!(d.Type.0, 7 | 9 | 10 | 11) {
+        return dev_create_query_heap_pc(this, desc, riid, ppv);
+    }
+    if COPY_TS.load(Ordering::Relaxed) == 0 {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let ok = ID3D12Device::from_raw_borrowed(&this).is_some_and(|dev| {
+            dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.CopyQueueTimestampQueriesSupported.as_bool()
+        });
+        COPY_TS.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    }
+    let copy = COPY_TS.load(Ordering::Relaxed) == 1;
+    let pc = pc_query_heap_type(d.Type.0, copy);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_info!("D3D12.X: query heap type {} (count {}) made as the PC's {pc}{}", d.Type.0, d.Count, if matches!(d.Type.0, 7 | 11) && !copy { " (no copy-queue timestamps on this device)" } else { "" });
+    }
+    d.Type = D3D12_QUERY_HEAP_TYPE(pc);
+    dev_create_query_heap_pc(this, &d as *const _ as usize, riid, ppv)
+}
 creator!(dev_create_command_signature, "CreateCommandSignature", Kind::CommandSignature, [a1, a2]);
 creator!(dev_create_pipeline_library, "CreatePipelineLibrary", Kind::PipelineLibrary, [a1, a2]);
 creator!(dev_create_state_object, "CreateStateObject", Kind::StateObject, [a1]);
@@ -13765,6 +13805,29 @@ mod mesh_stream_tests {
             // Case 2: caller passes ppv == null
             let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], 0, "MS", &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
+        }
+    }
+}
+
+#[cfg(test)]
+mod query_heap_type_tests {
+    use super::pc_query_heap_type as map;
+
+    #[test]
+    fn console_query_heap_types_become_the_pcs() {
+        for (console, pc) in [(9, 0), (10, 1)] {
+            assert_eq!(map(console, true), pc, "console {console}");
+            assert_eq!(map(console, false), pc, "console {console}, no copy-queue timestamps");
+        }
+        // the copy-engine timestamp heaps (the PC's 7 is PIPELINE_STATISTICS1)
+        for console in [7, 11] {
+            assert_eq!(map(console, true), 5);
+            assert_eq!(map(console, false), 1);
+        }
+        // the shared types stay
+        for t in [0, 1, 2, 3, 5] {
+            assert_eq!(map(t, true), t);
+            assert_eq!(map(t, false), t);
         }
     }
 }
