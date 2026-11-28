@@ -1005,14 +1005,14 @@ impl ShaderCache {
 
 /// Per-`ShaderKey` in-flight mutex so concurrent PSO workers requesting the same shader coalesce
 /// into a single translation/compilation instead of translating the same program N times in parallel.
-fn shader_flight(key: ShaderKey) -> Arc<Mutex<()>> {
-    static FLIGHTS: OnceLock<Mutex<HashMap<ShaderKey, Weak<Mutex<()>>>>> = OnceLock::new();
+fn shader_flight(key: ShaderKey) -> Arc<dxc::Flight> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<ShaderKey, Weak<dxc::Flight>>>> = OnceLock::new();
     let mut flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     flights.retain(|_, v| v.strong_count() != 0);
     if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
         return flight;
     }
-    let flight = Arc::new(Mutex::new(()));
+    let flight = Arc::new(dxc::Flight::default());
     flights.insert(key, Arc::downgrade(&flight));
     flight
 }
@@ -1038,7 +1038,7 @@ fn cached_shader(
         return Ok(shader);
     }
     let flight = shader_flight(key.clone());
-    let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = flight.enter();
     if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
         dxc::note_memory_hit();
         return Ok(shader);
@@ -2566,6 +2566,69 @@ mod shader_cache_tests {
             probe.join().unwrap();
             assert!(result.unwrap());
         });
+    }
+
+    /// A background build compiles a shader and a pipeline the title waits for needs the same
+    /// one: it is compiled once, and the compile is wanted from the moment the title waits for
+    /// the second pipeline – what a DXC job of the first build asks while it is held back.
+    #[test]
+    fn a_waiter_for_a_shared_shader_makes_its_compile_wanted() {
+        use crate::hle::d3d12x::pso_async;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        if dxc::compile_threads() < 2 {
+            eprintln!("SKIPPED a_waiter_for_a_shared_shader_makes_its_compile_wanted: one PSO worker");
+            return;
+        }
+        let cache = Arc::new(Mutex::new(ShaderCache::new(1 << 20)));
+        let shared = key(0x2608_0001);
+        let compiles = Arc::new(AtomicUsize::new(0));
+        let (owner, joiner) = (0x7E57_2601usize, 0x7E57_2602usize);
+        let (demand_tx, demand_rx) = std::sync::mpsc::channel();
+        let (go, finish) = std::sync::mpsc::channel::<()>();
+        {
+            let (cache, shared, compiles) = (cache.clone(), shared.clone(), compiles.clone());
+            pso_async::submit(owner, true, Box::new(move || {
+                let r = cached_shader(&cache, shared, b"shared", || {
+                    compiles.fetch_add(1, Ordering::SeqCst);
+                    demand_tx.send(dxc::demand()).unwrap();
+                    let _ = finish.recv_timeout(Duration::from_secs(10));
+                    Ok(compiled(8))
+                });
+                if r.is_ok() { 0x2601 } else { 0 }
+            }));
+        }
+        let wanted = demand_rx.recv_timeout(Duration::from_secs(10)).expect("the background build compiles");
+        assert!(!wanted(), "nobody waits for the background build");
+        {
+            let (cache, shared, compiles) = (cache.clone(), shared.clone(), compiles.clone());
+            pso_async::submit(joiner, true, Box::new(move || {
+                let r = cached_shader(&cache, shared, b"shared", || {
+                    compiles.fetch_add(1, Ordering::SeqCst);
+                    Ok(compiled(9))
+                });
+                if r.is_ok_and(|s| s.dxil == synthetic_dxil(8)) { 0x2602 } else { 0 }
+            }));
+        }
+        let flight = shader_flight(shared);
+        let t = Instant::now();
+        while flight.waiters() == 0 && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(flight.waiters(), 1, "the second build waits for the compile");
+        assert!(!wanted(), "nobody waits for either build");
+        pso_async::need_by_submit(joiner);
+        let urgent = wanted();
+        go.send(()).unwrap();
+        assert!(urgent, "the title waits for the second build: the shared compile is wanted");
+        let t = Instant::now();
+        while (pso_async::is_pending(owner) || pso_async::is_pending(joiner)) && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!((pso_async::resolve(owner), pso_async::resolve(joiner)), (0x2601, 0x2602), "both built, the second from the first's compile");
+        assert_eq!(compiles.load(Ordering::SeqCst), 1);
+        assert_eq!(flight.waiters(), 0);
+        let _ = (pso_async::released(owner), pso_async::released(joiner));
     }
 
     #[test]

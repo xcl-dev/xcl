@@ -629,7 +629,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
         profile: profile.into(),
         extra: extra.iter().map(|s| s.to_string()).collect(),
         reply,
-        wanted: crate::hle::d3d12x::pso_async::wanted_here(),
+        wanted: demand(),
         queue_stall: crate::stall::span(crate::stall::StallKind::DxcQueue),
     };
     pool().push(job).map_err(|_| "DXC: no compile threads".to_string())?;
@@ -957,16 +957,92 @@ pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> R
     compile_cached_in_with(dir, src, entry, profile, || compile(src, entry, profile, &[]))
 }
 
+/// One compile several callers need (a translated shader, `pso::shader_flight`; a DXC source,
+/// `cache_flight`): the first to `enter` does it, the others wait for it. The compile is wanted
+/// while any of them is (`demand`): a pipeline the title waits for can share the compile of a
+/// background one that started first, which used to be held back as unwanted.
+#[derive(Default)]
+pub struct Flight {
+    lock: Mutex<()>,
+    /// the demand of each caller waiting to enter (`demand`), by `WAITER`
+    waiting: Mutex<Vec<(u64, Wanted)>>,
+}
+
+static WAITER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// the flights this thread is in: their waiters wait for what it compiles
+    static ENTERED: RefCell<Vec<Arc<Flight>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// This thread is in the flight until it drops this.
+pub struct InFlight<'a> {
+    flight: &'a Arc<Flight>,
+    _lock: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        ENTERED.with(|e| {
+            let mut e = e.borrow_mut();
+            if let Some(at) = e.iter().rposition(|f| Arc::ptr_eq(f, self.flight)) {
+                e.remove(at);
+            }
+        });
+    }
+}
+
+impl Flight {
+    /// Wait for the caller in it, if any, and go in; while this caller waits, its `demand` is
+    /// the flight's too.
+    pub fn enter(self: &Arc<Self>) -> InFlight<'_> {
+        let lock = match self.lock.try_lock() {
+            Ok(lock) => lock,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let id = WAITER.fetch_add(1, Ordering::Relaxed);
+                self.waiting.lock().unwrap().push((id, demand()));
+                let lock = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.waiting.lock().unwrap().retain(|(w, _)| *w != id);
+                lock
+            }
+        };
+        ENTERED.with(|e| e.borrow_mut().push(self.clone()));
+        InFlight { flight: self, _lock: lock }
+    }
+
+    fn wanted(&self) -> bool {
+        self.waiting.lock().unwrap().iter().any(|(_, wanted)| wanted())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> usize {
+        self.waiting.lock().unwrap().len()
+    }
+}
+
+/// Whether one of the title's threads waits for what this thread compiles, to be asked later and
+/// from another thread: `pso_async::wanted_here`, or one of the callers waiting for a flight this
+/// thread is in wants it (`Flight`).
+pub fn demand() -> Wanted {
+    let own = crate::hle::d3d12x::pso_async::wanted_here();
+    let entered = ENTERED.with(|e| e.borrow().clone());
+    if entered.is_empty() {
+        return own;
+    }
+    Box::new(move || own() || entered.iter().any(|f| f.wanted()))
+}
+
 type CacheFlight = (PathBuf, u64);
 
-fn cache_flight(key: CacheFlight) -> Arc<Mutex<()>> {
-    static FLIGHTS: OnceLock<Mutex<HashMap<CacheFlight, Weak<Mutex<()>>>>> = OnceLock::new();
+fn cache_flight(key: CacheFlight) -> Arc<Flight> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<CacheFlight, Weak<Flight>>>> = OnceLock::new();
     let mut flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     flights.retain(|_, v| v.strong_count() != 0);
     if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
         return flight;
     }
-    let flight = Arc::new(Mutex::new(()));
+    let flight = Arc::new(Flight::default());
     flights.insert(key, Arc::downgrade(&flight));
     flight
 }
@@ -1179,7 +1255,7 @@ where
     }
     counters.misses.fetch_add(1, Ordering::Relaxed);
     let flight = cache_flight((dir.clone(), key));
-    let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = flight.enter();
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
     if let Some(b) = cached_file(&file) {
@@ -1563,6 +1639,65 @@ mod cache_tests {
         let (dxil, hit) = compile_cached_in_with(&dir, "retry", "main", "cs_6_6", || Ok(synthetic_dxil(9))).unwrap();
         assert!(!hit);
         assert_eq!(dxil, synthetic_dxil(9));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two builds of different translated shaders reach the same DXC source, a background one
+    /// first: it is compiled once, and the compile is wanted from the moment the title waits for
+    /// the second build.
+    #[test]
+    fn a_waiter_for_the_same_source_makes_its_compile_wanted() {
+        use crate::hle::d3d12x::pso_async;
+        use std::time::Instant;
+        if compile_threads() < 2 {
+            eprintln!("SKIPPED a_waiter_for_the_same_source_makes_its_compile_wanted: one PSO worker");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-demand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let counters: &'static CacheCounters = Box::leak(Box::default());
+        let (owner, joiner) = (0x7E57_2611usize, 0x7E57_2612usize);
+        let (demand_tx, demand_rx) = std::sync::mpsc::channel();
+        let (go, finish) = std::sync::mpsc::channel::<()>();
+        {
+            let dir = dir.clone();
+            pso_async::submit(owner, true, Box::new(move || {
+                let r = compile_cached_in_observed(&dir, "converging source", "main", "cs_6_6", counters, || {
+                    demand_tx.send(demand()).unwrap();
+                    let _ = finish.recv_timeout(Duration::from_secs(10));
+                    Ok(synthetic_dxil(6))
+                });
+                if r.is_ok() { 0x2611 } else { 0 }
+            }));
+        }
+        let wanted = demand_rx.recv_timeout(Duration::from_secs(10)).expect("the background build compiles");
+        assert!(!wanted(), "nobody waits for the background build");
+        {
+            let dir = dir.clone();
+            pso_async::submit(joiner, true, Box::new(move || {
+                let r = compile_cached_in_observed(&dir, "converging source", "main", "cs_6_6", counters, || Ok(synthetic_dxil(7)));
+                if r.is_ok_and(|(b, hit)| hit && b == synthetic_dxil(6)) { 0x2612 } else { 0 }
+            }));
+        }
+        let flight = cache_flight((normalized_cache_dir(&dir), cache_key("converging source", "main", "cs_6_6")));
+        let t = Instant::now();
+        while flight.waiters() == 0 && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(flight.waiters(), 1, "the second build waits for the compile");
+        assert!(!wanted(), "nobody waits for either build");
+        pso_async::need_by_submit(joiner);
+        let urgent = wanted();
+        go.send(()).unwrap();
+        assert!(urgent, "the title waits for the second build: the shared compile is wanted");
+        let t = Instant::now();
+        while (pso_async::is_pending(owner) || pso_async::is_pending(joiner)) && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!((pso_async::resolve(owner), pso_async::resolve(joiner)), (0x2611, 0x2612), "both built, the second from the first's compile");
+        assert_eq!(counters.snapshot().compilations, 1);
+        assert_eq!(flight.waiters(), 0);
+        let _ = (pso_async::released(owner), pso_async::released(joiner));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
