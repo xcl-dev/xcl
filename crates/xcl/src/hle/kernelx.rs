@@ -1272,22 +1272,32 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     // size 0 is the whole of a graphics reservation, which may hold places of shown pages)
     let whole = if size == 0 { GRAPHICS_RESERVATIONS.lock().unwrap().get(&(addr as usize)).copied().unwrap_or(0) } else { size };
     let part = if release != (t & mem::MEM_DECOMMIT != 0) && !(release && size != 0) { source_part(addr as usize, whole) } else { None };
-    // a graphics reservation is unpaired before Windows can hand its address out again
-    let graphics = t & 0x8000 != 0 && size == 0 && GRAPHICS_RESERVATIONS.lock().unwrap().contains_key(&(addr as usize));
-    if graphics {
+    // a graphics reservation is unpaired before Windows can hand its address out again, and
+    // forgotten before then too – the record of it, the pages the title mapped there, the places of
+    // shown pages kept there: done after Windows, it also took another thread's reservation made
+    // at the same address in between (its GPU-view pages showed nothing, its pair was lost)
+    let graphics = if t & 0x8000 != 0 && size == 0 { GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)) } else { None };
+    let mut gone = Vec::new();
+    if let Some(len) = graphics {
+        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
         mirrors::released(addr as usize);
+        forget_title_mappings(addr as usize, len);
+        gone = mirrors::place_gone(addr as usize, len);
     }
     let ok = source_part_going(part, release, || mem::VirtualFree(addr, size, t));
-    if ok != 0 && t & 0x8000 != 0 {
-        let released = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
-        if let Some(len) = released {
-            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-            if !graphics {
-                mirrors::released(addr as usize);
-            }
-            forget_title_mappings(addr as usize, len);
-            crate::hle::d3d12x::sparse::remapped(&mirrors::place_gone(addr as usize, len));
+    #[cfg(test)]
+    if ok != 0 {
+        if let Some(then) = tests::AFTER_WINDOWS_RELEASE.with(|h| h.borrow_mut().take()) {
+            then();
         }
+    }
+    if let Some(len) = graphics {
+        if ok == 0 {
+            // (Windows kept it: it is still a graphics reservation)
+            GRAPHICS_RESERVATIONS.lock().unwrap().insert(addr as usize, len);
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        }
+        crate::hle::d3d12x::sparse::remapped(&gone);
     }
     ok
 }
@@ -3959,6 +3969,9 @@ mod tests {
         pub(super) static PLACED: std::cell::RefCell<Vec<(usize, usize, usize, Vec<usize>, Vec<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
         /// the ranges `mirrors::released` had sparse forget on this thread
         pub(super) static FORGOTTEN: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// runs once in `VirtualFree` right after Windows released memory on this thread: what
+        /// another thread may do then (the address is free)
+        pub(super) static AFTER_WINDOWS_RELEASE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
 
     /// The CPU view of a pair (`mirrors`) as the title's is – plain write-watched memory – with
@@ -4554,6 +4567,54 @@ mod tests {
                 assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
             }
             mem::VirtualFree(plain as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The release of a graphics reservation forgets it – its record and the pages the title
+    /// mapped there – before Windows can hand its address out again: a reservation another
+    /// thread makes at that address right after Windows released it keeps its own.
+    #[test]
+    fn a_reservation_made_where_a_graphics_reservation_just_went_keeps_its_own_record() {
+        let null = std::ptr::null_mut();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let [a, b] = pages;
+            let size = 2 * PHYS_PAGE;
+            let r = reserve_watched(size, 0x2000, mem::PAGE_READWRITE) as usize;
+            assert!(r != 0 && in_graphics_reservation(r));
+            let mut one = [a];
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
+            assert_eq!(title_at(r), Some(a));
+            // another thread reserves the address once Windows gave it back, and maps b there
+            let again = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let got = again.clone();
+            AFTER_WINDOWS_RELEASE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let q = mem::VirtualAlloc(r as *const c_void, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, mem::PAGE_READWRITE) as usize;
+                    if q == r {
+                        GRAPHICS_RESERVATIONS.lock().unwrap().insert(r, size);
+                        let mut one = [b];
+                        assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
+                        got.store(true, Ordering::Release);
+                    }
+                }))
+            });
+            assert_eq!(VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!(AFTER_WINDOWS_RELEASE.with(|h| h.borrow().is_none()), "the hook ran");
+            if again.load(Ordering::Acquire) {
+                assert!(in_graphics_reservation(r), "the new reservation is still a graphics reservation");
+                assert_eq!(title_at(r), Some(b), "the page mapped in the new reservation is still mapped there");
+                let mut none = [0usize];
+                assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, r);
+                assert_eq!(VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            } else {
+                // (another test's thread took the address first: nothing to check here)
+                eprintln!("note: the released address was taken by another thread before the hook");
+            }
+            assert_eq!(FreeTitlePhysicalPages(null, 2, pages.as_mut_ptr()), 1);
         }
     }
 
