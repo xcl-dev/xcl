@@ -18,6 +18,7 @@ mod capture;
 pub mod console_heap;
 pub mod console_list;
 pub mod clamp;
+mod alias_copy;
 mod depth_uav;
 pub mod device_x;
 pub mod dxgi_device;

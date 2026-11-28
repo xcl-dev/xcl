@@ -1212,6 +1212,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                     super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                    super::alias_copy::note_created(this, *ppv, va as usize, d.as_ptr(), state);
                     super::lut3d::created("CreatePlacedResourceX (GPU-owned: on the title's pages / an arena)", *ppv, Some(&x), Some(va as usize), false, state);
                 }
                 return hr;
@@ -1235,6 +1236,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                super::alias_copy::note_created(this, *ppv, va as usize, d.as_ptr(), state);
                 super::lut3d::created(if placed_hr.is_some() { "CreatePlacedResourceX (sampled: on shared pages)" } else if small_hr.is_some() { "CreatePlacedResourceX (sampled: 4 KiB placement)" } else { "CreatePlacedResourceX (sampled: committed)" }, *ppv, Some(&x), Some(va as usize), true, state);
                 return hr;
             }
@@ -1253,6 +1255,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         real::note_title_address(*ppv as usize, va as usize);
         if !buffer {
             super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+            super::alias_copy::note_created(this, *ppv, va as usize, d.as_ptr(), state);
             super::lut3d::created("CreatePlacedResourceX (a resource of its own: not kept in step)", *ppv, Some(&x), Some(va as usize), false, state);
         }
     }

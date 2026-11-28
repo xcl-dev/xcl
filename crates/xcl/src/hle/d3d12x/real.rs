@@ -2474,6 +2474,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             super::small_tex::gone(this as usize);
         }
         super::depth_uav::forget(this as usize);
+        super::alias_copy::forget(this as usize);
         super::title_textures::forget(this as usize);
         super::lut3d::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));

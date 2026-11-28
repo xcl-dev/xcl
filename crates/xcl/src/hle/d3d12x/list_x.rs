@@ -4940,10 +4940,14 @@ unsafe fn emit_uav_barrier_pc(this: *mut c_void) {
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
-/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass.
+/// A retail title calls it with groups of texture barriers too (enhanced barriers): the copies
+/// they ask for between textures of one memory follow (`alias_copy`).
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, barriers: *const c_void) {
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
+    let alias_jobs = if super::alias_copy::on() { super::alias_copy::plan_enhanced(n, barriers as usize) } else { Vec::new() };
     emit_uav_barrier_pc(this);
+    super::alias_copy::record(this, &alias_jobs);
 }
 
 /// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
@@ -6282,6 +6286,8 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         return;
     }
     let capture = super::capture::op(this, || Some(super::capture::barrier(&(0..n as usize).map(|k| barriers.add(k).read_unaligned()).collect::<Vec<_>>())));
+    // (a sampled texture in the memory of a written one of another format: copied after these)
+    let alias_jobs = if super::alias_copy::on() { super::alias_copy::plan(&(0..n as usize).map(|k| barriers.add(k).read_unaligned()).collect::<Vec<_>>(), PC_STATES) } else { Vec::new() };
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
@@ -6396,6 +6402,30 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if let Some(p) = &plane_copies {
         plane_copies_on(this, &p.to_twin, true);
     }
+    super::alias_copy::record(this, &alias_jobs);
+}
+
+/// The texels of the texture `from` into the texture `to` through `buffer`, on the PC list past
+/// the hooks of a title's calls (`alias_copy::record`): the barriers `before`, each level and
+/// layer of `from` into the buffer by the first footprint of its `parts`, the barrier `between`,
+/// each out of the buffer into `to` by the second, the barriers `after`.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn texture_through_buffer(
+    list: *mut c_void, from: usize, to: usize, buffer: usize, parts: &[(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)], before: &[[u32; 8]], between: &[u32; 8], after: &[[u32; 8]],
+) {
+    let barriers = |b: &[[u32; 8]]| pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
+    let copy = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION);
+    let part = |res: usize, k: usize| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
+    let rows = |f: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&buffer), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f } };
+    barriers(before);
+    for (k, (written, _)) in parts.iter().enumerate() {
+        copy(list, &rows(written), 0, 0, 0, &part(from, k), std::ptr::null());
+    }
+    barriers(std::slice::from_ref(between));
+    for (k, (_, read)) in parts.iter().enumerate() {
+        copy(list, &part(to, k), 0, 0, 0, &rows(read), std::ptr::null());
+    }
+    barriers(after);
 }
 
 /// The copies between depth planes and their twins around a title's barriers
