@@ -126,6 +126,44 @@ unsafe extern "system" fn trace(caller: usize, name: *const String, frame: *cons
     0
 }
 
+/// A slot watched for one call on the newer console layout (`make_layout_probe`).
+pub struct LayoutProbe {
+    pub name: String,
+    pub newer_layout: &'static std::sync::atomic::AtomicBool,
+    pub logged: std::sync::atomic::AtomicBool,
+}
+
+impl LayoutProbe {
+    /// Whether this call is the one to log: the first on the newer layout.
+    fn first_newer_call(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.newer_layout.load(Ordering::Acquire) && !self.logged.swap(true, Ordering::AcqRel)
+    }
+}
+
+unsafe extern "system" fn probe(caller: usize, p: *const LayoutProbe, frame: *const u64) -> usize {
+    if crate::modules::image_base_for_addr(caller).is_some() && (*p).first_newer_call() {
+        let at = |off: usize| *frame.add(off / 8);
+        let (a1, a2, a3) = (at(0x78), at(0x70), at(0x68));
+        let (a4, a5) = (at(0x90 + 0x20), at(0x90 + 0x28));
+        crate::xlog_info!(
+            "D3D12.X: newer layout, first title call of {} ← {}: ({a1:#x}{}, {a2:#x}{}, {a3:#x}{}, {a4:#x}, {a5:#x}); the older layout's method there runs",
+            (*p).name,
+            crate::modules::describe_address(caller),
+            describe_ptr(a1),
+            describe_ptr(a2),
+            describe_ptr(a3)
+        );
+    }
+    0
+}
+
+/// Forwards every call; the first call from a game image once the newer layout is known is
+/// logged with its arguments (a slot where the newer layout has another method).
+pub fn make_layout_probe(original: usize, p: LayoutProbe) -> usize {
+    thunk(Tail::GuardOr(original), Box::leak(Box::new(p)) as *const LayoutProbe as u64, probe as usize)
+}
+
 /// Like a guard, but always forwards: calls from a game image are logged (`XCL_D3D12_TRACE`).
 /// The original sees the caller's return address (the slot splits classify by it), so the
 /// result is not seen here; `make_call_tracer` logs it but hides the caller from the callee.
@@ -308,6 +346,17 @@ mod tests {
 
     /// Non-game callers reach the PC method whatever the layout, with every argument (stack
     /// and floating-point ones too) intact; the layout flag is read at each call.
+    /// A layout probe logs one call, and only once the newer layout is known.
+    #[test]
+    fn a_layout_probe_logs_its_first_call_on_the_newer_layout_only() {
+        static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let p = LayoutProbe { name: "ID3D12GraphicsCommandList::#59".into(), newer_layout: &NEWER, logged: Default::default() };
+        assert!(!p.first_newer_call(), "older layout: not logged");
+        NEWER.store(true, std::sync::atomic::Ordering::Release);
+        assert!(p.first_newer_call());
+        assert!(!p.first_newer_call(), "once per slot");
+    }
+
     #[test]
     fn layout_split_keeps_the_runtime_on_the_pc_method() {
         static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

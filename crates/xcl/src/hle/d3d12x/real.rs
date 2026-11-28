@@ -1437,6 +1437,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
     }
+    // slots where the newer layout has a method other than the older handler XCL runs there:
+    // the first title call of each on the newer layout is logged with its arguments
+    if kind == Kind::CommandList {
+        for slot in NEWER_LIST_COLLISIONS.into_iter().filter(|&s| s < total) {
+            let name = format!("{}::#{slot}", iface.name);
+            v[1 + slot] = super::guard::make_layout_probe(v[1 + slot], super::guard::LayoutProbe { name, newer_layout: &QUEUE_SHIFTED, logged: Default::default() });
+        }
+    }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
@@ -11159,6 +11167,14 @@ pub(super) unsafe fn list_device(list: *mut c_void) -> Option<ID3D12Device> {
         None
     }
 }
+
+
+/// Command-list slots where the newer layout has a method other than the older layout's handler,
+/// which XCL runs at both: #59 / #60 the newer layout's two markers, #68 hi-stencil control,
+/// #78 GDS write, #81 hi-stencil state, #88 predication advance, #89 list-level
+/// ExecuteCommandListsX, #93 command-size query, #94 CloseBundleX, #104–#109 counters, batch
+/// binning and the PC's List1 block (from a console API audit; logged by a layout probe).
+const NEWER_LIST_COLLISIONS: [usize; 15] = [59, 60, 68, 78, 81, 88, 89, 93, 94, 104, 105, 106, 107, 108, 109];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
