@@ -1495,12 +1495,41 @@ fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
 }
 
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
-    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| wave32_only(min, max))
+    let range = wave_range(device);
+    log_wave_mode(range);
+    split_wave64_forced() || range.is_none_or(|(min, max)| wave32_only(min, max))
 }
 
 /// `graphics_wave32` for the device: the split flag for a wave64 VS / PS. Unknown: assume so.
 pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
-    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
+    let range = wave_range(device);
+    log_wave_mode(range);
+    split_wave64_forced() || range.is_none_or(|(min, max)| graphics_wave32(min, max))
+}
+
+/// Logs once per process which form wave64 programs get, and why: a wrong wave mode shows
+/// nothing else in the log (#1407).
+fn log_wave_mode(range: Option<(u32, u32)>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("[SHADER] wave mode: {}", wave_mode_line(range, split_wave64_forced())));
+}
+
+/// The text of `log_wave_mode` for a device wave range (`None`: unknown) and `XCL_SPLIT_WAVE64=1`.
+fn wave_mode_line(range: Option<(u32, u32)>, forced: bool) -> String {
+    let why = match (forced, range) {
+        (true, _) => "XCL_SPLIT_WAVE64=1".to_string(),
+        (false, None) => "wave range unknown".to_string(),
+        (false, Some((min, max))) => format!("device waves {min}-{max}"),
+    };
+    let (split, split_graphics) = match (forced, range) {
+        (false, Some((min, max))) => (wave32_only(min, max), graphics_wave32(min, max)),
+        _ => (true, true),
+    };
+    format!(
+        "wave64 compute / mesh / geometry {}, wave64 VS / PS {} ({why})",
+        if split { "split into 32-lane halves" } else { "native wave64" },
+        if split_graphics { "with the upper-lanes form (the driver may pick 32 lanes)" } else { "as they are" },
+    )
 }
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
@@ -1937,6 +1966,22 @@ mod shader_cache_tests {
         for stage in [Stage::Vertex, Stage::Pixel, Stage::Mesh] {
             assert_eq!(windows_for_stage(windows, stage), windows & !super::super::HEAP_FLAT);
         }
+    }
+
+    #[test]
+    fn wave_mode_line_names_the_form_and_why() {
+        assert_eq!(
+            wave_mode_line(Some((32, 32)), false),
+            "wave64 compute / mesh / geometry split into 32-lane halves, wave64 VS / PS with the upper-lanes form (the driver may pick 32 lanes) (device waves 32-32)"
+        );
+        assert_eq!(
+            wave_mode_line(Some((32, 64)), false),
+            "wave64 compute / mesh / geometry native wave64, wave64 VS / PS with the upper-lanes form (the driver may pick 32 lanes) (device waves 32-64)"
+        );
+        assert_eq!(wave_mode_line(Some((64, 64)), false), "wave64 compute / mesh / geometry native wave64, wave64 VS / PS as they are (device waves 64-64)");
+        assert!(wave_mode_line(Some((64, 64)), true).starts_with("wave64 compute / mesh / geometry split into 32-lane halves"));
+        assert!(wave_mode_line(Some((64, 64)), true).ends_with("(XCL_SPLIT_WAVE64=1)"));
+        assert!(wave_mode_line(None, false).ends_with("(wave range unknown)"));
     }
 
     #[test]
