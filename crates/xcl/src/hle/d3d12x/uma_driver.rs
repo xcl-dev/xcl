@@ -694,6 +694,31 @@ mod tests {
     /// its reservations meanwhile lets a segment land elsewhere, which stops the process.
     static MIXED_REMAKE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Runs the test `name` of this module again on its own in a child process and fails when the
+    /// child does; false in the child, which runs the test's body. After the lib's earlier tests the
+    /// remake's `CreateCommandQueue` can fail with E_OUTOFMEMORY (with one test thread too), and a
+    /// remake that fails after a segment was mapped stops the process: in the test binary that ended
+    /// every test after it.
+    fn ran_in_child(name: &str) -> bool {
+        use std::io::Write;
+        const CHILD: &str = "XCL_TEST_UMA_REMAKE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("hle::d3d12x::uma_driver::tests::{name}"), "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        for line in transcript.lines().filter(|l| l.starts_with("SKIPPED ")) {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+        assert!(output.status.success(), "{transcript}");
+        assert!(transcript.contains("1 passed"), "{transcript}");
+        true
+    }
+
     /// On by default for NVIDIA outside Wine only; the switch overrides either way.
     #[test]
     fn driver_windows_by_default_on_nvidia_outside_wine() {
@@ -732,6 +757,9 @@ mod tests {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         let _alone = MIXED_REMAKE.lock().unwrap_or_else(|e| e.into_inner());
+        if ran_in_child("mixed_window_keeps_its_bytes_and_the_gpu_sees_every_segment") {
+            return;
+        }
         let mut dev: Option<ID3D12Device> = None;
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
             return crate::gpu::recomp::runner::skip_test("no D3D12 device");
@@ -789,6 +817,9 @@ mod tests {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         let _alone = MIXED_REMAKE.lock().unwrap_or_else(|e| e.into_inner());
+        if ran_in_child("a_refused_gpu_upload_segment_becomes_custom") {
+            return;
+        }
         let mut dev: Option<ID3D12Device> = None;
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
             return crate::gpu::recomp::runner::skip_test("no D3D12 device");
