@@ -887,3 +887,15 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// With heap windows a program selects every window descriptor of the shared heap, as the
+/// HLSL accessors do (`recomp::heap_window_tests::heap_windows_select_every_heap_slot`): the
+/// slots past the unified block's windows hold null views.
+#[test]
+fn heap_windows_select_every_heap_slot() {
+    use super::lower_mem::heap_window_bound;
+    let slots = crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+    for mems in [2usize, 3, 4, 8, 16] {
+        assert_eq!(heap_window_bound(mems), slots, "{mems} unified windows");
+    }
+}

@@ -151,6 +151,14 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
+/// Windows a program with heap windows (`Lw::heap_mem`) may select: every window descriptor
+/// of the shared heap (`MEM_HEAP_BASE`.., `uma::MAX_HEAP_WINDOWS`), the unified block's and the
+/// null views or mapped memory after them (`console_heap::set_window_views`) – the same bound as
+/// the HLSL path's accessors (`recomp::emit::mem_accessors`).
+pub(crate) fn heap_window_bound(mems: usize) -> u32 {
+    (mems as u32).max(crate::gpu::uma::MAX_HEAP_WINDOWS as u32)
+}
+
 impl Lw {
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
@@ -173,7 +181,7 @@ impl Lw {
         // Descriptor-heap windows (`#1693`, `XCL_HEAP_WINDOWS=1`): single guarded heap lookup
         // combined with `guard`, stacking cleanly with vector loads/stores & FormatLoad opt.
         if let Some(coherent) = self.heap_mem {
-            let windows = self.mems.len() as u32;
+            let windows = heap_window_bound(self.mems.len());
             let w = self.rd(super::lower::VAR_WIN);
             let inside = self.cmpc(Pred::ULt, w, windows);
             let cond = match guard {
@@ -413,7 +421,7 @@ impl Lw {
                 return vec![z; n];
             }
             let w = self.rd(super::lower::VAR_WIN);
-            let inside = self.cmpc(Pred::ULt, w, self.mems.len() as u32);
+            let inside = self.cmpc(Pred::ULt, w, heap_window_bound(self.mems.len()));
             let ok = match guard {
                 Some(g) if self.s.m.const_u64(g) != Some(1) => self.and(g, inside),
                 _ => inside,

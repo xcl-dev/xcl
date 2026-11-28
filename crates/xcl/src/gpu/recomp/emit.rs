@@ -5998,6 +5998,9 @@ fn method_switch(windows: u32, w: &str, ret: &str, name: &str, args: &str, def: 
 fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(coherent) = heap {
+        // every window descriptor of the shared heap, not only the unified block's: the slots
+        // past it hold null views (`console_heap::set_window_views`) or memory XCL maps there
+        let windows = windows.max(crate::gpu::uma::MAX_HEAP_WINDOWS as u32);
         // Redirect ordinary out-of-window loads/stores to null raw UAVs without a divergent
         // branch. Atomics keep the guard because their out parameter must be set to zero.
         let buf = |nul: u32| format!(

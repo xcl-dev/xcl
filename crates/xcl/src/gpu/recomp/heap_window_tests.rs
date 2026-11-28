@@ -552,3 +552,30 @@ fn heap_windows_graphics_stages_validate() {
         }
     }
 }
+
+/// With heap windows, the HLSL accessors let a program select every window descriptor of the
+/// shared heap (`uma::MAX_HEAP_WINDOWS`), whatever its own window count: the slots past the
+/// unified block's windows hold null views (`console_heap::set_window_views`), so an address
+/// there reads 0 as before. Without heap windows the bound stays the program's own count.
+/// (The direct path's bound: `dxil::core_tests::heap_windows_select_every_heap_slot`.)
+#[test]
+fn heap_windows_select_every_heap_slot() {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| crate::gpu::rdna2::encode(n, enc, f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(e("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let slots = crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+    for windows in [2u32, 4, 8, slots] {
+        let t = super::translate(&code, &super::Options { mem_windows: windows, heap_windows: true, ..Default::default() }).unwrap();
+        // loads and stores select a null view past the bound, atomics branch on it
+        assert!(t.hlsl.contains(&format!("bool xcl_o = xcl_w >= {slots}u;")), "{windows} windows:\n{}", t.hlsl);
+        assert!(t.hlsl.contains(&format!("[branch] if (xcl_w >= {slots}u)")), "{windows} windows:\n{}", t.hlsl);
+        if windows < slots {
+            assert!(!t.hlsl.contains(&format!("xcl_w >= {windows}u")), "{windows} windows:\n{}", t.hlsl);
+        }
+    }
+    // the root-UAV form: a switch over the program's own 2 windows, nothing past them
+    let t = super::translate(&code, &super::Options { mem_windows: 2, heap_windows: false, ..Default::default() }).unwrap();
+    assert!(!t.hlsl.contains("ResourceDescriptorHeap[") && t.hlsl.contains("case 1u: return mem1."), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("case 2u:"), "{}", t.hlsl);
+}

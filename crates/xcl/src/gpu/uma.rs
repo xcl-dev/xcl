@@ -1204,7 +1204,9 @@ mod tests {
             // HLSL path accepts 8/16 with heap_windows, rejects without.
             assert!(recomp::translate(&code, &Options { mem_windows: w, heap_windows: false, ..Default::default() }).is_err());
             let t = recomp::translate(&code, &Options { mem_windows: w, heap_windows: true, ..Default::default() }).unwrap();
-            assert!(t.hlsl.contains(&format!("xcl_w >= {w}u")), "HLSL must range-check against {w} windows");
+            // heap-window programs select every heap window slot (null views past the layout's)
+            let slots = MAX_HEAP_WINDOWS as u32;
+            assert!(t.hlsl.contains(&format!("xcl_w >= {slots}u")), "HLSL must range-check against the {slots} heap window slots ({w} windows)");
             assert!(!t.hlsl.contains("mem4"), "root signature ABI stays at 4 root UAVs");
             // Direct DXIL path validates cleanly with 8/16 | HEAP_WINDOWS.
             translate(&code, KernelOptions { wave64: true, split: false, mem_windows: w | HEAP_WINDOWS, sampler_base: 0 }).unwrap();
