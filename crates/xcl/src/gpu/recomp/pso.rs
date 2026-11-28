@@ -359,6 +359,8 @@ mod translated {
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
+            // `XCL_BVH_WATERTIGHT=1`: another BVH triangle test in the HLSL and the DXIL (off keeps the identity)
+            let id = if crate::gpu::bvh::watertight() { identity_for(&id.to_string(), "xcl-bvh-watertight") } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))

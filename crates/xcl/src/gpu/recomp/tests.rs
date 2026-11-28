@@ -5594,6 +5594,157 @@ fn gpu_triangle_pair_and_box16_nodes() {
     assert!(checked > 5, "{checked} triangle hits");
 }
 
+/// Watertight triangle test on the GPU: rays exactly through the edge a triangle pair shares
+/// (type 0 = (v0, v1, v2) and type 1 = (v1, v3, v2) share v1–v2), along each axis and both
+/// signs. Each ray goes to both triangles in neighbouring lanes: at least one hits on the GPU,
+/// and at least one in the CPU reference (each checked on its own).
+#[test]
+fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    // one skewed quad across each axis: v1 = (-1.3, 0.7), v2 = (1.1, -0.9) in the other two axes
+    let quad = [[-1.7f32, -1.9, 0.0], [-1.3, 0.7, 0.2], [1.1, -0.9, -0.1], [1.6, 1.8, 0.3]];
+    let at = |axis: usize, p: [f32; 3]| {
+        let mut r = [0.0f32; 3];
+        r[(axis + 1) % 3] = p[0];
+        r[(axis + 2) % 3] = p[1];
+        r[axis] = 5.0 + p[2];
+        r
+    };
+    for axis in 0..3 {
+        let verts: Vec<f32> = quad.iter().flat_map(|&p| at(axis, p)).collect();
+        w(&mut mem, 0x40 * (axis + 1), &ff(&verts));
+        w(&mut mem, 0x40 * (axis + 1) + 48, &[0x80, 0, 1, 0x0909]);
+    }
+    // nodes 4 and 5: the pinned pair of `bvh.rs` that Möller–Trumbore misses in both triangles,
+    // each as type 0 in the same vertex order (so the old test rounds as there), last two lanes
+    let (pa, pb) = ([1.911541f32, -2.025442, 0.78372467], [1.911541f32, 2.740394, -0.50947857]);
+    for (n, tri) in [[pa, pb, [2.1104007, -1.6796683, 9.487581]], [pb, pa, [1.5455573, 0.7414906, -8.11272]]].iter().enumerate() {
+        w(&mut mem, 0x100 + 0x40 * n, &ff(&tri.concat()));
+        w(&mut mem, 0x100 + 0x40 * n + 48, &[0, 0, 1, 0x0909]);
+    }
+    let pinned_ray = ([5.911541f32, -0.8080063, 0.59203976], [-1.0f32, -0.13060194, 0.000772506], 3usize);
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let mut r = bvh::tests::rng(23);
+    let mut rays = vec![];
+    let mut ray = ([0.0f32; 3], [0.0f32; 3], 0usize);
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        if l % 2 == 0 {
+            let axis = (l / 2) % 3;
+            let s = r(0.0, 1.0);
+            let (v1, v2) = (at(axis, quad[1]), at(axis, quad[2]));
+            let on = [0, 1, 2].map(|a| v1[a] + s * (v2[a] - v1[a]));
+            let mut d = [r(-0.4, 0.4), r(-0.4, 0.4), r(-0.4, 0.4)];
+            d[axis] = if (l / 6) % 2 == 0 { 1.0 } else { -1.0 };
+            ray = ([0, 1, 2].map(|a| on[a] - 3.0 * d[a]), d, axis);
+        }
+        if l >= 62 {
+            ray = pinned_ray;
+        }
+        let (o, d, axis) = ray;
+        let inv = d.map(|x| 1.0 / x);
+        let node = if axis == 3 { (0x100 + 0x40 * (l as u32 % 2)) >> 3 } else { ((0x40 * (axis as u32 + 1)) >> 3) | (l as u32 % 2) };
+        v[0] = node;
+        for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + k] = x.to_bits();
+        }
+        rays.push((node, o, d, inv));
+    }
+    let res = bvh::tests::with_watertight(true, || runner::run_code(&code, &st, &mem)).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    // GPU and CPU may round 1 / d differently, so on the edge each is checked on its own
+    let (mut gh, mut ch) = ([false; 2], [false; 2]);
+    for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
+        gh[l % 2] = f32::from_bits(res.vgpr[l][100]).is_finite();
+        ch[l % 2] = f32::from_bits(bvh::tests::with_watertight(true, || bvh::intersect_node(&data, node, 100.0, o, d, inv, true))[0]).is_finite();
+        if l % 2 == 1 {
+            assert!(gh[0] || gh[1], "lanes {} and {l}: GPU ray through the shared edge missed both", l - 1);
+            assert!(ch[0] || ch[1], "lanes {} and {l}: CPU ray through the shared edge missed both", l - 1);
+        }
+    }
+    // the pinned lanes separate the tests: the old one (switch off) misses both there
+    let ((n0, o, d, inv), n1) = (rays[62], rays[63].0);
+    let mt = |n| f32::from_bits(bvh::tests::with_watertight(false, || bvh::intersect_node(&data, n, 100.0, o, d, inv, true))[0]);
+    assert!(mt(n0).is_infinite() && mt(n1).is_infinite(), "Möller–Trumbore hits the pinned pair");
+}
+
+/// The #3038 review cases (`bvh::tests::review_cases`: coplanar ray, overflowing sheared depth,
+/// zero encoded denominator) plus the small triangle with a unit direction, one per lane, with
+/// the watertight test on the GPU (HLSL, or the direct DXIL with `XCL_DIRECT_DXIL=1`): the node
+/// result is the CPU reference's bit for bit, and hit / miss is as the review expects.
+#[test]
+fn gpu_bvh_watertight_review_cases_match_the_cpu() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let [c1, c2, c3] = bvh::tests::review_cases();
+    let cases = [(c1, false), (c2, true), (c3, false), ((c3.0, c3.1, [0.0, 0.0, 1.0]), true)];
+    for (k, ((tri, _, _), _)) in cases.iter().enumerate() {
+        let v: Vec<u32> = tri.concat().iter().map(|x| x.to_bits()).collect();
+        w(&mut mem, 0x40 * (k + 1), &v);
+        w(&mut mem, 0x40 * (k + 1) + 48, &[0, 0, 1, 0x0909]);
+    }
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let lane = |l: usize| (l % cases.len(), (0x40 * (l % cases.len() as usize + 1) as u32) >> 3);
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        let (k, node) = lane(l);
+        let ((_, o, d), _) = cases[k];
+        let inv = d.map(|x| 1.0 / x);
+        v[0] = node;
+        for (n, x) in [f32::MAX, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + n] = x.to_bits();
+        }
+    }
+    let res = bvh::tests::with_watertight(true, || runner::run_code(&code, &st, &mem)).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    for l in 0..cases.len() {
+        let (k, node) = lane(l);
+        let ((_, o, d), hit) = cases[k];
+        let cpu = bvh::tests::with_watertight(true, || bvh::intersect_node(&data, node, f32::MAX, o, d, d.map(|x| 1.0 / x), true));
+        let gpu: [u32; 4] = res.vgpr[l][100..104].try_into().unwrap();
+        assert_eq!(gpu, cpu, "case {}: GPU {:?} CPU {:?}", k + 1, gpu.map(f32::from_bits), cpu.map(f32::from_bits));
+        assert_eq!(f32::from_bits(cpu[0]).is_finite(), hit, "case {}: {:?}", k + 1, cpu.map(f32::from_bits));
+    }
+}
+
+/// `XCL_BVH_WATERTIGHT` selects the triangle test in the HLSL and in the direct DXIL. Off, the
+/// HLSL has main's Möller–Trumbore text and nothing of the switch (DXC cache keys unchanged);
+/// on, only a program that calls `bvh_intersect` changes.
+#[test]
+fn bvh_watertight_switch_changes_the_hlsl_and_the_dxil() {
+    use crate::gpu::bvh::tests::with_watertight;
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let hlsl = |code: &[u8], on| with_watertight(on, || translate(code, &Options::default()).unwrap().hlsl);
+    let (off, on) = (hlsl(&code, false), hlsl(&code, true));
+    assert!(!off.contains("XCL_BVH_WATERTIGHT") && !on.contains("XCL_BVH_WATERTIGHT"));
+    assert!(off.contains(super::emit::BVH_TRIANGLE_MT) && !off.contains("precise float sz"));
+    assert!(on.contains("precise float sz") && !on.contains("p = cross(d, e2)"));
+    let plain = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None)]);
+    assert_eq!(hlsl(&plain, false), hlsl(&plain, true), "a program without BVH changed");
+    let dxil = |on| with_watertight(on, || runner::direct_kernel(&code, true));
+    match (dxil(false), dxil(true)) {
+        (Ok(off), Ok(on)) => assert_ne!(off, on, "direct DXIL is the same with and without the switch"),
+        (a, b) => panic!("direct DXIL: {:?} / {:?}", a.err(), b.err()),
+    }
+}
+
 /// Multi-window `image_bvh64_intersect_ray` (full 64-bit node pointer into UMA window 1 with
 /// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN-disabled box.
 #[test]

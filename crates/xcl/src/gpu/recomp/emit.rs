@@ -1,4 +1,8 @@
 //! Instruction semantics: one RDNA2 instruction → HLSL statements.
+//!
+//! `BVH_TRIANGLE_WATERTIGHT` is adapted from victory-fork (https://github.com/fxceless/victory-fork,
+//! GPL-3.0-or-later) `9a9091d`, `crates/victory-shader/src/bvh.rs` `triangle`, after Mesa RADV
+//! (MIT, Copyright © 2021 Google) `intersect_ray_amd_software_tri`; changed 2026-11-27 (see `gpu/bvh.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -4996,7 +5000,11 @@ impl Em {
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
-        h.push_str(PRELUDE_MEM);
+        if crate::gpu::bvh::watertight() && body.contains("bvh_intersect(") {
+            h.push_str(&bvh_watertight_prelude_mem());
+        } else {
+            h.push_str(PRELUDE_MEM);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -6129,6 +6137,63 @@ void scr_st(uint a, uint v, uint n) {
     if (s != 0u && s + 8u * n > 32u) { uint b2 = (b + 1u) & 1023u; xcl_scratch[b2] = (xcl_scratch[b2] & ~(m >> (32u - s))) | ((v & m) >> (32u - s)); }
 }
 "#;
+
+/// `bvh_intersect`'s Möller–Trumbore triangle test in `PRELUDE_MEM` (`XCL_BVH_WATERTIGHT` off).
+pub(super) const BVH_TRIANGLE_MT: &str = r#"        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
+        float det = dot(e1, p);
+        float3 sv = o - v0, q = cross(sv, e1);
+        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+"#;
+
+/// The watertight test that replaces `BVH_TRIANGLE_MT` with `XCL_BVH_WATERTIGHT=1`, as
+/// `gpu::bvh::triangle_hit_watertight` (provenance in this file's header): shear so the ray runs
+/// along its largest axis, signs of the edge functions decide; `precise` so that no product is
+/// fused and a shared edge's function is exactly negated in the other triangle (a driver that
+/// fuses anyway loses that).
+const BVH_TRIANGLE_WATERTIGHT: &str = r#"        float3 ad = abs(d);
+        uint kz = ad.x >= ad.y ? (ad.x >= ad.z ? 0u : 2u) : (ad.y >= ad.z ? 1u : 2u);
+        // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
+        float3 pd = kz == 0u ? d.yzx : (kz == 1u ? d.zxy : d.xyz);
+        bool sw = pd.z < 0.0f;
+        pd = sw ? pd.yxz : pd;
+        precise float sz = 1.0f / pd.z;
+        precise float sx = pd.x * sz, sy = pd.y * sz;
+        float3 r0 = v0 - o, r1 = v1 - o, r2 = v2 - o;
+        r0 = kz == 0u ? r0.yzx : (kz == 1u ? r0.zxy : r0); r0 = sw ? r0.yxz : r0;
+        r1 = kz == 0u ? r1.yzx : (kz == 1u ? r1.zxy : r1); r1 = sw ? r1.yxz : r1;
+        r2 = kz == 0u ? r2.yzx : (kz == 1u ? r2.zxy : r2); r2 = sw ? r2.yxz : r2;
+        // (x, y) sheared, z the unscaled axial distance from the origin
+        precise float3 p0 = float3(r0.x - sx * r0.z, r0.y - sy * r0.z, r0.z);
+        precise float3 p1 = float3(r1.x - sx * r1.z, r1.y - sy * r1.z, r1.z);
+        precise float3 p2 = float3(r2.x - sx * r2.z, r2.y - sy * r2.z, r2.z);
+        precise float u = p2.x * p1.y - p2.y * p1.x;
+        precise float i = p0.x * p2.y - p0.y * p2.x;
+        precise float j = p1.x * p0.y - p1.y * p0.x;
+        bool mixed = (u < 0.0f || i < 0.0f || j < 0.0f) && (u > 0.0f || i > 0.0f || j > 0.0f);
+        precise float det = u + (i + j);
+        // Möller–Trumbore's t·det: the unscaled depth sum with d[kz]'s sign
+        precise float t = (u * p0.z + i * p1.z) + j * p2.z;
+        t = pd.z < 0.0f ? -t : t;
+        // the plane's orientation (Möller–Trumbore's det) must agree with the sheared det's sign
+        precise float3 e1 = v1 - v0, e2 = v2 - v0;
+        precise float3 c = float3(d.y * e2.z - d.z * e2.y, d.z * e2.x - d.x * e2.z, d.x * e2.y - d.y * e2.x);
+        precise float mt = (e1.x * c.x + e1.y * c.y) + e1.z * c.z;
+        bool facing = (det > 0.0f && mt > 0.0f) || (det < 0.0f && mt < 0.0f);
+        // back to Möller–Trumbore's scale after the decision; the encoded det is a normal
+        // number (never 0 for the traversal), a non-finite t or det misses
+        precise float s = abs(pd.z);
+        precise float dets = det * s; i = i * s; j = j * s;
+        bool hit = !mixed && facing && abs(dets) >= 1.17549435e-38f && !isinf(t) && !isnan(t) && !isinf(dets) && !isnan(dets);
+        det = dets;
+"#;
+
+/// `PRELUDE_MEM` with the watertight triangle test (only for shaders that call `bvh_intersect`).
+fn bvh_watertight_prelude_mem() -> String {
+    assert!(PRELUDE_MEM.contains(BVH_TRIANGLE_MT), "PRELUDE_MEM lost its triangle test");
+    PRELUDE_MEM.replacen(BVH_TRIANGLE_MT, BVH_TRIANGLE_WATERTIGHT, 1)
+}
 
 const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {

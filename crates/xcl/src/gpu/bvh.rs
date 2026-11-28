@@ -27,6 +27,14 @@
 //!
 //! Top-down build: median split of the leaf box centroids on the longest axis, twice per box
 //! node (4 children), one triangle / instance per leaf.
+//!
+//! `triangle_hit_watertight` (`XCL_BVH_WATERTIGHT=1`) is adapted from victory-fork
+//! (https://github.com/fxceless/victory-fork, GPL-3.0-or-later) commit `9a9091d`,
+//! `crates/victory-shader/src/bvh.rs` `triangle` (by fxceless), which follows Mesa RADV
+//! (https://gitlab.freedesktop.org/mesa/mesa, MIT, Copyright © 2021 Google)
+//! `src/amd/vulkan/nir/radv_nir_rt_common.c` `intersect_ray_amd_software_tri`. Changed
+//! 2026-11-27: f32 edge functions (Mesa computes them in f64), no t sign test, XCL's result
+//! scale (Mesa returns t / |det| and the sign of det).
 
 pub const BOX32: u32 = 5;
 pub const INSTANCE: u32 = 6;
@@ -244,8 +252,80 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-/// Möller–Trumbore as the triangle node returns it: (t·det, det, i·det, j·det), `None` = miss
+/// The triangle node's test as it returns it: (t·det, det, i·det, j·det), `None` = miss.
 pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+    if watertight() { triangle_hit_watertight(v, o, d) } else { triangle_hit_mt(v, o, d) }
+}
+
+/// `XCL_BVH_WATERTIGHT=1` (off by default): the triangle node uses the watertight test in the CPU
+/// reference, the HLSL prelude and the DXIL lowering; otherwise Möller–Trumbore as before. Read
+/// once; a test sets it for its own thread only (`tests::with_watertight`). Off, the HLSL is the
+/// text it was before; on, a program calling `bvh_intersect` gets other text (so another DXC
+/// cache key), and the translated cache's identity gets a tag (`recomp::pso`).
+pub fn watertight() -> bool {
+    #[cfg(test)]
+    if let Some(w) = tests::WATERTIGHT.with(|c| c.get()) {
+        return w;
+    }
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("XCL_BVH_WATERTIGHT").is_ok_and(|v| v == "1"))
+}
+
+/// The watertight test of `triangle_hit`:
+/// Watertight (Woop, Benthin, Wald, "Watertight Ray/Triangle Intersection", JCGT 2013): the
+/// vertices are sheared so the ray runs along its largest axis and the signs of the three edge
+/// functions decide, so a ray through an edge two triangles share hits at least one of them
+/// (both when the edge function is exactly 0; the console's rule for that tie is not known).
+/// Edge-on (det = 0), NaN and a non-finite t or det miss; t's sign is not tested here (the
+/// traversal does). The four values have the Möller–Trumbore scale XCL returned before. The
+/// HLSL prelude (`recomp/emit.rs` `bvh_intersect`) and the DXIL lowering
+/// (`dxil/lower_image.rs`) do the same operations in the same order. Ported code: see the file
+/// header.
+fn triangle_hit_watertight(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+    let kz = dominant_axis(d);
+    let (kx, ky) = if d[kz] < 0.0 { ((kz + 2) % 3, (kz + 1) % 3) } else { ((kz + 1) % 3, (kz + 2) % 3) };
+    let sz = 1.0 / d[kz];
+    let (sx, sy) = (d[kx] * sz, d[ky] * sz);
+    // (x, y) sheared, z the unscaled axial distance from the origin
+    let shear = |p: [f32; 3]| {
+        let r = sub(p, o);
+        [r[kx] - sx * r[kz], r[ky] - sy * r[kz], r[kz]]
+    };
+    let (p0, p1, p2) = (shear(v[0]), shear(v[1]), shear(v[2]));
+    // edge functions: the barycentric numerators of v0, v1, v2
+    let u = p2[0] * p1[1] - p2[1] * p1[0];
+    let i = p0[0] * p2[1] - p0[1] * p2[0];
+    let j = p1[0] * p0[1] - p1[1] * p0[0];
+    let mixed = (u < 0.0 || i < 0.0 || j < 0.0) && (u > 0.0 || i > 0.0 || j > 0.0);
+    let det = u + (i + j);
+    // Möller–Trumbore's t·det is the depth sum over the sheared det times |d[kz]| / d[kz]:
+    // with the unscaled depths only d[kz]'s sign is left (exact), so nothing overflows that
+    // the old t·det does not
+    let tz = (u * p0[2] + i * p1[2]) + j * p2[2];
+    let t = if d[kz] < 0.0 { -tz } else { tz };
+    // back to Möller–Trumbore's scale (the sheared determinant is its det / |d[kz]|), after
+    // the decision
+    let s = d[kz].abs();
+    let r = [t, det * s, i * s, j * s];
+    // the plane's own orientation (Möller–Trumbore's det, as `triangle_hit_mt`) must agree with
+    // the sheared det's sign: a ray in (or within rounding of) the plane misses even when the
+    // rounded sheared det is not 0
+    let mt = dot(sub(v[1], v[0]), cross(d, sub(v[2], v[0])));
+    let facing = (det > 0.0 && mt > 0.0) || (det < 0.0 && mt < 0.0);
+    // the traversal divides by the encoded det: a normal number, so never 0 (also where a GPU
+    // flushes subnormals); a non-finite t or det misses
+    let normal = r[1].abs() >= f32::MIN_POSITIVE;
+    (!mixed && facing && normal && r[0].is_finite() && r[1].is_finite()).then_some(r)
+}
+
+/// The ray's largest axis (ties: x before y before z), along which `triangle_hit` shears.
+fn dominant_axis(d: [f32; 3]) -> usize {
+    let a = d.map(f32::abs);
+    if a[0] >= a[1] { if a[0] >= a[2] { 0 } else { 2 } } else if a[1] >= a[2] { 1 } else { 2 }
+}
+
+/// The Möller–Trumbore test XCL used before the watertight one (`XCL_BVH_WATERTIGHT` unset).
+fn triangle_hit_mt(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
     let (e1, e2) = (sub(v[1], v[0]), sub(v[2], v[0]));
     let p = cross(d, e2);
     let det = dot(e1, p);
@@ -669,5 +749,208 @@ pub(crate) mod tests {
         // Type 3 must miss a ray aimed at type 0's interior (1.0, 0.5)
         let miss3 = intersect_node(&data, 3, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
         assert!(miss3[0].is_infinite());
+    }
+
+    /// `p` rotated so that its axis 2 becomes `axis`, mirrored when `flip`
+    fn place(p: [f32; 3], axis: usize, flip: bool) -> [f32; 3] {
+        let mut r = [0.0; 3];
+        for k in 0..3 {
+            r[(axis + 1 + k) % 3] = p[k];
+        }
+        if flip {
+            r[axis] = -r[axis];
+        }
+        r
+    }
+
+    /// hits among `tris` for a ray from `o` along `d`
+    fn hits(tris: &[Triangle], o: [f32; 3], d: [f32; 3]) -> usize {
+        tris.iter().filter(|t| triangle_hit_watertight(t, o, d).is_some()).count()
+    }
+
+    /// Away from edges the watertight test agrees with the old Möller–Trumbore one: same hit /
+    /// miss, same sign of det (facing), t and barycentrics within rounding.
+    #[test]
+    fn triangle_hit_agrees_with_moller_trumbore_on_generic_rays() {
+        for seed in 0..8u64 {
+            let tris = random_tris(50, 200 + seed);
+            let mut r = rng(300 + seed);
+            let mut both = 0;
+            for _ in 0..2000 {
+                let o = [r(-12.0, 12.0), r(-12.0, 12.0), r(-12.0, 12.0)];
+                let to = [r(-8.0, 8.0), r(-8.0, 8.0), r(-8.0, 8.0)];
+                let d = sub(to, o);
+                for t in &tris {
+                    let (w, m) = (triangle_hit_watertight(t, o, d), triangle_hit_mt(t, o, d));
+                    let Some(m) = m else {
+                        if let Some(w) = w {
+                            // only a ray within rounding of an edge may differ
+                            assert!([w[2], w[3], w[1] - w[2] - w[3]].iter().any(|x| (x / w[1]).abs() < 1e-4), "{t:?} {o:?} {d:?}: {w:?}");
+                        }
+                        continue;
+                    };
+                    let Some(w) = w else {
+                        assert!([m[2], m[3], m[1] - m[2] - m[3]].iter().any(|x| (x / m[1]).abs() < 1e-4), "{t:?} {o:?} {d:?}: {m:?}");
+                        continue;
+                    };
+                    assert_eq!(w[1] > 0.0, m[1] > 0.0, "facing");
+                    assert!((w[1] - m[1]).abs() <= 1e-3 * m[1].abs(), "det scale: {w:?} vs {m:?}");
+                    for k in [0, 2, 3] {
+                        assert!((w[k] / w[1] - m[k] / m[1]).abs() < 1e-4, "{k}: {w:?} vs {m:?}");
+                    }
+                    both += 1;
+                }
+            }
+            assert!(both > 100, "seed {seed}: {both} hits");
+        }
+    }
+
+    /// Dyadic coordinates, so the ray passes exactly through the shared edge / vertex: at least
+    /// one triangle hits, along every dominant axis, both signs, the shared edge listed in
+    /// opposite orders (consistent winding) and in the same order.
+    #[test]
+    fn triangle_hit_exact_shared_edge_and_vertex() {
+        let (a, b) = ([-1.0, -0.5, 1.0], [1.5, 1.0, 1.0]);
+        let (c, e) = ([-2.0, 3.0, 1.5], [2.0, -3.0, 0.5]);
+        let pairs: [[Triangle; 2]; 2] = [[[a, b, c], [b, a, e]], [[a, b, c], [a, b, e]]];
+        let v = [0.25, -0.5, 1.0];
+        let ring = [[2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [-2.0, 2.0], [-2.0, 0.0], [-2.0, -2.0], [0.0, -2.0], [2.0, -2.0]];
+        let fan: Vec<Triangle> = (0..8)
+            .map(|k| {
+                let p = |k: usize| [v[0] + ring[k % 8][0], v[1] + ring[k % 8][1], 1.0 + 0.25 * (k % 2) as f32];
+                [v, p(k), p(k + 1)]
+            })
+            .collect();
+        let dirs = [[0.0, 0.0, 1.0], [0.25, -0.5, 1.0], [-0.375, 0.125, 1.0], [0.5, 0.5, -1.0], [-0.75, 0.25, -1.0]];
+        for axis in 0..3 {
+            for flip in [false, true] {
+                for dl in dirs {
+                    let d = place(dl, axis, flip);
+                    for s in [0.25f32, 0.5, 0.75] {
+                        let on = [0, 1, 2].map(|k| a[k] + s * (b[k] - a[k]));
+                        let o = place([0, 1, 2].map(|k| on[k] - 2.0 * dl[k]), axis, flip);
+                        for pair in &pairs {
+                            let pair = pair.map(|t| t.map(|p| place(p, axis, flip)));
+                            assert!(hits(&pair, o, d) >= 1, "edge: axis {axis} flip {flip} s {s} d {d:?} {pair:?}");
+                        }
+                    }
+                    let o = place([0, 1, 2].map(|k| v[k] - 2.0 * dl[k]), axis, flip);
+                    let fan: Vec<Triangle> = fan.iter().map(|t| t.map(|p| place(p, axis, flip))).collect();
+                    assert!(hits(&fan, o, d) >= 1, "vertex: axis {axis} flip {flip} d {d:?}");
+                }
+            }
+        }
+    }
+
+    /// Found by a random near-edge search (seed 11, first case):
+    /// a ray through the edge (1.911541, -2.025442, 0.78372467)–(1.911541, 2.740394, -0.50947857)
+    /// that Möller–Trumbore misses in both triangles; the watertight test hits at least one.
+    #[test]
+    fn triangle_hit_pinned_shared_edge_moller_trumbore_misses() {
+        let (a, b) = ([1.911541f32, -2.025442, 0.78372467], [1.911541f32, 2.740394, -0.50947857]);
+        let pair = [[a, b, [2.1104007, -1.6796683, 9.487581]], [b, a, [1.5455573, 0.7414906, -8.11272]]];
+        let (o, d) = ([5.911541f32, -0.8080063, 0.59203976], [-1.0f32, -0.13060194, 0.000772506]);
+        assert_eq!(pair.iter().filter(|t| triangle_hit_mt(t, o, d).is_some()).count(), 0);
+        assert!(hits(&pair, o, d) >= 1);
+        // the switch: off (the default) = Möller–Trumbore, misses both; on = watertight
+        let n = |on| with_watertight(on, || pair.iter().filter(|t| triangle_hit(t, o, d).is_some()).count());
+        assert_eq!(n(false), 0);
+        assert!(n(true) >= 1);
+    }
+
+    /// The watertight test's edge cases: degenerate triangles, rays in the triangle's plane, a
+    /// zero direction and NaN miss; a tiny largest component (1e-38) gives a subnormal
+    /// encoded det and misses; the node then returns its miss encoding, never a NaN. Equal
+    /// largest components pick the first axis (x before y before z), as the HLSL and DXIL `kz`.
+    #[test]
+    fn triangle_hit_degenerate_non_finite_and_axis_ties() {
+        let node = |t: &Triangle| {
+            let mut data = vec![0u8; 64];
+            for (k, p) in t.iter().enumerate() {
+                for a in 0..3 {
+                    data[12 * k + 4 * a..12 * k + 4 * a + 4].copy_from_slice(&p[a].to_le_bytes());
+                }
+            }
+            data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
+            data
+        };
+        let miss = [f32::INFINITY, 1.0, 0.0, 0.0];
+        let at = |t: &Triangle, o: [f32; 3], d: [f32; 3]| with_watertight(true, || intersect_node(&node(t), 0, 100.0, o, d, d.map(|x| 1.0 / x), false)).map(f32::from_bits);
+        let d = [0.0, 0.0, 1.0];
+        let o = [0.2, 0.2, -1.0];
+        let tri = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut nan = tri;
+        nan[1][0] = f32::NAN;
+        let degenerate: [Triangle; 4] = [
+            [[0.0; 3], [0.0; 3], [0.0; 3]],
+            [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]],
+            [[0.2, 0.2, 0.0], [0.2, 0.2, 0.0], [1.0, 0.0, 0.0]],
+            nan,
+        ];
+        for t in &degenerate {
+            assert!(triangle_hit_watertight(t, o, d).is_none(), "{t:?}");
+            assert_eq!(at(t, o, d), miss, "{t:?}");
+        }
+        // in the plane, along each in-plane axis and a diagonal
+        for d in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 0.0, 0.0]] {
+            assert!(triangle_hit_watertight(&tri, [-1.0, 0.2, 0.0], d).is_none(), "{d:?}");
+        }
+        assert!(triangle_hit_watertight(&tri, o, [0.0; 3]).is_none());
+        assert!(triangle_hit_watertight(&tri, o, [f32::NAN, 0.0, 1.0]).is_none());
+        assert!(triangle_hit_watertight(&tri, [f32::NAN, 0.2, -1.0], d).is_none());
+        let far = [[5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [5.0, 0.0, 1.0]];
+        let (fo, fd) = ([0.0, 0.2, 0.2], [1e-38f32, 0.0, 0.0]);
+        assert!(triangle_hit_watertight(&far, fo, fd).is_none());
+        assert_eq!(at(&far, fo, fd), miss);
+        for (d, k) in [([1.0, -1.0, 0.5], 0), ([-1.0, 1.0, 1.0], 0), ([0.5, 1.0, -1.0], 1), ([0.5, -0.25, 1.0], 2), ([0.0; 3], 0)] {
+            assert_eq!(dominant_axis(d), k, "{d:?}");
+        }
+    }
+
+    /// Review cases of #3038 (finite binary32 inputs; `p` = 2^p):
+    /// 1. a ray in the triangle's plane (Möller–Trumbore's det is exactly 0) whose rounded
+    ///    sheared determinant is not 0 misses;
+    /// 2. a finite interior hit whose weighted sheared depths overflow (tiny d[kz]) still hits,
+    ///    with Möller–Trumbore's values;
+    /// 3. a hit whose encoded determinant (sheared det · |d[kz]|) rounds to 0 misses, so the
+    ///    traversal never divides by a zero denominator.
+    pub(crate) fn review_cases() -> [(Triangle, [f32; 3], [f32; 3]); 3] {
+        let p = |e: i32| 2f32.powi(e);
+        [
+            ([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [4.0, 5.0, 6.0]], [-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]),
+            ([[0.0, 0.0, p(20)], [p(30), 0.0, p(20)], [0.0, p(30), p(20)]], [p(28), p(28), 0.0], [0.0, 0.0, p(-60)]),
+            ([[0.0, 0.0, 1.0], [p(-40), 0.0, 1.0], [0.0, p(-40), 1.0]], [p(-42), p(-42), 0.0], [0.0, 0.0, p(-80)]),
+        ]
+    }
+
+    #[test]
+    fn triangle_hit_review_cases_coplanar_overflow_zero_denominator() {
+        let [c1, c2, c3] = review_cases();
+        for (k, (t, o, d)) in review_cases().iter().enumerate() {
+            eprintln!("case {}: watertight {:?} mt {:?}", k + 1, triangle_hit_watertight(t, *o, *d), triangle_hit_mt(t, *o, *d));
+        }
+        assert_eq!(triangle_hit_mt(&c1.0, c1.1, c1.2), None);
+        assert_eq!(triangle_hit_watertight(&c1.0, c1.1, c1.2), None, "coplanar ray");
+        let p = |e: i32| 2f32.powi(e);
+        assert_eq!(triangle_hit_mt(&c2.0, c2.1, c2.2), Some([-p(80), -1.0, -0.25, -0.25]));
+        assert_eq!(triangle_hit_watertight(&c2.0, c2.1, c2.2), Some([-p(80), -1.0, -0.25, -0.25]), "overflowed depth");
+        assert_eq!(triangle_hit_watertight(&c3.0, c3.1, c3.2), None, "zero denominator");
+        // the same small triangle with a unit direction is a valid hit and still hits
+        let unit = [0.0, 0.0, 1.0];
+        assert_eq!(triangle_hit_watertight(&c3.0, c3.1, unit), triangle_hit_mt(&c3.0, c3.1, unit));
+        assert!(triangle_hit_watertight(&c3.0, c3.1, unit).is_some());
+    }
+
+    thread_local! {
+        /// `watertight()` for this test thread only (`None`: `XCL_BVH_WATERTIGHT`)
+        pub(crate) static WATERTIGHT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// `f` with the triangle test switched `on` / off on this thread, restored after
+    pub(crate) fn with_watertight<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        let old = WATERTIGHT.with(|c| c.replace(Some(on)));
+        let r = f();
+        WATERTIGHT.with(|c| c.set(old));
+        r
     }
 }

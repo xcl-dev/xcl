@@ -4,6 +4,11 @@
 //! `image_bvh(64)_intersect_ray` on the flat memory (port of
 //! `recomp/emit.rs` `mimg` and `bvh_intersect`; compute rules: no implicit
 //! derivatives, so implicit-LOD samples take LOD 0 / the bias).
+//!
+//! The watertight BVH triangle test (`XCL_BVH_WATERTIGHT=1`) is adapted from victory-fork
+//! (https://github.com/fxceless/victory-fork, GPL-3.0-or-later) `9a9091d`,
+//! `crates/victory-shader/src/bvh.rs` `triangle`, after Mesa RADV (MIT, Copyright © 2021 Google)
+//! `intersect_ray_amd_software_tri`; changed 2026-11-27 (see `gpu/bvh.rs`).
 
 use super::lower::{err, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, Value};
@@ -212,31 +217,140 @@ impl Lw {
             let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
             let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
             let tw = words[9];
-            let e1 = lw.f3(v1, v0, Lw::fsub);
-            let e2 = lw.f3(v2, v0, Lw::fsub);
-            let p = lw.cross(dir, e2);
-            let det = lw.dot3(e1, p);
-            let sv = lw.f3(o, v0, Lw::fsub);
-            let q = lw.cross(sv, e1);
-            let i = lw.dot3(sv, p);
-            let j = lw.dot3(dir, q);
-            let t = lw.dot3(e2, q);
-            let z = lw.fc(0.0);
-            let ij = lw.fadd(i, j);
-            let dpos = lw.fcmp(Pred::FOGt, det, z);
-            let c1 = lw.fcmp(Pred::FOGe, i, z);
-            let c2 = lw.fcmp(Pred::FOGe, j, z);
-            let c3 = lw.fcmp(Pred::FOLe, ij, det);
-            let hp = lw.land(c1, c2);
-            let hp = lw.land(hp, c3);
-            let dneg = lw.fcmp(Pred::FOLt, det, z);
-            let n1 = lw.fcmp(Pred::FOLe, i, z);
-            let n2 = lw.fcmp(Pred::FOLe, j, z);
-            let n3 = lw.fcmp(Pred::FOGe, ij, det);
-            let hn = lw.land(dneg, n1);
-            let hn = lw.land(hn, n2);
-            let hn = lw.land(hn, n3);
-            let hit = lw.sel(dpos, hp, hn);
+            // `XCL_BVH_WATERTIGHT=1` (`gpu::bvh::watertight`): the watertight test as
+            // gpu::bvh::triangle_hit_watertight and the HLSL prelude; no fused products, so a shared edge's
+            // function is exactly negated in the other triangle. Limit: the module drops
+            // DisableMathRefactoring when it also uses FMad (shader.rs), and a driver may then
+            // fuse these products, which loses the exact negation (no worse than before)
+            let (t, det, i, j, hit, z) = if crate::gpu::bvh::watertight() {
+                lw.s.require(super::shader::Feature::DisableMathRefactoring);
+                let ad = [lw.fabs(dir[0]), lw.fabs(dir[1]), lw.fabs(dir[2])];
+                let xy = lw.fcmp(Pred::FOGe, ad[0], ad[1]);
+                let xz = lw.fcmp(Pred::FOGe, ad[0], ad[2]);
+                let yz = lw.fcmp(Pred::FOGe, ad[1], ad[2]);
+                let nxy = lw.lnot(xy);
+                let kz0 = lw.land(xy, xz);
+                let kz1 = lw.land(nxy, yz);
+                // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
+                let perm = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] {
+                    let x = lw.sel(kz1, v[2], v[0]);
+                    let x = lw.sel(kz0, v[1], x);
+                    let y = lw.sel(kz1, v[0], v[1]);
+                    let y = lw.sel(kz0, v[2], y);
+                    let z = lw.sel(kz1, v[1], v[2]);
+                    let z = lw.sel(kz0, v[0], z);
+                    [x, y, z]
+                };
+                let pd = perm(lw, dir);
+                let z = lw.fc(0.0);
+                let sw = lw.fcmp(Pred::FOLt, pd[2], z);
+                let swap = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] { [lw.sel(sw, v[1], v[0]), lw.sel(sw, v[0], v[1]), v[2]] };
+                let pd = swap(lw, pd);
+                let one = lw.fc(1.0);
+                let sz = lw.fdiv(one, pd[2]);
+                let sx = lw.fmul(pd[0], sz);
+                let sy = lw.fmul(pd[1], sz);
+                let mut sh = [[z; 3]; 3];
+                for (k, v) in [v0, v1, v2].into_iter().enumerate() {
+                    let r = lw.f3(v, o, Lw::fsub);
+                    let r = perm(lw, r);
+                    let r = swap(lw, r);
+                    let ax = lw.fmul(sx, r[2]);
+                    let ay = lw.fmul(sy, r[2]);
+                    // (x, y) sheared, z the unscaled axial distance from the origin
+                    sh[k] = [lw.fsub(r[0], ax), lw.fsub(r[1], ay), r[2]];
+                }
+                let [p0, p1, p2] = sh;
+                let edge = |lw: &mut Lw, a: [Value; 3], b: [Value; 3]| {
+                    let m0 = lw.fmul(a[0], b[1]);
+                    let m1 = lw.fmul(a[1], b[0]);
+                    lw.fsub(m0, m1)
+                };
+                let u = edge(lw, p2, p1);
+                let i = edge(lw, p0, p2);
+                let j = edge(lw, p1, p0);
+                let mut neg = lw.fcmp(Pred::FOLt, u, z);
+                let mut pos = lw.fcmp(Pred::FOGt, u, z);
+                for e in [i, j] {
+                    let n = lw.fcmp(Pred::FOLt, e, z);
+                    neg = lw.lor(neg, n);
+                    let p = lw.fcmp(Pred::FOGt, e, z);
+                    pos = lw.lor(pos, p);
+                }
+                let mixed = lw.land(neg, pos);
+                let ij = lw.fadd(i, j);
+                let det = lw.fadd(u, ij);
+                let tu = lw.fmul(u, p0[2]);
+                let ti = lw.fmul(i, p1[2]);
+                let tj = lw.fmul(j, p2[2]);
+                let t = lw.fadd(tu, ti);
+                let t = lw.fadd(t, tj);
+                // Möller–Trumbore's t·det: the unscaled depth sum with d[kz]'s sign
+                let tn = lw.fneg(t);
+                let t = lw.sel(sw, tn, t);
+                // the plane's orientation (Möller–Trumbore's det, gpu::bvh order) must agree
+                // with the sheared det's sign; edge-on, NaN miss
+                let e1 = lw.f3(v1, v0, Lw::fsub);
+                let e2 = lw.f3(v2, v0, Lw::fsub);
+                let c = lw.cross(dir, e2);
+                let m0 = lw.fmul(e1[0], c[0]);
+                let m1 = lw.fmul(e1[1], c[1]);
+                let m2 = lw.fmul(e1[2], c[2]);
+                let mt = lw.fadd(m0, m1);
+                let mt = lw.fadd(mt, m2);
+                let dpos = lw.fcmp(Pred::FOGt, det, z);
+                let dneg = lw.fcmp(Pred::FOLt, det, z);
+                let mpos = lw.fcmp(Pred::FOGt, mt, z);
+                let mneg = lw.fcmp(Pred::FOLt, mt, z);
+                let fp = lw.land(dpos, mpos);
+                let fneg = lw.land(dneg, mneg);
+                let facing = lw.lor(fp, fneg);
+                let inside = lw.lnot(mixed);
+                let hit = lw.land(inside, facing);
+                // back to Möller–Trumbore's scale after the decision; the encoded det is a normal
+                // number (never 0 for the traversal), a non-finite t or det misses
+                let s = lw.fabs(pd[2]);
+                let (det, i, j) = (lw.fmul(det, s), lw.fmul(i, s), lw.fmul(j, s));
+                let adet = lw.fabs(det);
+                let fmin = lw.fc(f32::MIN_POSITIVE);
+                let normal = lw.fcmp(Pred::FOGe, adet, fmin);
+                let pinf = lw.fc(f32::INFINITY);
+                let mut hit = lw.land(hit, normal);
+                for x in [t, det] {
+                    // |x| < inf is false for inf and NaN
+                    let ax = lw.fabs(x);
+                    let fin = lw.fcmp(Pred::FOLt, ax, pinf);
+                    hit = lw.land(hit, fin);
+                }
+                (t, det, i, j, hit, z)
+            } else {
+                let e1 = lw.f3(v1, v0, Lw::fsub);
+                let e2 = lw.f3(v2, v0, Lw::fsub);
+                let p = lw.cross(dir, e2);
+                let det = lw.dot3(e1, p);
+                let sv = lw.f3(o, v0, Lw::fsub);
+                let q = lw.cross(sv, e1);
+                let i = lw.dot3(sv, p);
+                let j = lw.dot3(dir, q);
+                let t = lw.dot3(e2, q);
+                let z = lw.fc(0.0);
+                let ij = lw.fadd(i, j);
+                let dpos = lw.fcmp(Pred::FOGt, det, z);
+                let c1 = lw.fcmp(Pred::FOGe, i, z);
+                let c2 = lw.fcmp(Pred::FOGe, j, z);
+                let c3 = lw.fcmp(Pred::FOLe, ij, det);
+                let hp = lw.land(c1, c2);
+                let hp = lw.land(hp, c3);
+                let dneg = lw.fcmp(Pred::FOLt, det, z);
+                let n1 = lw.fcmp(Pred::FOLe, i, z);
+                let n2 = lw.fcmp(Pred::FOLe, j, z);
+                let n3 = lw.fcmp(Pred::FOGe, ij, det);
+                let hn = lw.land(dneg, n1);
+                let hn = lw.land(hn, n2);
+                let hn = lw.land(hn, n3);
+                let hit = lw.sel(dpos, hp, hn);
+                (t, det, i, j, hit, z)
+            };
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];

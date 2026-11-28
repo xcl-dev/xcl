@@ -183,12 +183,18 @@ fn translate_entry(
     let code = code.to_vec();
     #[cfg(test)]
     let no_select_fold = super::module::NO_SELECT_FOLD.with(|c| c.get());
+    // a test's `XCL_BVH_WATERTIGHT` setting is per thread: carried over to the translator's
+    #[cfg(test)]
+    let wt = crate::gpu::bvh::watertight();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
         .spawn(move || {
             #[cfg(test)]
             super::module::NO_SELECT_FOLD.with(|c| c.set(no_select_fold));
+            #[cfg(test)]
+            return crate::gpu::bvh::tests::with_watertight(wt, || translate_on_this_thread(&code, o, entry, compact, nest));
+            #[cfg(not(test))]
             translate_on_this_thread(&code, o, entry, compact, nest)
         })
         .map_err(|e| format!("translator thread: {e}"))?

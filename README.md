@@ -248,6 +248,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   split-wave64 programs that access LDS stay on the HLSL path to preserve instruction order
   between their two hardware wave32 halves.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **`XCL_BVH_WATERTIGHT=1`** (off by default): the ray/triangle test of `image_bvh_intersect_ray`
+  becomes watertight, so a ray exactly through an edge two triangles share hits one of them instead
+  of possibly missing both. Changes the translated shaders (they get their own cache entries).
+  Ported from victory-fork, after Mesa RADV (see `THIRD_PARTY.md`).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
