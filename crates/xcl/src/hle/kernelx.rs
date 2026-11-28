@@ -4191,9 +4191,12 @@ mod tests {
         unsafe {
             let old = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
             *(old as *mut u32) = 7;
-            // an address with nothing reserved: committing there fails
-            let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
-            mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
+            // an address with nothing reserved: committing there fails. The first page past the
+            // user address space, which Windows never hands out – not one just released, which a
+            // test on another thread could reserve before the move (and the move then wrote there)
+            let mut si: windows_sys::Win32::System::SystemInformation::SYSTEM_INFO = std::mem::zeroed();
+            windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut si);
+            let at = (si.lpMaximumApplicationAddress as usize + 1).next_multiple_of(PHYS_PAGE);
             let page = 0x7E57_0000usize;
             let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new(), ready: Default::default(), ..Default::default() };
             away.at.insert(old, page);
