@@ -11008,7 +11008,20 @@ mod integer_clear_tests {
         let rb = rb.ok_or("readback")?;
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
-        list.ClearRenderTargetView(rtv, &colour, None);
+        // Call the unhooked PC ClearRenderTargetView directly if another test in this process
+        // already adopted the adapter's singleton ID3D12Device; otherwise `cl_clear_rtv` would
+        // intercept the unfixed control clear.
+        use windows::core::Interface;
+        if super::is_adopted(list.as_raw()) {
+            use crate::hle::d3d12x::layout;
+            use std::ffi::c_void;
+            use std::sync::OnceLock;
+            type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
+            let f: F = std::mem::transmute(super::orig_fn(list.as_raw(), pc_slot!("ID3D12GraphicsCommandList", "ClearRenderTargetView")));
+            f(list.as_raw(), rtv.ptr, &colour, 0, std::ptr::null());
+        } else {
+            list.ClearRenderTargetView(rtv, &colour, None);
+        }
         list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
