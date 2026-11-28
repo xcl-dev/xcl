@@ -499,7 +499,13 @@ fn vtbl() -> &'static [usize] {
             copy_from as usize,
             get_resource_tiling as usize,
         ];
-        for i in v.len()..12 {
+        // #11 texture-view descriptor getter, #12 IsTiledResource (a bool: the generic stub's
+        // E_NOTIMPL would read as true), #13 swizzle-pattern info getter
+        for i in v.len()..14 {
+            if i == 12 {
+                v.push(is_tiled_resource as usize);
+                continue;
+            }
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
             v.push(stub);
         }
@@ -608,6 +614,11 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
 
 unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
+}
+
+/// #12 `bool IsTiledResource()`: never – the computer does not model reserved textures.
+unsafe extern "system" fn is_tiled_resource(_p: *mut c_void) -> u8 {
+    0
 }
 
 /// #10 GetResourceTiling(&tiles, &packed mip info, &tile shape, &count, first subresource,
@@ -801,6 +812,19 @@ mod tests {
                 assert_eq!(back7[row.clone()], lin[row], "7-argument form, row {y}");
             }
             release(c);
+        }
+    }
+
+    #[test]
+    fn computer_has_all_14_methods_and_is_not_a_tiled_resource() {
+        let v = vtbl();
+        assert_eq!(v.len(), 14);
+        let mut out = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(desc(64, 64, 1, 1, 28, 0x109).as_ptr(), &mut out), S_OK);
+            let f: unsafe extern "system" fn(*mut c_void) -> u8 = std::mem::transmute(v[12]);
+            assert_eq!(f(out), 0);
+            release(out);
         }
     }
 
