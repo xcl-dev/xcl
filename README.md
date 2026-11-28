@@ -323,6 +323,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
   sets the cap in KiB (0 turns it off).
+- **`--pipelines` queue bound**: `XCL_PREP_QUEUE_MB=<MiB>` starts the driver builds while records are
+  still being translated and holds at most that many MiB of translated DXIL (queued and being
+  built; one larger program runs alone). Unset: translate everything first, as before.
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.

@@ -2494,6 +2494,101 @@ fn make_pipelines(pipelines: &Pipelines, mut jobs: Vec<PipelineJob>) {
     run_pipeline_jobs(jobs, pipelines.most, |job| pipelines.make_selected(&job.compiled, job.prewarm_indirect, None));
 }
 
+/// `XCL_PREP_QUEUE_MB`: the MiB of translated DXIL `--precompile --pipelines` holds between
+/// translation and the driver builds. Unset or 0: translate everything first, then build (the
+/// default). With a cap, builds start while records are still being translated and a translator
+/// waits when the held bytes (queued and being built) would pass it; a job over the cap runs alone.
+fn prep_queue_cap(value: Option<&str>) -> Option<usize> {
+    value?.trim().parse::<usize>().ok().filter(|&mb| mb != 0).map(|mb| mb.saturating_mul(1 << 20))
+}
+
+/// A byte-bounded handoff between translators (`push`) and driver builders (`take`).
+/// Builders take a used-earlier job first, then the largest.
+struct ByteQueue<T> {
+    state: Mutex<ByteQueueState<T>>,
+    changed: std::sync::Condvar,
+    cap: usize,
+}
+
+struct ByteQueueState<T> {
+    jobs: Vec<(bool, usize, T)>,
+    held: usize,
+    high_water: usize,
+    closed: bool,
+}
+
+impl<T> ByteQueue<T> {
+    fn new(cap: usize) -> Self {
+        Self { state: Mutex::new(ByteQueueState { jobs: Vec::new(), held: 0, high_water: 0, closed: false }), changed: std::sync::Condvar::new(), cap }
+    }
+
+    /// Waits until `bytes` fit under the cap (or nothing is held, so one oversized job goes
+    /// through alone). False: the queue was closed (cancelled) and the job was not taken.
+    fn push(&self, used: bool, bytes: usize, job: T) -> bool {
+        let mut s = self.state.lock().unwrap();
+        while !s.closed && s.held != 0 && s.held.saturating_add(bytes) > self.cap {
+            s = self.changed.wait(s).unwrap();
+        }
+        if s.closed { return false; }
+        s.held += bytes;
+        s.high_water = s.high_water.max(s.held);
+        s.jobs.push((used, bytes, job));
+        self.changed.notify_all();
+        true
+    }
+
+    /// The next job, waiting for one; None once the queue is closed and empty (or cancelled).
+    fn take(&self) -> Option<(T, Release<'_, T>)> {
+        let mut s = self.state.lock().unwrap();
+        loop {
+            let best = s.jobs.iter().enumerate().max_by_key(|(_, (used, bytes, _))| (*used, *bytes)).map(|(i, _)| i);
+            if let Some(i) = best {
+                let (_, bytes, job) = s.jobs.swap_remove(i);
+                return Some((job, Release { queue: self, bytes }));
+            }
+            if s.closed { return None; }
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    /// No more jobs: builders finish what is queued; blocked pushes return false.
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.changed.notify_all();
+    }
+
+    /// Drops what is queued and ends the pass: blocked pushes return false, builders stop.
+    fn cancel(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.closed = true;
+        let dropped: usize = s.jobs.iter().map(|j| j.1).sum();
+        s.held = s.held.saturating_sub(dropped);
+        s.jobs.clear();
+        self.changed.notify_all();
+    }
+
+    fn high_water(&self) -> usize { self.state.lock().unwrap().high_water }
+}
+
+/// Frees a job's bytes from the queue's count when its build is done.
+struct Release<'a, T> { queue: &'a ByteQueue<T>, bytes: usize }
+
+impl<T> Drop for Release<'_, T> {
+    fn drop(&mut self) {
+        let mut s = self.queue.state.lock().unwrap();
+        s.held = s.held.saturating_sub(self.bytes);
+        self.queue.changed.notify_all();
+    }
+}
+
+/// A builder drains `queue` until it is closed and empty.
+fn build_from_queue<T>(queue: &ByteQueue<T>, build: impl Fn(&T)) {
+    while let Some((job, _release)) = queue.take() {
+        build(&job);
+        drop(job);
+    }
+}
+
 fn run_pipeline_jobs<T: Send>(jobs: Vec<T>, workers: usize, build: impl Fn(&T) + Sync) {
     let workers = workers.min(jobs.len());
     let jobs = Mutex::new(jobs.into_iter());
@@ -2546,6 +2641,93 @@ mod pipeline_selection_tests {
         });
         assert_eq!(next.into_inner(), inputs.len());
         assert!(inputs.iter().all(|input| input.upgrade().is_none()));
+    }
+
+    #[test]
+    fn prep_queue_cap_reads_mebibytes() {
+        assert_eq!(prep_queue_cap(None), None);
+        assert_eq!(prep_queue_cap(Some("0")), None);
+        assert_eq!(prep_queue_cap(Some("x")), None);
+        assert_eq!(prep_queue_cap(Some(" 64 ")), Some(64 << 20));
+    }
+
+    /// `jobs` = (used, bytes) pushed by 2 translators at once into a queue of `cap` bytes, drained
+    /// by 2 slow builders. Returns (queue high water, order the jobs were built in, wall time).
+    fn drain(jobs: &[(bool, usize)], cap: usize, build_ms: u64) -> (usize, Vec<usize>, std::time::Duration) {
+        let queue = ByteQueue::new(cap);
+        let built = Mutex::new(Vec::new());
+        let next = AtomicUsize::new(0);
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| build_from_queue(&queue, |&(id, _): &(usize, usize)| {
+                    std::thread::sleep(std::time::Duration::from_millis(build_ms));
+                    built.lock().unwrap().push(id);
+                }));
+            }
+            let producers: Vec<_> = (0..2).map(|_| s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(used, bytes)) = jobs.get(i) else { break };
+                assert!(queue.push(used, bytes, (i, bytes)));
+            })).collect();
+            for p in producers { p.join().unwrap(); }
+            queue.close();
+        });
+        let built = built.into_inner().unwrap();
+        (queue.high_water(), built, t0.elapsed())
+    }
+
+    #[test]
+    fn byte_queue_stays_under_its_cap_and_builds_every_job_once() {
+        let jobs: Vec<_> = (0..40).map(|i| (i % 5 == 0, 100 + i)).collect();
+        let (high, mut built, _) = drain(&jobs, 350, 3);
+        assert!(high <= 350, "held {high} bytes");
+        built.sort_unstable();
+        assert_eq!(built, (0..jobs.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn byte_queue_lets_an_oversized_job_run_alone() {
+        let jobs = [(false, 50), (false, 5000), (false, 50), (false, 50)];
+        let (high, built, _) = drain(&jobs, 200, 3);
+        assert_eq!(high, 5000, "the oversized job is admitted only into an empty queue");
+        assert_eq!(built.len(), 4);
+    }
+
+    #[test]
+    fn byte_queue_hands_out_used_first_then_largest() {
+        let queue = ByteQueue::new(1 << 20);
+        for (id, (used, bytes)) in [(false, 900), (true, 5), (false, 10), (true, 50)].into_iter().enumerate() {
+            assert!(queue.push(used, bytes, id));
+        }
+        queue.close();
+        let order: Vec<_> = std::iter::from_fn(|| queue.take().map(|(id, _)| id)).collect();
+        assert_eq!(order, [3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn byte_queue_cancel_frees_blocked_translators_and_stops_builders() {
+        let queue = ByteQueue::new(100);
+        assert!(queue.push(false, 100, 0));
+        std::thread::scope(|s| {
+            let blocked = s.spawn(|| queue.push(false, 100, 1));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            queue.cancel();
+            assert!(!blocked.join().unwrap(), "a cancelled push does not queue its job");
+        });
+        assert!(queue.take().is_none());
+        assert!(!queue.push(false, 1, 2));
+    }
+
+    #[test]
+    fn byte_queue_fixture_numbers() {
+        // 400 jobs of ~1 MiB translated at once, built slowly: unbounded holds them all
+        let jobs: Vec<_> = (0..400).map(|i| (i % 7 == 0, (1 << 20) + i)).collect();
+        let (free, _, t_free) = drain(&jobs, usize::MAX, 2);
+        let (capped, _, t_capped) = drain(&jobs, 8 << 20, 2);
+        eprintln!("byte_queue fixture: unbounded high water {} MiB in {:?}; 8 MiB cap high water {} MiB in {:?}", free >> 20, t_free, capped >> 20, t_capped);
+        assert!(capped <= 8 << 20);
+        assert!(free > capped);
     }
 
     #[test]
@@ -3400,6 +3582,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let matched: Mutex<std::collections::HashSet<u64>> = Mutex::new(Default::default());
     let pipeline_jobs: Mutex<Vec<PipelineJob>> = Mutex::new(Vec::new());
+    // `XCL_PREP_QUEUE_MB`: builds start during translation, and the bytes held are bounded
+    let byte_queue = prep_queue_cap(std::env::var("XCL_PREP_QUEUE_MB").ok().as_deref())
+        .filter(|_| pipelines.is_some() && startup.is_none() && !mandatory)
+        .map(ByteQueue::<PipelineJob>::new);
     let used_earlier = if pipelines.is_some() && startup.is_none() {
         crate::hle::d3d12x::pso_async::earlier_used_keys()
     } else {
@@ -3444,7 +3630,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     std::thread::scope(|s| {
-        for _ in 0..threads {
+        if let (Some(queue), Some(p)) = (&byte_queue, pipelines) {
+            for _ in 0..p.most.max(1) {
+                s.spawn(|| build_from_queue(queue, |job| p.make_selected(&job.compiled, job.prewarm_indirect, None)));
+            }
+        }
+        let translators: Vec<_> = (0..threads).map(|_| {
             s.spawn(|| loop {
                 if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -3522,7 +3713,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                                 } else {
                                     let used = used_earlier.contains(&pipeline_key(&blob));
                                     let prewarm_indirect = indirect.is_some_and(|i| used_indirect_split(&blob, i));
-                                    pipeline_jobs.lock().unwrap().push(PipelineJob { used, prewarm_indirect, compiled: c });
+                                    let job = PipelineJob { used, prewarm_indirect, compiled: c };
+                                    match &byte_queue {
+                                        Some(queue) => { let bytes = job.compiled.dxil.len(); queue.push(used, bytes, job); }
+                                        None => pipeline_jobs.lock().unwrap().push(job),
+                                    }
                                 }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
@@ -3605,9 +3800,17 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 }
                 if let Some(proof) = &pack_proof { proof.record(i, stage_outputs); }
                 record_done();
-            });
+            })
+        }).collect();
+        let panicked = translators.into_iter().map(|t| t.join()).find_map(Result::err);
+        if let Some(queue) = &byte_queue {
+            if panicked.is_some() { queue.cancel(); } else { queue.close(); }
         }
+        if let Some(panic) = panicked { std::panic::resume_unwind(panic); }
     });
+    if let Some(queue) = &byte_queue {
+        println!("pipelines: {} MiB of translated DXIL held at most (XCL_PREP_QUEUE_MB)", queue.high_water() >> 20);
+    }
     if let Some(selected) = selected {
         let matched = matched.into_inner().unwrap();
         let mut unmatched: Vec<_> = selected.difference(&matched).copied().collect();
