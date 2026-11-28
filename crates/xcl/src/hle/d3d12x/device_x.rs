@@ -514,6 +514,44 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
     result
 }
 
+/// Device methods XCL has no model for that create an object: a title sees E_NOTIMPL (and a null
+/// object where the out pointer's place is known) instead of S_OK with nothing written.
+fn not_implemented(slot: u32, what: &str) -> HRESULT {
+    static N: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let i = match slot {
+        45 => 0,
+        77 => 1,
+        _ => 2,
+    };
+    if once(&N[i], 1) {
+        crate::xlog_warn!("D3D12.X: device #{slot} ({what}) is not implemented: E_NOTIMPL");
+    }
+    E_NOTIMPL
+}
+
+/// device #45: a resource whose planes / metadata sit at separate GPU addresses (addresses*,
+/// resource desc*, state, clear value*, riid, out).
+pub(super) unsafe extern "system" fn create_resource_at_planes_x(_this: *mut c_void, _addrs: usize, _desc: usize, _state: usize, _clear: usize, _riid: usize, out: *mut *mut c_void) -> HRESULT {
+    if !out.is_null() {
+        *out = std::ptr::null_mut();
+    }
+    not_implemented(45, "resource at per-plane GPU addresses")
+}
+
+/// device #77: as #45, with the console resource desc.
+pub(super) unsafe extern "system" fn create_resource_at_planes_console_desc_x(_this: *mut c_void, _addrs: usize, _desc: usize, _state: usize, _clear: usize, _riid: usize, out: *mut *mut c_void) -> HRESULT {
+    if !out.is_null() {
+        *out = std::ptr::null_mut();
+    }
+    not_implemented(77, "resource at per-plane GPU addresses, console desc")
+}
+
+/// device #82: a performance-counter set (where its out pointer sits is not known, so nothing is
+/// written).
+pub(super) unsafe extern "system" fn create_counter_set_x(_this: *mut c_void) -> HRESULT {
+    not_implemented(82, "performance-counter set")
+}
+
 /// Apply one CreateDerivedPipelineStateX patch to a desc: part 0 = depth-stencil state, 1 =
 /// rasterizer state, 2 = blend state, 3 = sample mask. Ok(false): part 5 (seen on Fortnite,
 /// 0x30 bytes, meaning unknown) – not applied. Err: an unknown part.
@@ -1531,6 +1569,22 @@ mod tests {
         assert_eq!(pc_initial_state_for_desc(0x4, 0x0, 0x8), 0x0);
         assert_eq!(pc_initial_state_for_desc(0x4, 0x4, 0x8), 0x8);
         assert_eq!(pc_initial_state_for_desc(0x6, 0x2, 0x8), 0x10);
+    }
+
+    /// #45 / #77 / #82: the title sees a failure, and a null object where #45 / #77 put it, not
+    /// S_OK with its out pointer left as it was.
+    #[test]
+    fn unmodelled_object_creators_return_e_notimpl_and_a_null_object() {
+        unsafe {
+            let mut out = 0x1234usize as *mut c_void;
+            assert_eq!(create_resource_at_planes_x(std::ptr::null_mut(), 1, 2, 3, 4, 5, &mut out), E_NOTIMPL);
+            assert!(out.is_null());
+            out = 0x1234usize as *mut c_void;
+            assert_eq!(create_resource_at_planes_console_desc_x(std::ptr::null_mut(), 1, 2, 3, 4, 5, &mut out), E_NOTIMPL);
+            assert!(out.is_null());
+            assert_eq!(create_resource_at_planes_x(std::ptr::null_mut(), 0, 0, 0, 0, 0, std::ptr::null_mut()), E_NOTIMPL);
+            assert_eq!(create_counter_set_x(std::ptr::null_mut()), E_NOTIMPL);
+        }
     }
 
     #[test]
