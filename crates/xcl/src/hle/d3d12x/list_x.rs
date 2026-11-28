@@ -6668,6 +6668,7 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
+    super::target_handles::check(dsv, "ClearDepthStencilView");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 

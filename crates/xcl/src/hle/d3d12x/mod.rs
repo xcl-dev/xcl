@@ -52,6 +52,7 @@ pub mod sparse;
 mod standin;
 mod targets;
 mod watch;
+mod target_handles;
 pub mod title_list;
 mod submit_cost;
 mod texture_upload;

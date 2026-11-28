@@ -1292,6 +1292,9 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     }
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
+    if kind == Kind::Device {
+        super::target_handles::note_device(obj);
+    }
 }
 
 /// `XCL_DRED` is set (`init` turns the report on with it).
@@ -1766,7 +1769,14 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let desc = if desc.is_null() { desc } else { &d as *const [u32; 4] };
     let sampler = d[0] == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32;
     if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 && !sampler {
-        return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
+        let hr = dev_create_descriptor_heap(this, desc as usize, riid, ppv);
+        if hr >= 0 && !desc.is_null() && !ppv.is_null() {
+            if let (Some(heap), Some(dev)) = (ID3D12DescriptorHeap::from_raw_borrowed(&*ppv), ID3D12Device::from_raw_borrowed(&this)) {
+                let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(d[0] as i32));
+                super::target_handles::note_heap(d[0], heap.GetCPUDescriptorHandleForHeapStart().ptr, d[1] as usize, inc as usize);
+            }
+        }
+        return hr;
     }
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
     let shared = match ID3D12Device::from_raw_borrowed(&this) {
@@ -2856,6 +2866,7 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
+    super::target_handles::note_copy(ty, dst as usize, n);
 }
 
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
@@ -2877,7 +2888,13 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
-        return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        if !dsts.is_null() {
+            for r in 0..nd as usize {
+                super::target_handles::note_copy(ty, *dsts.add(r) as usize, if dsizes.is_null() { 1 } else { *dsizes.add(r) });
+            }
+        }
+        return;
     }
     // every descriptor as (dst, src) handle, ranges walked in step
     let step = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 { SAMPLER_SLOT } else { SLOT } as u64;
@@ -3084,6 +3101,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     let flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
     super::depth_uav::note_dsv(cpu as usize, res as usize, flags);
+    super::target_handles::note_view(cpu as usize);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -10871,6 +10889,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
         let v = copy.filter(|c| c.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D).map(|c| (c.Format.0, c.Anonymous.Texture3D));
         format!("a render target view made ({handle:#x}): {}", v.map_or("the default view".into(), |(f, t)| format!("format {f}, mip {}, depth slices {} (+{})", t.MipSlice, t.FirstWSlice, t.WSize as i32)))
     });
+    super::target_handles::note_view(handle);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -10904,6 +10923,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::lut3d::wrote(r, false, || format!("ClearRenderTargetView {rtv:#x} to {:?}, {n} rects", color.as_ref()));
         }
     }
+    super::target_handles::check(rtv, "ClearRenderTargetView");
     f(this, rtv, color, n, rects)
 }
 
@@ -10918,6 +10938,16 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     let _ = super::capture::op(this, || Some(super::capture::targets_op(this)));
+    if n > 0 && !rtvs.is_null() {
+        // (the single-range form: descriptors at the heap's increment from the first)
+        let step = if single != 0 { super::target_handles::increment_at(*rtvs) } else { 0 };
+        for k in 0..n.min(8) as usize {
+            super::target_handles::check(if single != 0 { *rtvs + k * step } else { *rtvs.add(k) }, "OMSetRenderTargets");
+        }
+    }
+    if let Some(&d) = dsv.as_ref() {
+        super::target_handles::check(d, "OMSetRenderTargets (depth)");
+    }
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
