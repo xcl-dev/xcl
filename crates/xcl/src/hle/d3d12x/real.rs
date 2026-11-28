@@ -10915,6 +10915,10 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     );
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
+    // (a depth buffer whose plane shaders write through a twin: the twin into the plane first)
+    if !dsv.is_null() {
+        super::depth_uav::before_dsv_bind(this, *dsv);
+    }
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     let _ = super::capture::op(this, || Some(super::capture::targets_op(this)));
@@ -14437,8 +14441,8 @@ mod depth_uav_twin_tests {
 
     /// A stencil UAV of a console depth buffer with unordered access, made through the device
     /// calls (`XCL_DEPTH_UAV_TWIN=1`, the shared view heap): the slot's UAV and its companion SRV
-    /// name the buffer's R8 twin and the T# reads as 8-bit uint; a depth UAV stays a null view
-    /// with its reason; the DSV is known; the twin goes with the buffer. On WARP, in a child
+    /// name the buffer's R8 twin and the T# reads as 8-bit uint; a depth UAV is a view of the
+    /// depth plane's R32 twin; the DSV is known; the twins go with the buffer. On WARP, in a child
     /// process.
     #[test]
     fn gpu_a_stencil_uav_of_a_console_depth_buffer_is_a_view_of_its_twin() {
@@ -14460,8 +14464,8 @@ mod depth_uav_twin_tests {
             // a second stencil UAV takes the same twin
             dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R8_UINT, 0), slot_cpu(2));
             let (made2, alive2, redirected2, nulls) = depth_uav::counts();
-            assert_eq!((made2 - made, alive2 - alive, redirected2 - redirected), (1, 1, 2), "one twin, two views of it");
-            assert_eq!(nulls, ["its depth plane has no twin yet"], "the depth view is a null view, with its reason");
+            assert_eq!((made2 - made, alive2 - alive, redirected2 - redirected), (2, 2, 3), "a stencil twin with two views of it, a depth twin with one");
+            assert!(nulls.is_empty(), "no null view: {nulls:?}");
 
             let twin = depth_uav::twin_of(raw as usize).expect("a stencil twin");
             let t = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().GetDesc();
@@ -14476,8 +14480,12 @@ mod depth_uav_twin_tests {
                 std::ptr::copy_nonoverlapping(slot_cpu(k) as *const u32, w.as_mut_ptr(), 8);
                 assert_eq!((w[0], (w[1] >> 20) & 0x1FF), (s.index, 5), "slot {k}: the T# of an R8_UINT image");
             }
+            // the depth plane's UAV: a view of an R32 twin of the plane's size (a console D24S8)
+            let depth_twin = depth_uav::depth_twin_of(raw as usize).expect("a depth twin");
+            let t = ID3D12Resource::from_raw_borrowed(&(depth_twin as *mut c_void)).unwrap().GetDesc();
+            assert_eq!((t.Format, t.Width, t.Height, t.DepthOrArraySize, t.MipLevels), (DXGI_FORMAT_R32_TYPELESS, 16, 16, 1, 1));
             let s = console_heap::slot(slot_cpu(1)).unwrap();
-            assert_eq!(console_heap::names_of(&s).1, 0, "the depth plane's UAV is a null view");
+            assert_eq!(console_heap::names_of(&s), (depth_twin, depth_twin), "the depth plane's UAV and its companion SRV name the depth twin");
 
             drop(heap);
             drop(depth);
@@ -14545,6 +14553,348 @@ mod depth_uav_twin_tests {
         }
     }
 
+    /// The depth twin of a console D24S8 buffer (R24G8 on the PC) is drawn into the depth plane
+    /// before a DSV of the buffer is bound: each texel of the plane then holds the twin's value
+    /// in 24 bits; a second bind with nothing dispatched in between draws nothing. The list is
+    /// the title's (adopted, kept), and the pass is recorded past its hooks. On WARP, in a child
+    /// process.
+    #[test]
+    fn gpu_a_depth_twin_is_drawn_into_the_r24g8_plane_before_its_dsv_is_bound() {
+        if !in_child("gpu_a_depth_twin_is_drawn_into_the_r24g8_plane_before_its_dsv_is_bound") {
+            return;
+        }
+        use super::super::{depth_uav, list_x};
+        unsafe {
+            let Some(f) = Fixture::new() else { return };
+            let (d, raw) = (f.dev.as_raw(), f.depth.as_raw());
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0), f.base);
+            let twin = depth_uav::depth_twin_of(raw as usize).expect("a depth twin");
+            let twin = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().clone();
+
+            // the twin's texels: (x + 16 y) / 300, uploaded on the PC list
+            let value = |x: usize, y: usize| (x + 16 * y) as f32 / 300.0;
+            let buffer = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, bytes: u64| -> ID3D12Resource {
+                let mut b: Option<ID3D12Resource> = None;
+                f.dev
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .expect("a buffer");
+                b.unwrap()
+            };
+            // (16 rows of 256 bytes: the row pitch D3D12 asks for)
+            let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R32_TYPELESS, Width: 16, Height: 16, Depth: 1, RowPitch: 256 } };
+            let up = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 16 * 256);
+            let mut p = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).expect("map upload");
+            for y in 0..16 {
+                for x in 0..16 {
+                    ((p as *mut u8).add(y * 256 + x * 4) as *mut f32).write_unaligned(value(x, y));
+                }
+            }
+            up.Unmap(0, None);
+            let l = &f.list;
+            let lraw = l.as_raw();
+            // (PC calls of the list by slot: after the list is adopted its own table is XCL's)
+            let pc_vt = *(lraw as *const *const usize);
+            let barrier = |res: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES| {
+                let r = res.as_raw() as usize;
+                let b = [0u32, 0, r as u32, (r as u64 >> 32) as u32, sub, before.0 as u32, after.0 as u32, 0];
+                let call: unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8]) = std::mem::transmute(*pc_vt.add(26));
+                call(lraw, 1, &b);
+            };
+            let copy = |dst: &D3D12_TEXTURE_COPY_LOCATION, src: &D3D12_TEXTURE_COPY_LOCATION| {
+                let call: unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const c_void) = std::mem::transmute(*pc_vt.add(16));
+                call(lraw, dst, 0, 0, 0, src, std::ptr::null());
+            };
+            let placed = |b: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(b), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            let sub0 = |t: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(t), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier(&twin, all, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            copy(&sub0(&twin), &placed(&up));
+            barrier(&twin, all, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            // the list as a title's, and the bind of the buffer's DSV
+            adopt(lraw, Kind::CommandList);
+            list_x::on_create(lraw, f._alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let (passes, spared, left) = depth_uav::plane_passes();
+            depth_uav::before_dsv_bind(lraw, f.dsv as usize);
+            assert_eq!(depth_uav::plane_passes(), (passes + 1, spared, left), "the twin is drawn into the plane");
+            depth_uav::before_dsv_bind(lraw, f.dsv as usize);
+            assert_eq!(depth_uav::plane_passes(), (passes + 1, spared + 1, left), "nothing was dispatched since: no second pass");
+
+            // the depth plane (the buffer was made in DEPTH_WRITE and is there again) to a
+            // readback buffer
+            let rb = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, 16 * 256);
+            barrier(&f.depth, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy(&placed(&rb), &sub0(&f.depth));
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*pc_vt.add(9));
+            assert!(close(lraw) >= 0, "close list");
+            // (the PC queue's own call with the list as it is: no reference of the list changes hands)
+            let q = f.queue.as_raw();
+            let execute: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(*(*(q as *const *const usize)).add(10));
+            execute(q, 1, &lraw);
+            let fence: ID3D12Fence = f.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            f.queue.Signal(&fence, 1).expect("signal");
+            crate::gpu::fence::wait(&fence, 1, &f.dev, None, 5000).expect("the pass and the copies complete");
+            assert!(f.dev.GetDeviceRemovedReason().is_ok(), "the device is there");
+
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).expect("map readback");
+            let mut distinct = std::collections::BTreeSet::new();
+            for y in 0..16 {
+                for x in 0..16 {
+                    // (24 bits of depth in the low bytes of each 32-bit texel)
+                    let got = ((p as *const u8).add(y * 256 + x * 4) as *const u32).read_unaligned() & 0xFF_FFFF;
+                    let want = (value(x, y) as f64 * 16_777_215.0).round() as i64;
+                    assert!((got as i64 - want).abs() <= 1, "texel {x},{y}: {got:#x}, the twin's value is {want:#x}");
+                    distinct.insert(got);
+                }
+            }
+            rb.Unmap(0, None);
+            assert_eq!(distinct.len(), 256, "every texel its own value");
+        }
+    }
+
+    /// The case of a retail title's lighting: a console D16_UNORM_S8_UINT buffer (R24G8 on the
+    /// PC) whose depth plane a compute program writes through its UAV, one count of 1/65535 steps
+    /// a texel, and draws that test the plane with EQUAL at the depth `count * (1.0 / 65535.0)`.
+    /// The R16 twin holds a count for each texel; after the pass that draws it into the plane,
+    /// a draw at a count's depth passes on exactly the texels that hold that count (seen in the
+    /// stencil plane, which each passing draw counts up). On WARP, in a child process.
+    #[test]
+    fn gpu_an_equal_test_at_a_counts_depth_passes_where_the_16_bit_twin_holds_the_count() {
+        if !in_child("gpu_an_equal_test_at_a_counts_depth_passes_where_the_16_bit_twin_holds_the_count") {
+            return;
+        }
+        use super::super::{depth_uav, list_x};
+        unsafe {
+            let Some(f) = Fixture::new() else { return };
+            let d = f.dev.as_raw();
+            // a console D16S8 with unordered access, and the fixture's DSV handle for it
+            let console = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(118),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut raw = std::ptr::null_mut();
+            let hr = dev_create_committed_resource_x(
+                d,
+                &props as *const _ as usize,
+                0,
+                &console as *const _ as usize,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as usize,
+                0,
+                &ID3D12Resource::IID as *const _ as *const GUID,
+                &mut raw,
+            );
+            assert!(hr >= 0 && !raw.is_null(), "the D16S8 buffer: {hr:#x}");
+            let depth = ID3D12Resource::from_raw(raw);
+            assert_eq!(depth.GetDesc().Format, DXGI_FORMAT_R24G8_TYPELESS, "R24G8 on the PC");
+            dev_create_dsv_x(d, raw, &D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D24_UNORM_S8_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() }, f.dsv);
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R16_UNORM, 0), f.base);
+            let twin = depth_uav::depth_twin_of(raw as usize).expect("a depth twin");
+            let twin = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().clone();
+            assert_eq!(twin.GetDesc().Format, DXGI_FORMAT_R16_TYPELESS, "16 bits a texel");
+
+            // each row holds the 16 counts around one of these (the count itself at x = 8). At
+            // the first twelve the product and the correctly rounded count / 65535 are floats
+            // one unit in the last place apart, and 24-bit values one apart: the first eight
+            // when the float is rounded to 24 bits, the next four when it is cut off
+            const ROWS: [u32; 16] = [385, 642, 898, 1156, 1412, 1668, 1924, 2184, 257, 514, 770, 1028, 8, 128, 32768, 65528];
+            let count = |x: usize, y: usize| (ROWS[y] + x as u32 - 8) as u16;
+            let buffer = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, bytes: u64| -> ID3D12Resource {
+                let mut b: Option<ID3D12Resource> = None;
+                f.dev
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .expect("a buffer");
+                b.unwrap()
+            };
+            let footprint = |format: DXGI_FORMAT| D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: 16, Height: 16, Depth: 1, RowPitch: 256 } };
+            let up = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 16 * 256);
+            let mut p = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).expect("map upload");
+            for y in 0..16 {
+                for x in 0..16 {
+                    ((p as *mut u8).add(y * 256 + x * 2) as *mut u16).write_unaligned(count(x, y));
+                }
+            }
+            up.Unmap(0, None);
+
+            // the draws' pipeline: one triangle over the target at the depth of the count in b0,
+            // depth test EQUAL without a write, the stencil counted up where it passes
+            let vs = crate::gpu::recomp::dxc::compile(
+                r#"
+#define RS "RootConstants(num32BitConstants=1, b0)"
+cbuffer C : register(b0) { uint count; };
+[RootSignature(RS)]
+float4 main(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 2u ? 3.0 : -1.0, id == 1u ? 3.0 : -1.0, float(count) * (1.0 / 65535.0), 1.0);
+}
+"#,
+                "main",
+                "vs_6_0",
+                &[],
+            )
+            .expect("the vertex shader");
+            type CreateRs = unsafe extern "system" fn(*mut c_void, u32, *const c_void, usize, *const GUID, *mut *mut c_void) -> i32;
+            let create_rs: CreateRs = std::mem::transmute(orig_fn(d, 16));
+            let mut rs_raw = std::ptr::null_mut();
+            assert!(create_rs(d, 0, vs.as_ptr() as *const c_void, vs.len(), &ID3D12RootSignature::IID as *const _ as *const GUID, &mut rs_raw) >= 0, "root signature");
+            let rs = ID3D12RootSignature::from_raw(rs_raw);
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as *const c_void, BytecodeLength: vs.len() },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 0,
+                DSVFormat: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = false.into();
+            pd.DepthStencilState.DepthEnable = true.into();
+            pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+            pd.DepthStencilState.StencilEnable = true.into();
+            pd.DepthStencilState.StencilReadMask = 0xFF;
+            pd.DepthStencilState.StencilWriteMask = 0xFF;
+            let face = D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: D3D12_STENCIL_OP_KEEP, StencilDepthFailOp: D3D12_STENCIL_OP_KEEP, StencilPassOp: D3D12_STENCIL_OP_INCR_SAT, StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS };
+            (pd.DepthStencilState.FrontFace, pd.DepthStencilState.BackFace) = (face, face);
+            type CreatePso = unsafe extern "system" fn(*mut c_void, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, *const GUID, *mut *mut c_void) -> i32;
+            let create_pso: CreatePso = std::mem::transmute(orig_fn(d, 10));
+            let mut pso_raw = std::ptr::null_mut();
+            let hr = create_pso(d, &pd, &ID3D12PipelineState::IID as *const _ as *const GUID, &mut pso_raw);
+            std::mem::ManuallyDrop::drop(&mut pd.pRootSignature);
+            assert!(hr >= 0 && !pso_raw.is_null(), "the draws' pipeline: {hr:#x}");
+            let pso = ID3D12PipelineState::from_raw(pso_raw);
+
+            let l = &f.list;
+            let lraw = l.as_raw();
+            // (PC calls of the list by slot: after the list is adopted its own table is XCL's)
+            let pc_vt = *(lraw as *const *const usize);
+            let barrier = |res: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES| {
+                let r = res.as_raw() as usize;
+                let b = [0u32, 0, r as u32, (r as u64 >> 32) as u32, sub, before.0 as u32, after.0 as u32, 0];
+                let call: unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8]) = std::mem::transmute(*pc_vt.add(26));
+                call(lraw, 1, &b);
+            };
+            let copy = |dst: &D3D12_TEXTURE_COPY_LOCATION, src: &D3D12_TEXTURE_COPY_LOCATION| {
+                let call: unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const c_void) = std::mem::transmute(*pc_vt.add(16));
+                call(lraw, dst, 0, 0, 0, src, std::ptr::null());
+            };
+            let placed = |b: &ID3D12Resource, format: DXGI_FORMAT| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(b), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint(format) } };
+            let sub = |t: &ID3D12Resource, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(t), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
+            let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier(&twin, all, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            copy(&sub(&twin, 0), &placed(&up, DXGI_FORMAT_R16_TYPELESS));
+            barrier(&twin, all, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            // the list as a title's; the twin into the plane as the DSV is bound
+            adopt(lraw, Kind::CommandList);
+            list_x::on_create(lraw, f._alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let (passes, _, left) = depth_uav::plane_passes();
+            depth_uav::before_dsv_bind(lraw, f.dsv as usize);
+            let (passes2, _, left2) = depth_uav::plane_passes();
+            assert_eq!((passes2 - passes, left2 - left), (1, 0), "the twin is drawn into the plane");
+
+            // the stencil plane to 0, then a draw for each row's count, for 0 and for 65535
+            let drawn: Vec<u32> = ROWS.iter().copied().chain([0, 65535]).collect();
+            let dsv = f.dsv as usize;
+            let clear: unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const c_void) = std::mem::transmute(*pc_vt.add(47));
+            clear(lraw, dsv, D3D12_CLEAR_FLAG_STENCIL.0 as u32, 0.0, 0, 0, std::ptr::null());
+            let set_rs: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(*pc_vt.add(30));
+            set_rs(lraw, rs.as_raw());
+            let set_pso: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(*pc_vt.add(25));
+            set_pso(lraw, pso.as_raw());
+            let topology: unsafe extern "system" fn(*mut c_void, u32) = std::mem::transmute(*pc_vt.add(20));
+            topology(lraw, windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32);
+            let viewport = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: 16.0, Height: 16.0, MinDepth: 0.0, MaxDepth: 1.0 };
+            let set_viewports: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT) = std::mem::transmute(*pc_vt.add(21));
+            set_viewports(lraw, 1, &viewport);
+            let scissor = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 16, bottom: 16 };
+            let set_scissors: unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT) = std::mem::transmute(*pc_vt.add(22));
+            set_scissors(lraw, 1, &scissor);
+            let targets: unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize) = std::mem::transmute(*pc_vt.add(46));
+            targets(lraw, 0, std::ptr::null(), 0, &dsv);
+            let constants: unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void, u32) = std::mem::transmute(*pc_vt.add(36));
+            let draw: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = std::mem::transmute(*pc_vt.add(12));
+            for k in &drawn {
+                constants(lraw, 0, 1, k as *const u32 as *const c_void, 0);
+                draw(lraw, 3, 1, 0, 0);
+            }
+
+            // the stencil plane (subresource 1) to a readback buffer
+            let rb = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, 16 * 256);
+            barrier(&depth, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy(&placed(&rb, DXGI_FORMAT_R8_TYPELESS), &sub(&depth, 1));
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*pc_vt.add(9));
+            assert!(close(lraw) >= 0, "close list");
+            // (the PC queue's own call with the list as it is: no reference of the list changes hands)
+            let q = f.queue.as_raw();
+            let execute: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(*(*(q as *const *const usize)).add(10));
+            execute(q, 1, &lraw);
+            let fence: ID3D12Fence = f.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            f.queue.Signal(&fence, 1).expect("signal");
+            crate::gpu::fence::wait(&fence, 1, &f.dev, None, 5000).expect("the pass, the draws and the copy complete");
+            assert!(f.dev.GetDeviceRemovedReason().is_ok(), "the device is there");
+
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).expect("map readback");
+            let mut wrong = Vec::new();
+            for y in 0..16 {
+                for x in 0..16 {
+                    let got = *(p as *const u8).add(y * 256 + x);
+                    let want = drawn.contains(&(count(x, y) as u32)) as u8;
+                    if got != want {
+                        wrong.push((count(x, y), got));
+                    }
+                }
+            }
+            rb.Unmap(0, None);
+            assert!(wrong.is_empty(), "(count, draws that passed there) where it is not 1 for a drawn count and 0 for any other: {wrong:?}");
+        }
+    }
+
     /// ClearUnorderedAccessViewUint of console code with the console handles of a stencil UAV
     /// and the depth buffer as its resource: the PC clear goes to the twin the slot's view names,
     /// and the twin reads back the value. On WARP, in a child process.
@@ -14589,13 +14939,14 @@ mod depth_uav_twin_tests {
             let (done2, not_done2) = depth_uav::clears();
             assert_eq!((done2 - done, not_done2 - not_done), (1, 0), "the clear went to the twin");
             assert_eq!(GOT.load(Ordering::Relaxed), twin.as_raw() as usize, "the PC clear gets the twin as its resource, not the depth buffer");
-            // a depth-plane UAV of the buffer is a null view: its clear is not done, nothing reaches the PC
+            // a depth-plane UAV of the buffer is a view of the depth twin: its clear goes there
             let depth_slot = slot + console_heap::SLOT as u64;
             dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0), depth_slot);
+            let depth_twin = depth_uav::depth_twin_of(raw as usize).expect("a depth twin");
             GOT.store(0, Ordering::Relaxed);
             list_x::clear_uav_uint_x(stand_in.as_ptr() as *mut c_void, depth_slot, depth_slot, raw as usize, [0x11u32; 4].as_ptr(), 0, std::ptr::null());
             let (done3, not_done3) = depth_uav::clears();
-            assert_eq!((done3 - done2, not_done3 - not_done2, GOT.load(Ordering::Relaxed)), (0, 1, 0), "a clear through the null view is not done");
+            assert_eq!((done3 - done2, not_done3 - not_done2, GOT.load(Ordering::Relaxed)), (1, 0, depth_twin), "a clear through the depth view goes to the depth twin");
 
             // the twin to a readback buffer
             let td = twin.GetDesc();

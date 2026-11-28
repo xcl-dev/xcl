@@ -17,6 +17,16 @@
 //! the shaders wrote reaches the next depth test or sampling). A transition names the state it
 //! leaves and the one it enters, so each copy starts and ends in states the title gave.
 //!
+//! The depth plane of an R24G8 buffer (a console D16S8 or D24S8) has a twin as well: R16 for the
+//! console's 16-bit depth, else R32. A D3D12 copy cannot put either into a 24-bit plane, and a
+//! retail title does not move such a buffer into UNORDERED_ACCESS before its compute program
+//! writes it, so this twin is not copied at transitions: it is drawn into the plane, by a pass of
+//! XCL's own that writes `SV_Depth`, before the title binds a DSV of the buffer
+//! (`before_dsv_bind`). That is the case of a title whose compute program writes a number for
+//! each pixel into such a plane and whose lighting draws then test it with EQUAL. (The pass
+//! and the 16-bit steps after xcl-dev/xcl#1989 by raylitebull and its follow-up on `amd-dev`,
+//! 3cda5bea.) What a draw or a clear writes into that plane does not reach the twin.
+//!
 //! Behind `XCL_DEPTH_UAV_TWIN=1`; with the switch off nothing is registered, a UAV of a depth
 //! buffer stays a null view and every hook stops at one atomic load.
 //!
@@ -93,6 +103,10 @@ struct Inner {
     made_in: Option<u32>,
     /// [depth, stencil]
     twins: [Option<Twin>; 2],
+    /// an R24G8 buffer's depth twin: the views `before_dsv_bind` draws it into the plane with
+    pass: Option<PassViews>,
+    /// `bind::activity`'s count of dispatches when the twin was last drawn into the plane
+    drawn_at: Option<u64>,
 }
 
 /// A plane's twin: a colour texture of the plane's size with unordered access, resting in
@@ -101,6 +115,10 @@ struct Twin {
     res: ID3D12Resource,
     /// its number in the log (`#n`)
     n: u64,
+    /// the device it was made on
+    dev: usize,
+    /// the depth twin of an R24G8 buffer (counted in `R24_TWINS`)
+    r24: bool,
 }
 
 // D3D12 resources are free-threaded
@@ -110,6 +128,9 @@ unsafe impl Sync for Twin {}
 impl Drop for Twin {
     fn drop(&mut self) {
         TWINS.fetch_sub(1, Ordering::Relaxed);
+        if self.r24 {
+            R24_TWINS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -118,10 +139,12 @@ struct Object {
     cell: Arc<Cell>,
     /// the PC state the object was created in
     state: u32,
+    /// the PC states the title's transitions left the object's depth plane and its stencil plane
+    /// in (`note_plane_state`); `STATE_UNKNOWN` once a transition named a part of the plane only
+    now: Arc<[AtomicU32; 2]>,
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // (read once DSV binds are followed)
 struct Dsv {
     res: usize,
     /// D3D12_DSV_FLAGS of the view: 1 read-only depth, 2 read-only stencil
@@ -149,6 +172,16 @@ static UAV_CLEARS: AtomicU64 = AtomicU64::new(0);
 static CLEARS_NOT_DONE: AtomicU64 = AtomicU64::new(0);
 /// Cell numbers given.
 static CELL_IDS: AtomicU64 = AtomicU64::new(1);
+/// Depth twins of R24G8 buffers alive: the gate of `before_dsv_bind`.
+static R24_TWINS: AtomicUsize = AtomicUsize::new(0);
+/// Passes that drew a twin into its R24G8 depth plane, DSV binds that needed none (nothing was
+/// dispatched since the last one), and binds left without one (the plane's state not known, or
+/// the pass could not be made).
+static PLANE_PASSES: AtomicU64 = AtomicU64::new(0);
+static PLANE_PASSES_SPARED: AtomicU64 = AtomicU64::new(0);
+static PLANE_PASSES_LEFT: AtomicU64 = AtomicU64::new(0);
+/// `Object::now`: the depth plane's state is not known.
+const STATE_UNKNOWN: u32 = u32::MAX;
 /// Copies of a depth plane into its twin, of a twin into its plane, and copies into the twin not
 /// done since the two were in step (`plan_barriers`).
 static TO_TWIN: AtomicU64 = AtomicU64::new(0);
@@ -226,7 +259,7 @@ fn register(res: usize, x: &[u8; 0x38], at: Option<usize>, pc_state: u32) -> boo
             );
         }
     }
-    let gone = match OBJECTS.insert(res, Object { cell, state: pc_state }) {
+    let gone = match OBJECTS.insert(res, Object { cell, state: pc_state, now: Arc::new([AtomicU32::new(pc_state), AtomicU32::new(pc_state)]) }) {
         None => {
             REGISTERED.fetch_add(1, Ordering::Relaxed);
             Default::default()
@@ -261,6 +294,8 @@ fn leave(cells: &mut HashMap<Key, Arc<Cell>>, cell: &Arc<Cell>) -> [Option<Twin>
     inner.members = inner.members.saturating_sub(1);
     if inner.members == 0 && cells.get(&cell.key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
         cells.remove(&cell.key);
+        // (views and heaps of the PC's own, not adopted: their release calls nothing of XCL's)
+        (inner.pass, inner.drawn_at) = (None, None);
         return std::mem::take(&mut inner.twins);
     }
     Default::default()
@@ -289,7 +324,7 @@ pub(super) enum Resolve {
 
 /// CreateUnorderedAccessView of `res` (description `rd`) with the title's view `view` as it came:
 /// a UAV of the stencil plane of a kept two-plane depth buffer, or of the depth plane of a kept
-/// D32, D16 or D32S8 one, is made on the plane's twin (made now when there is none yet).
+/// buffer, is made on the plane's twin (made now when there is none yet).
 pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<&D3D12_RESOURCE_DESC>, view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Resolve {
     let Some(rd) = rd.filter(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0) else {
         return Resolve::NotOurs;
@@ -328,18 +363,18 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
         }
     }
     let stencil = stencil_view(view);
-    // (a D24S8's depth plane: no UAV format holds it as a shader reads it)
-    if if stencil { !matches!(key.format, 19 | 44) } else { !matches!(key.format, 19 | 39 | 53) } {
-        return Resolve::Null("its depth plane has no twin yet");
+    if stencil && !matches!(key.format, 19 | 44) {
+        return Resolve::Null("it has no stencil plane");
     }
-    // (its states stay the title's: the twin would never be copied)
-    if !stencil && (o.cell.inner.lock().unwrap().made_in.unwrap_or(o.state) | o.state) & UNORDERED_ACCESS != 0 {
+    // (its states stay the title's: the twin would never be copied. An R24G8 buffer's twin is
+    // not copied at transitions but drawn into the plane, `before_dsv_bind`)
+    if !stencil && key.format != 44 && (o.cell.inner.lock().unwrap().made_in.unwrap_or(o.state) | o.state) & UNORDERED_ACCESS != 0 {
         return Resolve::Null("the buffer was made in UNORDERED_ACCESS");
     }
     // (the Cell holds the twin)
     let Some((twin, _)) = plane_twin(&o, stencil as usize, dev) else { return Resolve::Null("the twin could not be made") };
     REDIRECTED.fetch_add(1, Ordering::Relaxed);
-    Resolve::Twin(twin.as_raw(), if stencil { twin_view(view, key.array) } else { depth_twin_view(view, key.array, key.format == 53) })
+    Resolve::Twin(twin.as_raw(), if stencil { twin_view(view, key.array) } else { depth_twin_view(view, key.array, depth_twin_r16(key.format, o.cell.console_format)) })
 }
 
 /// The twin of `plane` (0 depth, 1 stencil) of the buffer `o` is in, and its number: the one it
@@ -350,10 +385,14 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
     if let Some(t) = &inner.twins[plane] {
         return Some((t.res.clone(), t.n));
     }
-    let t = make_twin(dev, &key, twin_format(key.format, plane))?;
+    let t = make_twin(dev, &key, twin_format(key.format, o.cell.console_format, plane))?;
     TWINS.fetch_add(1, Ordering::Relaxed);
+    let r24 = plane == 0 && key.format == 44;
+    if r24 {
+        R24_TWINS.fetch_add(1, Ordering::Relaxed);
+    }
     let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
-    inner.twins[plane] = Some(Twin { res: t.clone(), n });
+    inner.twins[plane] = Some(Twin { res: t.clone(), n, dev: dev as usize, r24 });
     o.cell.twinned.store(true, Ordering::Relaxed);
     // (the state of the title's object; that of the UAV's own when the title made none)
     let state = inner.made_in.unwrap_or(o.state);
@@ -367,6 +406,18 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
                 key.format,
                 o.cell.console_format,
                 key.at,
+                state
+            );
+        } else if r24 {
+            crate::xlog_info!(
+                "D3D12.X: depth UAV twin #{n}: the depth plane of a {}x{}x{} depth buffer (PC format {}, console format {}) at {:#x} is an R{} texture, drawn into the plane before the title binds a DSV of the buffer; the buffer was made in state {:#x}",
+                key.width,
+                key.height,
+                key.array,
+                key.format,
+                o.cell.console_format,
+                key.at,
+                if depth_twin_r16(key.format, o.cell.console_format) { 16 } else { 32 },
                 state
             );
         } else {
@@ -386,14 +437,22 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
     Some((t, n))
 }
 
-/// The format of the twin of `plane` of a buffer of the PC format `format`: R8 for the stencil
-/// plane, R16 for D16's depth, R32 for D32's and D32S8's (the plane copies as R32_TYPELESS).
-fn twin_format(format: u32, plane: usize) -> DXGI_FORMAT {
-    match (plane, format) {
-        (1, _) => DXGI_FORMAT_R8_TYPELESS,
-        (_, 53) => DXGI_FORMAT_R16_TYPELESS,
+/// The format of the twin of `plane` of a buffer of the PC format `format` made for the
+/// console format `console`: R8 for the stencil plane, R16 for a 16-bit depth (`depth_twin_r16`),
+/// R32 for D32's and D32S8's (the plane copies as R32_TYPELESS) and for a console D24S8's.
+fn twin_format(format: u32, console: u32, plane: usize) -> DXGI_FORMAT {
+    match plane {
+        1 => DXGI_FORMAT_R8_TYPELESS,
+        _ if depth_twin_r16(format, console) => DXGI_FORMAT_R16_TYPELESS,
         _ => DXGI_FORMAT_R32_TYPELESS,
     }
+}
+
+/// The depth plane of a buffer of the PC format `format` made for the console format `console`
+/// holds 16 bits: a D16, or the console's D16S8 family (118 – 120), which the PC has as R24G8
+/// (`device_x::pc_resource_desc`).
+fn depth_twin_r16(format: u32, console: u32) -> bool {
+    format == 53 || (format == 44 && matches!(console, 118..=120))
 }
 
 /// Where a buffer whose depth plane can have a twin rests while the title has it in
@@ -467,7 +526,11 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
     let mut out = Vec::with_capacity(barriers.len());
     for mut b in barriers.drain(..) {
         let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
-        let Some(o) = (b[0] == 0).then(|| OBJECTS.get(res)).flatten().filter(plane_twinnable) else {
+        let kept = (b[0] == 0).then(|| OBJECTS.get(res)).flatten();
+        if let Some(o) = kept.as_ref().filter(|o| !plane_twinnable(o)) {
+            note_plane_state(o, &b);
+        }
+        let Some(o) = kept.filter(plane_twinnable) else {
             out.push(b);
             continue;
         };
@@ -557,6 +620,300 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
 /// The depth twin of `o`'s buffer when it has one, and its number.
 fn twin_if_made(o: &Object) -> Option<(ID3D12Resource, u64)> {
     o.cell.inner.lock().unwrap().twins[0].as_ref().map(|t| (t.res.clone(), t.n))
+}
+
+/// A title's transition `b` (PC words) of `o`, an object whose depth plane has no twin copied at
+/// transitions: the states it leaves the depth plane and the stencil plane in are kept
+/// (`Object::now`), for `before_dsv_bind`. The stencil plane's subresources follow the depth
+/// plane's in the buffer; a transition of a part of a plane leaves that plane's state unknown.
+fn note_plane_state(o: &Object, b: &[u32; 8]) {
+    let (flags, sub, after) = (b[1], b[4], b[6]);
+    // (a split transition counts at its end)
+    if flags & BEGIN_ONLY != 0 {
+        return;
+    }
+    let n = o.cell.key.mips.max(1) as u32 * o.cell.key.array.max(1) as u32;
+    if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES {
+        o.now.iter().for_each(|p| p.store(after, Ordering::Relaxed));
+    } else if let Some(p) = o.now.get((sub / n) as usize) {
+        p.store(if n == 1 { after } else { STATE_UNKNOWN }, Ordering::Relaxed);
+    }
+}
+
+/// What draws an R24G8 buffer's depth twin into the plane: an SRV of the twin in a view heap of
+/// its own, and a DSV of each level and slice of the depth plane of the object `of` (level `m`,
+/// slice `a` at `m * array + a`), then each once more with the stencil plane read only. Heaps
+/// of the PC's own, not adopted.
+struct PassViews {
+    of: usize,
+    srv_heap: ID3D12DescriptorHeap,
+    dsv_heap: ID3D12DescriptorHeap,
+    dsv_inc: usize,
+}
+
+// D3D12 objects are free-threaded
+unsafe impl Send for PassViews {}
+unsafe impl Sync for PassViews {}
+
+/// The pass's root signature (two root constants: slice, level; the twin's SRV) and pipelines
+/// on a device: `float` writes an R32_FLOAT twin's value, `steps` a 16-bit twin's.
+struct PassPipelines {
+    rs: ID3D12RootSignature,
+    float: ID3D12PipelineState,
+    steps: ID3D12PipelineState,
+}
+
+unsafe impl Send for PassPipelines {}
+unsafe impl Sync for PassPipelines {}
+
+/// By device; None: they could not be made there (said once).
+static PASS_PIPELINES: Mutex<Option<HashMap<usize, Option<Arc<PassPipelines>>>>> = Mutex::new(None);
+
+const PASS_VS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0, visibility=SHADER_VISIBILITY_PIXEL), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)"
+[RootSignature(RS)]
+float4 main(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 2u ? 3.0 : -1.0, id == 1u ? 3.0 : -1.0, 0.0, 1.0);
+}
+"#;
+
+const PASS_PS_FLOAT: &str = r#"
+Texture2DArray<float> src : register(t0);
+cbuffer C : register(b0) { uint slice; uint level; };
+float main(float4 pos : SV_Position) : SV_Depth {
+    return src.Load(int4(int2(pos.xy), int(slice), int(level)));
+}
+"#;
+
+/// A 16-bit twin's texel is a count of 1/65535 steps, and the depth written is that count times
+/// the float nearest 1/65535 (0x37800080), which is how a title's vertex shader makes the depth
+/// of the draw that tests the plane with EQUAL. Read as R16_UNORM the same texel can come out
+/// one unit in the last place off; in 24 bits that is another value for some counts, and the
+/// test fails for them. (After the follow-up of xcl-dev/xcl#1989 on `amd-dev`, 3cda5bea.)
+const PASS_PS_STEPS: &str = r#"
+Texture2DArray<uint> src : register(t0);
+cbuffer C : register(b0) { uint slice; uint level; };
+float main(float4 pos : SV_Position) : SV_Depth {
+    return float(src.Load(int4(int2(pos.xy), int(slice), int(level)))) * asfloat(0x37800080u);
+}
+"#;
+
+/// The PC's own method `slot` of the device `dev`: past XCL's hooks when the device is adopted
+/// (what the pass makes is XCL's, not a title's: no stand-ins, no bookkeeping).
+unsafe fn dev_fn(dev: *mut c_void, slot: usize) -> usize {
+    if super::real::is_adopted(dev) {
+        super::real::orig_fn(dev, slot)
+    } else {
+        *(*(dev as *const *const usize)).add(slot)
+    }
+}
+
+/// `PassPipelines` of `dev`, made at the first use.
+unsafe fn pass_pipelines(dev: *mut c_void) -> Option<Arc<PassPipelines>> {
+    let mut g = PASS_PIPELINES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(p) = m.get(&(dev as usize)) {
+        return p.clone();
+    }
+    let made = make_pass_pipelines(dev);
+    if let Err(e) = &made {
+        crate::xlog_warn!("D3D12.X: depth UAV twins: the pass that draws a twin into an R24G8 depth plane cannot be made ({e}): those planes keep what they hold");
+    }
+    let made = made.ok().map(Arc::new);
+    m.insert(dev as usize, made.clone());
+    made
+}
+
+unsafe fn make_pass_pipelines(dev: *mut c_void) -> Result<PassPipelines, String> {
+    use crate::gpu::recomp::dxc::compile;
+    use windows_sys::core::GUID;
+    let vs = compile(PASS_VS, "main", "vs_6_0", &[])?;
+    let float = compile(PASS_PS_FLOAT, "main", "ps_6_0", &[])?;
+    let steps = compile(PASS_PS_STEPS, "main", "ps_6_0", &[])?;
+    // (the root signature is in the vertex shader's container)
+    type CreateRs = unsafe extern "system" fn(*mut c_void, u32, *const c_void, usize, *const GUID, *mut *mut c_void) -> i32;
+    let create_rs: CreateRs = std::mem::transmute(dev_fn(dev, 16));
+    let mut raw = std::ptr::null_mut();
+    let hr = create_rs(dev, 0, vs.as_ptr() as *const c_void, vs.len(), &ID3D12RootSignature::IID as *const _ as *const GUID, &mut raw);
+    if hr < 0 || raw.is_null() {
+        return Err(format!("root signature: {hr:#x}"));
+    }
+    let rs = ID3D12RootSignature::from_raw(raw);
+    type CreatePso = unsafe extern "system" fn(*mut c_void, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, *const GUID, *mut *mut c_void) -> i32;
+    let create_pso: CreatePso = std::mem::transmute(dev_fn(dev, 10));
+    let pipeline = |ps: &[u8]| -> Result<ID3D12PipelineState, String> {
+        let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as *const c_void, BytecodeLength: vs.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as *const c_void, BytecodeLength: ps.len() },
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 0,
+            DSVFormat: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = false.into();
+        // every texel's depth is written, whatever the plane holds; the stencil plane is left
+        pd.DepthStencilState.DepthEnable = true.into();
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pd.DepthStencilState.StencilEnable = false.into();
+        let mut raw = std::ptr::null_mut();
+        let hr = create_pso(dev, &pd, &ID3D12PipelineState::IID as *const _ as *const GUID, &mut raw);
+        std::mem::ManuallyDrop::drop(&mut pd.pRootSignature);
+        if hr < 0 || raw.is_null() {
+            return Err(format!("pipeline: {hr:#x}"));
+        }
+        Ok(ID3D12PipelineState::from_raw(raw))
+    };
+    Ok(PassPipelines { float: pipeline(&float)?, steps: pipeline(&steps)?, rs })
+}
+
+/// `PassViews` of the twin `twin` (`r16`: a 16-bit one) for the depth plane of `of`, a buffer of
+/// `key`, on `dev`.
+unsafe fn make_pass_views(dev: *mut c_void, of: usize, twin: &ID3D12Resource, key: &Key, r16: bool) -> Option<PassViews> {
+    use windows_sys::core::GUID;
+    type CreateHeap = unsafe extern "system" fn(*mut c_void, *const D3D12_DESCRIPTOR_HEAP_DESC, *const GUID, *mut *mut c_void) -> i32;
+    let create_heap: CreateHeap = std::mem::transmute(dev_fn(dev, 14));
+    let heap = |ty: D3D12_DESCRIPTOR_HEAP_TYPE, n: u32, flags: D3D12_DESCRIPTOR_HEAP_FLAGS| -> Option<ID3D12DescriptorHeap> {
+        let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: n, Flags: flags, NodeMask: 0 };
+        let mut out = std::ptr::null_mut();
+        let hr = create_heap(dev, &d, &ID3D12DescriptorHeap::IID as *const _ as *const GUID, &mut out);
+        (hr >= 0 && !out.is_null()).then(|| ID3D12DescriptorHeap::from_raw(out))
+    };
+    let (mips, array) = (key.mips.max(1) as u32, key.array.max(1) as u32);
+    let srv_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+    let dsv_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2 * mips * array, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
+    let increment: unsafe extern "system" fn(*mut c_void, D3D12_DESCRIPTOR_HEAP_TYPE) -> u32 = std::mem::transmute(dev_fn(dev, 15));
+    let dsv_inc = increment(dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV) as usize;
+    let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: if r16 { DXGI_FORMAT_R16_UINT } else { DXGI_FORMAT_R32_FLOAT },
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: mips, FirstArraySlice: 0, ArraySize: array, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+        },
+    };
+    let create_srv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, usize) = std::mem::transmute(dev_fn(dev, 18));
+    create_srv(dev, twin.as_raw(), &srv, srv_heap.GetCPUDescriptorHandleForHeapStart().ptr);
+    let create_dsv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize) = std::mem::transmute(dev_fn(dev, 21));
+    let base = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+    for (k, flags) in [D3D12_DSV_FLAG_NONE, D3D12_DSV_FLAG_READ_ONLY_STENCIL].into_iter().enumerate() {
+        for m in 0..mips {
+            for a in 0..array {
+                let v = D3D12_DEPTH_STENCIL_VIEW_DESC {
+                    Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                    Flags: flags,
+                    Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_DSV { MipSlice: m, FirstArraySlice: a, ArraySize: 1 } },
+                };
+                create_dsv(dev, of as *mut c_void, &v, base + (k as u32 * mips * array + m * array + a) as usize * dsv_inc);
+            }
+        }
+    }
+    Some(PassViews { of, srv_heap, dsv_heap, dsv_inc })
+}
+
+/// Before OMSetRenderTargets binds the DSV at `dsv` on `list` (`real::cl_om_set_render_targets`).
+/// When the DSV names an R24G8 buffer whose depth plane has a twin, the twin is drawn into the
+/// plane first, so the draws that follow test what the title's compute programs wrote through
+/// the twin. Not when no dispatch was recorded since the last such pass of the buffer
+/// (`bind::activity`): then nothing wrote the twin. The pass is recorded where the bind is, so
+/// it runs after everything recorded before on this list and on the lists submitted before it.
+///
+/// On a DIRECT list XCL keeps state for; the title's own state of the list (view heaps,
+/// viewports, scissors, topology, vertex buffers, render targets, pipeline) is set again after
+/// it (`list_x::depth_only_pass`).
+pub(super) unsafe fn before_dsv_bind(list: *mut c_void, dsv: usize) {
+    if R24_TWINS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let Some(d) = DSVS.get(dsv) else { return };
+    let Some(cell) = d.cell.upgrade() else { return };
+    if cell.key.format != 44 || super::list_x::tracked_list_type(list) != Some(D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+    let Some(o) = OBJECTS.get(d.res) else { return };
+    let key = cell.key;
+    let r16 = depth_twin_r16(key.format, cell.console_format);
+    let now = super::bind::activity().1;
+    let left = |why: &str| {
+        let n = PLANE_PASSES_LEFT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: depth UAV twins: the twin of depth buffer {:#x} is not drawn into its plane ({why}): {n} such binds so far", d.res);
+        }
+    };
+    // (the depth plane's state, which the pass moves, and the stencil plane's, which it reads)
+    let state = [o.now[0].load(Ordering::Relaxed), o.now[1].load(Ordering::Relaxed)];
+    if state[0] == STATE_UNKNOWN {
+        return left("the title moved a part of the depth plane to a state of its own");
+    }
+    let (twin, n, dev, srv_heap, table, dsv_base, dsv_inc) = {
+        let mut inner = cell.inner.lock().unwrap();
+        let Some(t) = inner.twins[0].as_ref() else { return };
+        if inner.drawn_at == Some(now) {
+            PLANE_PASSES_SPARED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let (twin, n, dev) = (t.res.clone(), t.n, t.dev as *mut c_void);
+        if inner.pass.as_ref().map(|p| p.of) != Some(d.res) {
+            inner.pass = make_pass_views(dev, d.res, &twin, &key, r16);
+        }
+        let Some(p) = inner.pass.as_ref() else {
+            drop(inner);
+            return left("its views could not be made");
+        };
+        let views = (p.srv_heap.as_raw() as usize, p.srv_heap.GetGPUDescriptorHandleForHeapStart().ptr, p.dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr, p.dsv_inc);
+        inner.drawn_at = Some(now);
+        (twin, n, dev, views.0, views.1, views.2, views.3)
+    };
+    let Some(pl) = pass_pipelines(dev) else { return left("the pass could not be made") };
+    let (mips, array) = (key.mips.max(1) as u32, key.array.max(1) as u32);
+    let tr = |res: usize, sub: u32, before: u32, after: u32| [0, 0, res as u32, (res as u64 >> 32) as u32, sub, before, after, 0];
+    let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    let (shader, depth_write) = (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+    let twin_raw = twin.as_raw() as usize;
+    // the twin rests in UNORDERED_ACCESS; the stencil plane's subresources follow the depth plane's
+    let mut before = vec![tr(twin_raw, all, UNORDERED_ACCESS, shader)];
+    let mut after = vec![tr(twin_raw, all, shader, UNORDERED_ACCESS)];
+    // The pass writes the depth plane: in DEPTH_WRITE for it. The stencil plane it neither
+    // writes nor moves: where the title has that plane in DEPTH_READ (it binds the buffer to
+    // test it) the pass's DSV is the one with the stencil plane read only.
+    let stencil_read_only = state[1] != STATE_UNKNOWN && state[1] != depth_write && state[1] & D3D12_RESOURCE_STATE_DEPTH_READ.0 as u32 != 0;
+    let first_dsv = if stencil_read_only { mips * array } else { 0 };
+    if state[0] != depth_write {
+        for sub in 0..mips * array {
+            before.push(tr(d.res, sub, state[0], depth_write));
+            after.push(tr(d.res, sub, depth_write, state[0]));
+        }
+    }
+    let draws: Vec<(usize, u32, u32, [u32; 2])> = (0..mips)
+        .flat_map(|m| (0..array).map(move |a| (m, a)))
+        .map(|(m, a)| (dsv_base + (first_dsv + m * array + a) as usize * dsv_inc, (key.width >> m).max(1), (key.height >> m).max(1), [a, m]))
+        .collect();
+    super::list_x::barrier_words(list, &before);
+    super::list_x::depth_only_pass(list, srv_heap, pl.rs.as_raw() as usize, if r16 { pl.steps.as_raw() } else { pl.float.as_raw() } as usize, table, &draws);
+    super::list_x::barrier_words(list, &after);
+    let c = PLANE_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if c <= 4 || c.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: depth UAV twin #{n}: drawn into the depth plane of {:#x} before a DSV of it is bound (the title has its planes in states {:#x} and {:#x}; {c} such passes so far, {} binds needed none)",
+            d.res,
+            state[0],
+            state[1],
+            PLANE_PASSES_SPARED.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// (tests) Passes that drew a twin into an R24G8 depth plane, binds that needed none, binds left
+/// without one.
+#[cfg(test)]
+pub(super) fn plane_passes() -> (u64, u64, u64) {
+    (PLANE_PASSES.load(Ordering::Relaxed), PLANE_PASSES_SPARED.load(Ordering::Relaxed), PLANE_PASSES_LEFT.load(Ordering::Relaxed))
 }
 
 /// A UAV of a depth buffer stays a null view (`Resolve::Null`).
@@ -1137,11 +1494,24 @@ mod tests {
 
     #[test]
     fn a_depth_view_is_a_view_of_a_twin_of_the_planes_size() {
+        // (the PC format, the console's, the plane)
         assert_eq!(
-            [twin_format(39, 0), twin_format(19, 0), twin_format(53, 0), twin_format(44, 1), twin_format(19, 1)],
-            [DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_TYPELESS],
-            "D32, D32S8, D16 depth; stencil"
+            [twin_format(39, 40, 0), twin_format(19, 20, 0), twin_format(53, 55, 0), twin_format(44, 45, 0), twin_format(44, 118, 0), twin_format(44, 45, 1), twin_format(19, 20, 1)],
+            [
+                DXGI_FORMAT_R32_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS,
+                DXGI_FORMAT_R16_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS,
+                DXGI_FORMAT_R16_TYPELESS,
+                DXGI_FORMAT_R8_TYPELESS,
+                DXGI_FORMAT_R8_TYPELESS
+            ],
+            "D32, D32S8, D16, D24S8, the console's D16S8 depth; stencil"
         );
+        // 16 bits: a D16, and the console's D16S8 family, which the PC has as R24G8
+        for (format, console, r16) in [(53, 55, true), (44, 118, true), (44, 119, true), (44, 120, true), (44, 45, false), (44, 46, false), (39, 40, false), (19, 20, false)] {
+            assert_eq!(depth_twin_r16(format, console), r16, "PC format {format}, console format {console}");
+        }
         // an R32 twin: the depth as a float unless the title asked for another R32 class
         for (asked, got) in [
             (DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT),
@@ -1173,9 +1543,54 @@ mod tests {
         assert_eq!(twin_view(None, 1).Format, DXGI_FORMAT_R8_UINT);
     }
 
+    /// The states a title's transitions leave the depth plane and the stencil plane of a buffer
+    /// in whose twin is not copied at transitions: a transition of the whole buffer sets both, one
+    /// of a whole plane that plane's, the first half of a split one neither, and one of a part of
+    /// a plane makes that plane's unknown.
+    #[test]
+    fn the_states_of_an_r24g8_buffers_planes_follow_the_titles_transitions() {
+        let (one, two) = (0x7B50_0000_1000usize, 0x7B50_0000_2000usize);
+        assert!(register(one, &desc(3, 64, 64, 118, 1, 6), None, 0x10));
+        // (two levels)
+        let mut levels = desc(3, 64, 64, 45, 1, 6);
+        levels[0x1E..0x20].copy_from_slice(&2u16.to_le_bytes());
+        assert!(register(two, &levels, None, 0x10));
+        let tr = |res: usize, flags: u32, sub: u32, before: u32, after: u32| [0, flags, res as u32, (res as u64 >> 32) as u32, sub, before, after, 0];
+        // [the depth plane's, the stencil plane's]
+        let now = |res: usize| OBJECTS.get(res).unwrap().now.each_ref().map(|p| p.load(Ordering::Relaxed));
+        assert_eq!((now(one), now(two)), ([0x10; 2], [0x10; 2]), "the state they were made in");
+        let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        // (through the walk of a title's barriers: the barriers go on as they came)
+        let walk = |b: [u32; 8]| {
+            let mut v = vec![b];
+            let plan = plan_with(&mut v, true, &mut Vec::new(), &mut |_, _| None);
+            assert!(plan.to_plane.is_empty() && plan.to_twin.is_empty());
+            assert_eq!(v, [b], "an R24G8 buffer's transition goes to the PC as it came");
+        };
+        walk(tr(one, 0, all, 0x10, 0x20));
+        assert_eq!(now(one), [0x20, 0x20], "the whole buffer");
+        walk(tr(one, 0, 0, 0x20, 0xA0));
+        assert_eq!(now(one), [0xA0, 0x20], "its one depth subresource");
+        walk(tr(one, 0, 1, 0x20, 0x10));
+        assert_eq!(now(one), [0xA0, 0x10], "its one stencil subresource");
+        walk(tr(one, BEGIN_ONLY, all, 0xA0, 0x10));
+        assert_eq!(now(one), [0xA0, 0x10], "the first half of a split transition");
+        walk(tr(one, END_ONLY, all, 0xA0, 0x10));
+        assert_eq!(now(one), [0x10, 0x10], "its end");
+        // two levels: a transition of one of the depth plane's, then of one of the stencil plane's
+        walk(tr(two, 0, 1, 0x10, 0x20));
+        assert_eq!(now(two), [STATE_UNKNOWN, 0x10], "a part of the depth plane");
+        walk(tr(two, 0, 3, 0x10, 0x20));
+        assert_eq!(now(two), [STATE_UNKNOWN, STATE_UNKNOWN], "a part of the stencil plane");
+        walk(tr(two, 0, all, 0x10, 0x20));
+        assert_eq!(now(two), [0x20, 0x20], "the whole buffer again: known");
+        forget(one);
+        forget(two);
+    }
+
     /// The library's tests run with the switch as the process has it (by default as DEFAULT_ON).
     #[test]
-    fn a_depth_uav_of_a_d32_or_d16_buffer_asks_for_a_twin_and_a_d24s8_one_stays_null() {
+    fn a_depth_uav_of_a_kept_buffer_asks_for_a_twin() {
         let rd = |format| D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: 64,
@@ -1188,12 +1603,13 @@ mod tests {
             ..Default::default()
         };
         let base = 0x7B30_0000_1000usize;
-        // console D32, D16, D32S8, D24S8; the PC formats of the buffers; the views of their depth
+        // console D32, D16, D32S8, D24S8, D16S8; the PC formats of the buffers; the views of their depth
         for (k, (console, pc, view, on)) in [
             (40u32, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, "the twin could not be made"),
             (55, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, "the twin could not be made"),
             (20, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, "the twin could not be made"),
-            (45, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "its depth plane has no twin yet"),
+            (45, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "the twin could not be made"),
+            (118, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R16_UNORM, "the twin could not be made"),
         ]
         .into_iter()
         .enumerate()
@@ -1240,7 +1656,7 @@ mod tests {
         {
             let o = OBJECTS.get(buffer).unwrap();
             TWINS.fetch_add(1, Ordering::Relaxed);
-            o.cell.inner.lock().unwrap().twins[1] = Some(Twin { res: unsafe { ID3D12Resource::from_raw(fake) }, n: 0 });
+            o.cell.inner.lock().unwrap().twins[1] = Some(Twin { res: unsafe { ID3D12Resource::from_raw(fake) }, n: 0, dev: 0, r24: false });
         }
         let t = fake as usize;
         let before = clears();
@@ -1271,7 +1687,7 @@ mod tests {
     fn plant_depth_twin(res: usize, t: &ID3D12Resource) {
         let o = OBJECTS.get(res).unwrap();
         TWINS.fetch_add(1, Ordering::Relaxed);
-        o.cell.inner.lock().unwrap().twins[0] = Some(Twin { res: t.clone(), n: 0 });
+        o.cell.inner.lock().unwrap().twins[0] = Some(Twin { res: t.clone(), n: 0, dev: 0, r24: false });
     }
 
     fn tr(res: usize, sub: u32, before: u32, after: u32) -> [u32; 8] {

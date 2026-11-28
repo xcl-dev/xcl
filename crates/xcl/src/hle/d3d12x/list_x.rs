@@ -40,7 +40,12 @@ const PC_RESET: usize = 10;
 const PC_COPY_BUFFER_REGION: usize = 15;
 const PC_COPY_TEXTURE_REGION: usize = 16;
 const PC_COPY_RESOURCE: usize = 17;
+const PC_DRAW_INSTANCED: usize = 12;
 const PC_SET_PIPELINE_STATE: usize = 25;
+const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
+const PC_SET_GRAPHICS_ROOT_SIGNATURE: usize = 30;
+const PC_SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE: usize = 32;
+const PC_SET_GRAPHICS_ROOT_32BIT_CONSTANTS: usize = 36;
 const PC_RESOURCE_BARRIER: usize = 26;
 const PC_IA_SET_INDEX_BUFFER: usize = 43;
 const PC_BEGIN_QUERY: usize = 52;
@@ -91,6 +96,59 @@ fn gpu_wait_watchdog_timeout() -> Duration {
 
 fn once(counter: &AtomicU64, n: u64) -> bool {
     counter.fetch_add(1, Ordering::Relaxed) < n
+}
+
+/// A pass of XCL's own on a title's DIRECT list that only writes depth (`depth_uav::before_dsv_bind`):
+/// for each of `draws` (a DSV, the size of its level, two root constants) one triangle over the
+/// whole target with the pipeline `pso` under the root signature `rs`, its texture at `table` in
+/// the view heap `heap`. Past the hooks of a title's calls: nothing of it is kept as the
+/// title's, and what the title had set is set again (`restore_after_own_pass`).
+pub(super) unsafe fn depth_only_pass(list: *mut c_void, heap: usize, rs: usize, pso: usize, table: u64, draws: &[(usize, u32, u32, [u32; 2])]) {
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(list, PC_SET_DESCRIPTOR_HEAPS)(list, 1, &heap);
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_GRAPHICS_ROOT_SIGNATURE)(list, rs);
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, pso);
+    pc::<unsafe extern "system" fn(*mut c_void, u32)>(list, PC_IA_SET_PRIMITIVE_TOPOLOGY)(list, windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32);
+    pc::<unsafe extern "system" fn(*mut c_void, u32, u64)>(list, PC_SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE)(list, 1, table);
+    for &(dsv, w, h, constants) in draws {
+        let viewport = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let scissor = windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(list, PC_RS_SET_VIEWPORTS)(list, 1, &viewport);
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(list, PC_RS_SET_SCISSOR_RECTS)(list, 1, &scissor);
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize)>(list, PC_OM_SET_RENDER_TARGETS)(list, 0, std::ptr::null(), 0, &dsv);
+        pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void, u32)>(list, PC_SET_GRAPHICS_ROOT_32BIT_CONSTANTS)(list, 0, 2, constants.as_ptr() as *const c_void, 0);
+        pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32)>(list, PC_DRAW_INSTANCED)(list, 3, 1, 0, 0);
+    }
+    restore_after_own_pass(list);
+}
+
+/// After a graphics pass of XCL's own on `list` that set a view heap, a root signature, a
+/// pipeline, a topology, viewports, scissors and targets of its own: what the title had set is
+/// set again (`restore_bindings`), the title's pipeline is bound again, and the next translated
+/// draw or dispatch sets XCL's view heap (`bind::heaps_changed`). Root signatures and root
+/// arguments need nothing: every translated draw and dispatch binds its own (`bind::rebind`),
+/// and a draw with a PC pipeline the title's (`bind::bind_title_root_signature`).
+unsafe fn restore_after_own_pass(list: *mut c_void) {
+    let key = list as usize;
+    let (bindings, pso, ty) = {
+        let g = recording(key).lock().unwrap();
+        match g.as_ref().and_then(|m| m.get(&key)) {
+            Some(s) => (s.bindings.clone(), s.bound_pso, s.list_type.unwrap_or(D3D12_COMMAND_LIST_TYPE_DIRECT)),
+            None => return,
+        }
+    };
+    restore_bindings(list, &bindings, ty);
+    super::bind::heaps_changed(list);
+    if pso != 0 {
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, super::pso_async::resolve_for_bind(pso));
+    }
+}
+
+/// Barriers of XCL's own on the PC list, as PC words (type, flags, resource, subresource, state
+/// before, state after).
+pub(super) unsafe fn barrier_words(list: *mut c_void, b: &[[u32; 8]]) {
+    if !b.is_empty() {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
+    }
 }
 
 /// a PC method of the list (its runtime's own)
