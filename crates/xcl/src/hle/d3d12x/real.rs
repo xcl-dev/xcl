@@ -1058,6 +1058,24 @@ pub(crate) unsafe fn native_fence_completed(fence: &ID3D12Fence) -> u64 {
     f(raw)
 }
 
+/// Create an SRV directly through `dev`'s native vtable slot, bypassing the title hook.
+pub(super) unsafe fn native_create_srv(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
+    let raw = dev.as_raw();
+    let slot = std::mem::offset_of!(ID3D12Device_Vtbl, CreateShaderResourceView) / std::mem::size_of::<usize>();
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64);
+    let f: F = std::mem::transmute(if is_ext(vt(raw) as usize) { orig_fn(raw, slot) } else { *vt(raw).add(slot) });
+    f(raw, res.as_raw(), desc, cpu);
+}
+
+/// Copy descriptors directly through `dev`'s native vtable slot, bypassing the title hook.
+pub(super) unsafe fn native_copy_descriptors_simple(dev: &ID3D12Device, n: u32, dst: u64, src: u64, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+    let raw = dev.as_raw();
+    let slot = std::mem::offset_of!(ID3D12Device_Vtbl, CopyDescriptorsSimple) / std::mem::size_of::<usize>();
+    type F = unsafe extern "system" fn(*mut c_void, u32, u64, u64, i32);
+    let f: F = std::mem::transmute(if is_ext(vt(raw) as usize) { orig_fn(raw, slot) } else { *vt(raw).add(slot) });
+    f(raw, n, dst, src, ty.0);
+}
+
 #[cfg(test)]
 pub(super) fn register_test_queue_vtable(ext: usize, add: bool) {
     let mut tables = EXTS.lock().unwrap();
@@ -2781,6 +2799,23 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
+    let mut clamped_copy = None;
+    if !buf_delta_null && super::vram::srv_tracking_enabled() && !res.is_null() {
+        let min_mip = super::vram::resident_min_mip(res as usize);
+        if min_mip > 0 {
+            let base = desc.as_ref().copied().or_else(|| {
+                ID3D12Resource::from_raw_borrowed(&res).and_then(|r| super::vram::default_srv_desc(&r.GetDesc()))
+            });
+            if let Some(mut clamped) = base.filter(|v| {
+                v.ViewDimension != D3D12_SRV_DIMENSION_BUFFER
+                    && v.ViewDimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+            }) {
+                super::vram::clamp_srv_min_lod(&mut clamped, min_mip);
+                clamped_copy = Some(clamped);
+            }
+        }
+    }
+    let pc_desc = clamped_copy.as_ref().map_or(desc, |v| v as *const _);
     if buf_delta_null {
         let null_buf = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
@@ -2790,11 +2825,11 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         };
         f(this, std::ptr::null_mut(), &null_buf, slot.pc_srv);
     } else {
-        f(this, res, desc, slot.pc_srv);
+        f(this, res, pc_desc, slot.pc_srv);
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
-    if !res.is_null() && super::memory_report::enabled() {
+    if !res.is_null() && (super::memory_report::enabled() || super::vram::srv_tracking_enabled()) {
         super::vram::note_srv(res as usize, desc.as_ref());
     }
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {

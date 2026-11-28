@@ -592,10 +592,13 @@ pub(super) struct ViewSlotLease {
     _shared_heap: Option<ID3D12DescriptorHeap>,
 }
 
+impl ViewSlotLease {
+    pub(super) fn device(&self) -> &ID3D12Device { &self._device }
+}
+
 /// Lease the native objects behind one exact heap generation and slot. All arithmetic and both
 /// CPU handles are checked while `HEAPS` (and, for a shared slot, `GLOBAL`) still identify that
 /// generation. Driver calls happen only after allocator locks have been dropped.
-#[allow(dead_code)]
 pub(super) fn lease_view_slot(generation: u64, k: u32, pc_srv: u64, shared_srv: u64, index: u32) -> Option<ViewSlotLease> {
     let _lifetime = lock_lifetime()?;
     let (source_raw, shared_index) = {

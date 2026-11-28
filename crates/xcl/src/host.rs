@@ -180,8 +180,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if ts.sampled_textures > 0 {
                     let pct = if ts.total_texels > 0 { ts.resident_texels.saturating_mul(100) / ts.total_texels } else { 0 };
                     let mtex = |n: u64| n as f64 / 1_000_000.0;
+                    let evict = if ts.evicted_tiles > 0 {
+                        format!("; evicted {} mips ({} MB)", ts.evicted_mips, (ts.evicted_tiles * 65536) >> 20)
+                    } else {
+                        String::new()
+                    };
                     crate::xlog_info!(
-                        "texture residency: {} sampled ({} with SRV); texels {:.1}M resident / {:.1}M srv-sampled / {:.1}M virtual ({}% resident)",
+                        "texture residency: {} sampled ({} with SRV); texels {:.1}M resident / {:.1}M srv-sampled / {:.1}M virtual ({}% resident){evict}",
                         ts.sampled_textures,
                         ts.srv_textures,
                         mtex(ts.resident_texels),
