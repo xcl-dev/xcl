@@ -10904,7 +10904,157 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::lut3d::wrote(r, false, || format!("ClearRenderTargetView {rtv:#x} to {:?}, {n} rects", color.as_ref()));
         }
     }
+    if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| !v.is_finite())) {
+        if let Some(fixed) = integer_clear_bits(rtv, c) {
+            return f(this, rtv, &fixed, n, rects);
+        }
+    }
     f(this, rtv, color, n, rects)
+}
+
+/// A NaN or infinite channel in a clear of an integer target (`XCL_CLEAR_NAN_BITS=0`: off): the PC
+/// converts each float to the integer it stands for, a NaN to 0 and an infinity to the format's
+/// limit. A title passing one there means its bits (an all-ones R32_UINT marker comes out as NaN,
+/// a float +inf kept in an R32_UINT as 0x7f800000), so that channel gets a float the PC converts
+/// back to them. Other channels stay as given.
+unsafe fn integer_clear_bits(rtv: usize, c: &[f32; 4]) -> Option<[f32; 4]> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_CLEAR_NAN_BITS").map_or(true, |v| v.trim() != "0")) {
+        return None;
+    }
+    let r = super::present::rtv_resource(rtv)?;
+    let format = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void))?.GetDesc().Format;
+    let signed = match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R10G10B10A2_UINT => false,
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R32G32B32_SINT | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R8_SINT => true,
+        _ => return None,
+    };
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_info!("D3D12.X: ClearRenderTargetView of an integer target (format {}) with NaN or infinite channels {:08x?}: cleared to their bits", format.0, c.map(f32::to_bits));
+    }
+    Some(clear_bits_as_integers(c, signed))
+}
+
+/// `integer_clear_bits`' colour: each NaN or infinite channel as the float whose conversion to the
+/// (unsigned or signed) integer target gives back its bits. Values that round up to 2^32 (unsigned)
+/// or 2^31 (signed) — notably the all-ones NaN `0xffff_ffff` on a UINT target — pass `+inf` so the
+/// driver saturates to the format's maximum instead of overflowing the float-to-int conversion to 0.
+fn clear_bits_as_integers(c: &[f32; 4], signed: bool) -> [f32; 4] {
+    c.map(|v| match (v.is_finite(), signed) {
+        (true, _) => v,
+        (false, false) => {
+            let f = v.to_bits() as f32;
+            if f >= 4_294_967_296.0 { f32::INFINITY } else { f }
+        }
+        (false, true) => {
+            let f = v.to_bits() as i32 as f32;
+            if f >= 2_147_483_648.0 { f32::INFINITY } else { f }
+        }
+    })
+}
+
+#[cfg(test)]
+mod integer_clear_tests {
+    use super::clear_bits_as_integers;
+
+    #[test]
+    fn non_finite_channels_of_an_integer_clear_keep_their_bits() {
+        let c = [f32::INFINITY, f32::NEG_INFINITY, f32::from_bits(u32::MAX), 5.0];
+        // what the PC writes for each channel of an R32_UINT / R32_SINT target
+        let uint = clear_bits_as_integers(&c, false).map(|v| v as u32);
+        assert_eq!(uint, [0x7f80_0000, 0xff80_0000, u32::MAX, 5]);
+        let sint = clear_bits_as_integers(&c, true).map(|v| v as i32);
+        assert_eq!(sint, [0x7f80_0000, 0xff80_0000u32 as i32, -1, 5]);
+        // i32::MAX NaN saturates via +inf rather than overflowing to 2^31
+        let max_sint = clear_bits_as_integers(&[f32::from_bits(i32::MAX as u32), 0.0, 0.0, 0.0], true);
+        assert_eq!(max_sint[0], f32::INFINITY);
+    }
+
+    /// The first texel of an integer 4x32-bit target cleared with `colour` on the tests' device.
+    unsafe fn cleared_texel(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, colour: [f32; 4]) -> Result<[u32; 4], String> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let e = |x: windows::core::Error| x.to_string();
+        let dev = crate::gpu::recomp::runner::device()?;
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut rt: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut rt).map_err(e)?;
+        let rt = rt.ok_or("render target")?;
+        let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&rt, None, rtv);
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+        let buf = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buf, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).map_err(e)?;
+        let rb = rb.ok_or("readback")?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        list.ClearRenderTargetView(rtv, &colour, None);
+        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&rt),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                }),
+            },
+        }]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().map_err(e)?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        queue.Signal(&fence, 1).map_err(e)?;
+        crate::gpu::fence::wait(&fence, 1, &dev, None, 10_000).map_err(|x| format!("{x}"))?;
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).map_err(e)?;
+        let t = std::ptr::read(p as *const [u32; 4]);
+        rb.Unmap(0, None);
+        Ok(t)
+    }
+
+    /// On the tests' device: the colour `integer_clear_bits` gives an integer target leaves its
+    /// non-finite channels' bits in it, where the title's own colour does not.
+    #[test]
+    fn integer_target_cleared_with_infinities_holds_their_bits_on_the_gpu() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_R32G32B32A32_UINT};
+        let c = [f32::INFINITY, f32::NEG_INFINITY, f32::from_bits(u32::MAX), 5.0];
+        let raw = match unsafe { cleared_texel(DXGI_FORMAT_R32G32B32A32_UINT, c) } {
+            Ok(t) => t,
+            Err(why) => return crate::gpu::recomp::runner::skip_test(&format!("no GPU: {why}")),
+        };
+        eprintln!("an R32G32B32A32_UINT target cleared with [+inf, -inf, NaN(ffffffff), 5.0]: {raw:08x?}");
+        assert_ne!(raw[0], 0x7f80_0000, "this device already keeps +inf's bits");
+        assert_ne!(raw[2], u32::MAX, "this device already keeps NaN's bits");
+        let fixed_u = unsafe { cleared_texel(DXGI_FORMAT_R32G32B32A32_UINT, clear_bits_as_integers(&c, false)) }.unwrap();
+        assert_eq!(fixed_u, [0x7f80_0000, 0xff80_0000, u32::MAX, 5]);
+        let fixed_s = unsafe { cleared_texel(DXGI_FORMAT_R32G32B32A32_SINT, clear_bits_as_integers(&c, true)) }.unwrap();
+        assert_eq!(fixed_s, [0x7f80_0000, 0xff80_0000, u32::MAX, 5]);
+    }
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
