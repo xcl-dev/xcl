@@ -844,6 +844,15 @@ pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
 }
 
+/// The PC resource `res` is destroyed: no view slot names it any more in `RES`, or a trace would
+/// call `GetDesc` on the dead pointer. `RES` is filled only by the diagnostics, so without them
+/// (map never made) this costs one lock; with them it is a scan of the map per release.
+pub fn forget_resource(res: usize) {
+    if let Some(m) = RES.lock().unwrap().as_mut() {
+        m.retain(|_, r| *r != res);
+    }
+}
+
 pub fn write(s: &Slot, words: &[u32]) {
     let n = words.len().min(if s.sampler { 4 } else { 8 });
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };
@@ -1805,5 +1814,27 @@ mod tests {
             *GLOBAL.lock().unwrap() = None;
         }
         assert_eq!((device.refs.load(Ordering::Relaxed), global_heap.refs.load(Ordering::Relaxed), source_heap.refs.load(Ordering::Relaxed)), (0, 0, 1));
+    }
+
+    /// A released resource is gone from the view-slot map: a descriptor table slot that named
+    /// it must not hand its dead pointer to a trace's `GetDesc`.
+    #[test]
+    fn a_released_resource_is_forgotten_by_the_resource_map() {
+        let (at_a, at_b, at_c) = (0x7ff1_5a1e_0000usize, 0x7ff1_5a1e_0040usize, 0x7ff1_5a1e_0080usize);
+        let (dead, live) = (0x7ff1_5a1e_d000usize, 0x7ff1_5a1e_a000usize);
+        {
+            let mut g = RES.lock().unwrap();
+            let m = g.get_or_insert_with(Default::default);
+            m.insert(at_a, dead);
+            m.insert(at_b, dead);
+            m.insert(at_c, live);
+        }
+        assert_eq!(resource_at(at_a), Some(dead));
+        forget_resource(dead);
+        assert_eq!(resource_at(at_a), None);
+        assert_eq!(resource_at(at_b), None);
+        assert_eq!(resource_at(at_c), Some(live));
+        forget_resource(live);
+        assert_eq!(resource_at(at_c), None);
     }
 }
