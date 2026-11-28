@@ -100,6 +100,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
     // mode queries only adapter-local usage; it does not enable the activity hot-path probes.
     let activity = crate::hle::d3d12x::memory_report::enabled();
     let pressure = crate::hle::d3d12x::pso_async::pressure_sampling_enabled();
+    if activity {
+        crate::hle::d3d12x::list_x::enable_sync_activity();
+    }
     if activity || pressure {
         let name = if activity { "xcl-activity" } else { "xcl-pso-pressure" };
         let sampler = std::thread::Builder::new().name(name.into()).spawn(move || {
@@ -118,6 +121,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut views = crate::hle::d3d12x::view_want::totals();
             let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
             let mut last_tick = std::time::Instant::now();
+            let mut last_sync = crate::hle::d3d12x::list_x::sync_activity();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let window_ms = last_tick.elapsed().as_millis() as u64;
@@ -171,6 +175,18 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     crate::xlog_info!("tile mappings (2 s): {line}");
                 }
                 tile_calls = mappings;
+                // the per-draw sync of buffer mirrors (only once a mirror exists)
+                let sync = crate::hle::d3d12x::list_x::sync_activity();
+                let s: Vec<u64> = sync.iter().zip(last_sync).map(|(a, b)| a - b).collect();
+                let slowest = crate::hle::d3d12x::list_x::take_sync_slowest();
+                if crate::hle::d3d12x::list_x::sync_row_due(&s, slowest) {
+                    let ms = |ns: u64| ns as f64 / 1e6;
+                    crate::xlog_info!(
+                        "buffer mirrors (2 s): {} draws synced, {} with a mirror; {} copies ({} whole buffers), {} KB; {} indices scanned; {} readable() calls ({} over 16 pages), {:.2} ms, slowest {:.2} ms; {:.2} ms in all",
+                        s[0], s[1], s[2], s[3], s[4] >> 10, s[5], s[6], s[7], ms(s[8]), ms(slowest), ms(s[9])
+                    );
+                }
+                last_sync = sync;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let owner = owner.unwrap();
                 let private = owner.commit.unwrap_or(0);

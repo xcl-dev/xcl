@@ -5827,12 +5827,90 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     Some(p + (va - start) as usize)
 }
 
+/// `XCL_ACTIVITY`: what `sync_title_buffers` did so far (the `SYNC_*` indices)
+static SYNC_COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const SYNC_DRAWS: usize = 0;
+const SYNC_MIRRORED: usize = 1;
+const SYNC_COPIES: usize = 2;
+const SYNC_WHOLE: usize = 3;
+const SYNC_BYTES: usize = 4;
+const SYNC_INDICES: usize = 5;
+const SYNC_READABLE: usize = 6;
+const SYNC_READABLE_LARGE: usize = 7;
+const SYNC_READABLE_NS: usize = 8;
+/// ns of the whole function so far, and of its slowest `readable()` since `take_sync_slowest`
+static SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static SYNC_READABLE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+/// whether the mirror sync counts and times at all: only with `XCL_ACTIVITY` (`enable_sync_activity`)
+static SYNC_ON: AtomicBool = AtomicBool::new(false);
+
+/// `XCL_ACTIVITY`: from now on the mirror sync counts and times what it does
+pub fn enable_sync_activity() {
+    SYNC_ON.store(true, Ordering::Relaxed);
+}
+
+/// `XCL_ACTIVITY`: draws through the mirror sync, of those with a mirror, copies, whole-buffer
+/// copies, bytes copied, indices scanned, `readable()` calls, of those over 16 pages (the
+/// `VirtualQuery` walk), ns in `readable()`, ns in the sync – all so far
+pub fn sync_activity() -> [u64; 10] {
+    let mut out = [0; 10];
+    for (o, c) in out.iter_mut().zip(&SYNC_COUNTS) {
+        *o = c.load(Ordering::Relaxed);
+    }
+    out[9] = SYNC_NS.load(Ordering::Relaxed);
+    out
+}
+
+/// ns of the slowest `readable()` of the mirror sync since the last call
+pub fn take_sync_slowest() -> u64 {
+    SYNC_READABLE_MAX_NS.swap(0, Ordering::Relaxed)
+}
+
+/// Whether `XCL_ACTIVITY` logs a row for these `sync_activity` deltas and slowest `readable()`:
+/// when anything moved, also with no draw synced (a sync still running at the sample, or stalled)
+pub fn sync_row_due(delta: &[u64], slowest: u64) -> bool {
+    slowest > 0 || delta.iter().any(|&v| v > 0)
+}
+
+fn sync_count(k: usize, n: u64) {
+    if SYNC_ON.load(Ordering::Relaxed) {
+        SYNC_COUNTS[k].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// `readable()`, counted and timed for `XCL_ACTIVITY`
+fn sync_readable(p: usize, len: usize) -> bool {
+    if !SYNC_ON.load(Ordering::Relaxed) {
+        return crate::gpu::shader::readable(p, len);
+    }
+    let t = Instant::now();
+    let r = crate::gpu::shader::readable(p, len);
+    let ns = t.elapsed().as_nanos() as u64;
+    sync_count(SYNC_READABLE, 1);
+    if len > 0 && ((p + len - 1) >> 12) - (p >> 12) + 1 > 16 {
+        sync_count(SYNC_READABLE_LARGE, 1);
+    }
+    sync_count(SYNC_READABLE_NS, ns);
+    SYNC_READABLE_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    r
+}
+
 /// Before a draw on `list`: the parts of mirrored buffers it reads are copied from the title's
 /// memory. `indexed`: (first index, index count, base vertex); else `first_vertex`, `vertices`.
 pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
     if MIRROR_BYTES.load(Ordering::Relaxed) == 0 {
         return;
     }
+    if !SYNC_ON.load(Ordering::Relaxed) {
+        return sync_mirrors(list, indexed, first_vertex, vertices, instances);
+    }
+    let t = Instant::now();
+    sync_mirrors(list, indexed, first_vertex, vertices, instances);
+    sync_count(SYNC_DRAWS, 1);
+    SYNC_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+unsafe fn sync_mirrors(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
     let (vbs, ib) = {
         let g = LISTS.lock().unwrap();
         let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
@@ -5846,11 +5924,17 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         }
         v
     };
+    sync_count(SYNC_MIRRORED, 1);
+    // (no `readable` first – for a range not resident or over 16 pages it walks the region with
+    // `VirtualQuery`, a 1–9 ms stall of the render thread (#2392): the copy cannot fault, and a
+    // page the title freed or protected since keeps what the mirror had)
     let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
-            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        if len > 0 {
+            super::title_textures::copy_committed_pages((va + from) as usize, (mirror + from as usize) as *mut u8, len);
+            sync_count(SYNC_COPIES, 1);
+            sync_count(SYNC_BYTES, len as u64);
         }
     };
     // the vertices read: [lo, hi)
@@ -5858,14 +5942,21 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         (Some((first, count, base)), Some((va, bytes, format))) => {
             let size: u64 = if format == DXGI_FORMAT_R32_UINT.0 { 4 } else { 2 };
             let (from, len) = (first as u64 * size, count as u64 * size);
-            if let Some(m) = mirrors[vbs.len()] {
-                copy(va, m, bytes, from, len);
-            }
             let n = (len.min((bytes as u64).saturating_sub(from)) / size) as usize;
-            if n == 0 || !crate::gpu::shader::readable((va + from) as usize, n * size as usize) {
+            // the indices are read from the mirror once copied there, which is readable whatever
+            // the title did to its memory; an index buffer without a mirror is checked
+            let at = match mirrors[vbs.len()] {
+                Some(m) => {
+                    copy(va, m, bytes, from, len);
+                    Some(m + from as usize)
+                }
+                None => (n > 0 && sync_readable((va + from) as usize, n * size as usize)).then_some((va + from) as usize),
+            };
+            if n == 0 || at.is_none() {
                 (0, u64::MAX)
             } else {
-                let at = (va + from) as *const u8;
+                sync_count(SYNC_INDICES, n as u64);
+                let at = at.unwrap() as *const u8;
                 let (mut lo, mut hi) = (u32::MAX, 0u32);
                 for k in 0..n {
                     let i = if size == 4 { at.add(4 * k).cast::<u32>().read_unaligned() } else { at.add(2 * k).cast::<u16>().read_unaligned() as u32 };
@@ -5888,6 +5979,7 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         // a buffer stepped by instance is not told apart: with instances (callers pass more
         // than 1 for a first instance other than 0 too), all of it
         if instances > 1 || hi == u64::MAX || stride == 0 || hi.saturating_mul(stride as u64) > bytes as u64 {
+            sync_count(SYNC_WHOLE, 1);
             copy(va, m, bytes, 0, bytes as u64);
         } else {
             copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
@@ -11561,6 +11653,110 @@ mod tests {
         assert_eq!(u.view_release(g), Some(SIZE));
     }
 
+    /// The per-draw sync copies a mirrored vertex buffer without asking `readable` (#2392): with
+    /// one page of it made unreadable after the mirror was made, the draw's other pages are
+    /// still brought up to date and the unreadable one keeps what the mirror had, and the
+    /// vertex range comes from the indices as the title wrote them (read from their mirror).
+    /// Before, `readable` failed for the whole range and nothing was copied.
+    #[test]
+    fn the_mirror_sync_copies_around_a_page_the_title_made_unreadable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let len = 0x1_0000usize;
+            let vb = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            let ib = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u16;
+            assert!(!vb.is_null() && !ib.is_null());
+            let (vb_bytes, stride) = (0x3000u32, 16u32);
+            std::ptr::write_bytes(vb, 0x11, vb_bytes as usize);
+            for (k, i) in [0u16, 1, 2].into_iter().enumerate() {
+                *ib.add(k) = i;
+            }
+            let list = 0x7e57_0000_2392usize as *mut c_void;
+            assert_ne!(gpu_va(list, vb as u64, vb_bytes as usize, "test vertex buffer", true), vb as u64);
+            assert_ne!(gpu_va(list, ib as u64, 6, "test index buffer", true), ib as u64);
+            let vm = mirrored(vb as u64, vb_bytes as usize).unwrap() as *const u8;
+            with_bindings(list, |b| {
+                b.vertex_titles.insert(0, (vb as u64, vb_bytes, stride));
+                b.index_title = Some((ib as u64, 6, DXGI_FORMAT_R16_UINT.0));
+            });
+            // the title writes new vertices on all three pages and indices that reach them, then
+            // makes the middle page unreadable
+            std::ptr::write_bytes(vb, 0x22, vb_bytes as usize);
+            for (k, i) in [0u16, 0x1000 / 16, (vb_bytes / stride - 1) as u16].into_iter().enumerate() {
+                *ib.add(k) = i;
+            }
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(vb.add(0x1000) as *const _, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            sync_title_buffers(list, Some((0, 3, 0)), 0, 0, 1);
+            assert!((0..0x1000).all(|k| *vm.add(k) == 0x22), "the first page is copied");
+            assert!((0x1000..0x2000).all(|k| *vm.add(k) == 0x11), "the unreadable page keeps the mirror's bytes");
+            assert!((0x2000..0x3000).all(|k| *vm.add(k) == 0x22), "the last page, reached by the last index, is copied");
+            LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+            // (the ranges stay allocated: the mirror table is never emptied)
+        }
+    }
+
+    /// The other paths of the per-draw sync, with a page of the mirrored vertex buffer made
+    /// unreadable: an index buffer without a mirror gives the vertex range when it is readable,
+    /// and when it is not, or the draw has instances, the whole buffer is copied around that page.
+    #[test]
+    fn the_mirror_sync_copies_whole_buffers_around_a_page_the_title_made_unreadable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let len = 0x1_0000usize;
+            let vb = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            let ib = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u16;
+            assert!(!vb.is_null() && !ib.is_null());
+            let (vb_bytes, stride) = (0x3000u32, 16u32);
+            std::ptr::write_bytes(vb, 0x11, vb_bytes as usize);
+            for (k, i) in [0u16, 1, 2].into_iter().enumerate() {
+                *ib.add(k) = i;
+            }
+            let list = 0x7e57_0000_2437usize as *mut c_void;
+            assert_ne!(gpu_va(list, vb as u64, vb_bytes as usize, "test vertex buffer", true), vb as u64);
+            assert!(mirrored(ib as u64, 6).is_none(), "the index buffer has no mirror");
+            let vm = mirrored(vb as u64, vb_bytes as usize).unwrap() as *const u8;
+            with_bindings(list, |b| {
+                b.vertex_titles.insert(0, (vb as u64, vb_bytes, stride));
+                b.index_title = Some((ib as u64, 6, DXGI_FORMAT_R16_UINT.0));
+            });
+            let mut old = 0u32;
+            let title_writes = |v: u8| {
+                std::ptr::write_bytes(vb, v, 0x1000);
+                std::ptr::write_bytes(vb.add(0x2000), v, 0x1000);
+            };
+            std::ptr::write_bytes(vb, 0x22, vb_bytes as usize);
+            assert_ne!(VirtualProtect(vb.add(0x1000) as *const _, 0x1000, PAGE_NOACCESS, &mut old), 0);
+
+            // indices 0..=2 read from the title's index buffer: only those three vertices
+            sync_title_buffers(list, Some((0, 3, 0)), 0, 0, 1);
+            assert!((0..48).all(|k| *vm.add(k) == 0x22), "the vertices the indices reach are copied");
+            assert!((48..0x1000).chain(0x2000..0x3000).all(|k| *vm.add(k) == 0x11), "the rest is not");
+
+            // with instances: the whole buffer, around the unreadable page
+            title_writes(0x33);
+            sync_title_buffers(list, Some((0, 3, 0)), 0, 0, 2);
+            assert!((0..0x1000).chain(0x2000..0x3000).all(|k| *vm.add(k) == 0x33), "the whole buffer is copied");
+            assert!((0x1000..0x2000).all(|k| *vm.add(k) == 0x11), "the unreadable page keeps the mirror's bytes");
+
+            // an unreadable index buffer without a mirror: the whole buffer
+            title_writes(0x44);
+            assert_ne!(VirtualProtect(ib as *const _, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            sync_title_buffers(list, Some((0, 3, 0)), 0, 0, 1);
+            assert!((0..0x1000).chain(0x2000..0x3000).all(|k| *vm.add(k) == 0x44), "the whole buffer is copied");
+            assert!((0x1000..0x2000).all(|k| *vm.add(k) == 0x11), "the unreadable page keeps the mirror's bytes");
+            LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+        }
+    }
+
     #[test]
     fn occlusion_tracks_dropped_draws_and_active_counter() {
         let mut occ = Occlusion::default();
@@ -11728,5 +11924,41 @@ mod tests {
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
+    }
+
+    /// Without `XCL_ACTIVITY` the mirror sync counts and times nothing; once it is enabled it does.
+    #[test]
+    fn the_mirror_sync_counts_only_once_xcl_activity_enables_it() {
+        let buf = vec![0u8; 17 << 12]; // over 16 pages
+        let (p, len) = (buf.as_ptr() as usize, buf.len());
+        assert!(!SYNC_ON.load(Ordering::Relaxed), "only this test enables the counters");
+        let before = sync_activity();
+        assert!(sync_readable(p, len));
+        sync_count(SYNC_COPIES, 1);
+        assert_eq!(sync_activity(), before);
+        assert_eq!(take_sync_slowest(), 0);
+
+        enable_sync_activity();
+        assert!(sync_readable(p, len));
+        sync_count(SYNC_COPIES, 1);
+        let after = sync_activity();
+        // (other tests' draws may count too once it is on: at least ours)
+        assert!(after[SYNC_READABLE] > before[SYNC_READABLE]);
+        assert!(after[SYNC_READABLE_LARGE] > before[SYNC_READABLE_LARGE]);
+        assert!(after[SYNC_COPIES] > before[SYNC_COPIES]);
+    }
+
+    /// A 2 s row with `readable()` work but no draw synced yet is logged, not dropped with its slowest call.
+    #[test]
+    fn a_mirror_sync_row_with_no_finished_draw_is_still_logged() {
+        let mut d = [0u64; 10];
+        assert!(!sync_row_due(&d, 0));
+        d[SYNC_READABLE] = 1;
+        d[SYNC_READABLE_NS] = 5_000_000;
+        assert!(sync_row_due(&d, 5_000_000));
+        assert!(sync_row_due(&[0; 10], 5_000_000));
+        d = [0; 10];
+        d[SYNC_DRAWS] = 1;
+        assert!(sync_row_due(&d, 0));
     }
 }
