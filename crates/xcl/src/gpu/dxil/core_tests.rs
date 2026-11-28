@@ -32,6 +32,79 @@ fn straight_line_and_loop_kernels_validate() {
     }
 }
 
+#[test]
+fn latch_blocks_preserve_loop_registers_on_the_gpu() {
+    use crate::gpu::recomp::{dxc, runner, Options};
+    match runner::wave32_supported() {
+        Ok(true) => {}
+        Ok(false) => return runner::skip_test("no wave32"),
+        Err(e) => return runner::skip_test(&e),
+    }
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let two_returns = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 2)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 130)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xfffb)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)], None),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xfff9)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 257), ("SRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 3)], None),
+    ]);
+    // The inner loop's conditional returns to its own head or falls into the outer head.
+    let nested = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 4)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None),
+        ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 131)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xfffc)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 2)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 3)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xfff7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 257), ("SRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 3)], None),
+    ]);
+    for (name, code) in [("two returns", two_returns), ("nested", nested)] {
+        let cfg = super::cfg::Cfg::build(&code).expect("CFG");
+        let latches = cfg.blocks.iter().filter(|b| b.insts.is_empty() && matches!(b.term, super::cfg::Term::Jump(_))).count();
+        assert_eq!(latches, if name == "nested" { 2 } else { 1 }, "{name}");
+        for (wave64, split) in [(false, false), (true, true)] {
+            let direct = translate(&code, KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 }).expect("direct DXIL");
+            super::validate::validate(&direct).expect("valid direct DXIL");
+            let opt = Options { wave64, split_wave64: split, ..Default::default() };
+            let hlsl = crate::gpu::recomp::translate(&code, &opt).expect("HLSL").hlsl;
+            let reference = dxc::compile(&hlsl, "main", "cs_6_6", &[]).expect("DXC");
+            for count in [0u32, 1, 2, 5] {
+                let mut state = runner::KernelState::default();
+                state.sgpr[2] = count;
+                for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+                    regs[0] = lane as u32 + 1;
+                    regs[1] = 100 + lane as u32 * 7;
+                }
+                let got = runner::run(&direct, &state, &[]).expect("direct GPU");
+                let want = runner::run(&reference, &state, &[]).expect("HLSL GPU");
+                let additions = if name == "nested" { 3 * count } else { count - u32::from(count >= 2) };
+                for lane in 0..if wave64 { 64 } else { 32 } {
+                    let expected = state.vgpr[lane][1] + additions * state.vgpr[lane][0];
+                    assert_eq!(got.vgpr[lane][1], expected, "{name}, wave64={wave64}, count={count}, lane={lane}");
+                    assert_eq!(got.vgpr[lane][2], count);
+                    assert_eq!(got.vgpr[lane][3], state.vgpr[1][1] + additions * state.vgpr[1][0]);
+                    assert_eq!(&got.vgpr[lane][1..4], &want.vgpr[lane][1..4], "HLSL: {name}, count={count}, lane={lane}");
+                }
+            }
+        }
+    }
+}
+
 /// Development aid: `XCL_DUMP_HLSL=<file>` compiles a compute shader with DXC
 /// and prints the disassembly (DXC's lowering of an HLSL intrinsic is the
 /// reference for the direct path's).

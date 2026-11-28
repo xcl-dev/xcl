@@ -1053,7 +1053,8 @@ impl Module {
         let mut phi_repl: Vec<Option<Value>> = Vec::new();
         loop {
             let mut changed = false;
-            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let (layout, pos) = self.block_layout();
+            let order: Vec<u32> = layout.into_iter().map(|b| b as u32).collect();
 
             // Step 0: simplify degenerate terminators (`CondBr(_, t, t)`, `Switch` cases -> default).
             for &b_u32 in &order {
@@ -1105,7 +1106,7 @@ impl Module {
                 }
                 let Op::Br(t_blk) = self.insts[self.blocks[b][0] as usize].op else { continue };
                 let t = t_blk.0 as usize;
-                if t == b || self.blocks[t].is_empty() {
+                if t == b || self.blocks[t].is_empty() || pos[t] <= pos[b] {
                     continue;
                 }
                 let b_blk = Block(b_u32);
@@ -1804,6 +1805,53 @@ mod tests {
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
+    #[test]
+    fn simplify_cfg_keeps_an_empty_block_on_a_back_edge() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let outer = m.new_block();
+        let inner = m.new_block();
+        let body = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let lane = m.call(src, &[]);
+        let z = m.i32c(0);
+        let one = m.i32c(1);
+        m.br(outer);
+
+        m.set_block(outer);
+        m.call(sink, &[z]);
+        m.br(inner);
+
+        m.set_block(inner);
+        let go = m.cmp(Pred::Eq, lane, z);
+        m.cond_br(go, body, exit);
+
+        m.set_block(body);
+        m.call(sink, &[lane]);
+        let again = m.cmp(Pred::Eq, lane, one);
+        m.cond_br(again, inner, latch);
+
+        m.set_block(latch);
+        m.br(outer);
+
+        m.set_block(exit);
+        m.ret();
+
+        m.optimize();
+        assert!(m.successors(body.0 as usize).contains(&latch));
+    }
+
     #[test]
     fn guarded_selects_fold_only_for_same_condition_lane_local_uses() {
         let mut m = Module::new();
