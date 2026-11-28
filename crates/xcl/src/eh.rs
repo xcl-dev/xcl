@@ -854,9 +854,137 @@ unsafe fn name_thread(tid: u32, name: &[u16]) {
     }
 }
 
+/// A thread's stack from its RSP up, copied while the thread is stopped. The thread runs on
+/// while it is unwound (#106), so the unwinding reads this copy and never the live stack: a
+/// frame read from a stack that changed meanwhile sent RtlVirtualUnwind to a wild RSP, and
+/// `XCL_THREAD_DUMP_AT` took a title down with a read at 0x107 in the unwinder.
+struct StackCopy {
+    /// the stack address of `buf[0]` (the thread's RSP)
+    at: u64,
+    buf: Vec<u8>,
+}
+
+impl StackCopy {
+    /// the most of a stack copied: frames past it end the walk
+    const MAX: usize = 256 << 10;
+
+    /// Allocated before any thread is stopped: a stopped thread may hold the heap's lock. The
+    /// 64 KiB past the most that is copied are never filled: a read just past the copy is still
+    /// a read of this allocation.
+    fn new() -> StackCopy {
+        StackCopy { at: 0, buf: Vec::with_capacity(Self::MAX + (64 << 10)) }
+    }
+
+    /// The stack of the thread with TEB `teb`, from `rsp` up to its top, while that thread is
+    /// stopped: plain reads only (no lock, no allocation). Nothing when `rsp` is outside the
+    /// stack the TEB names (a stack the thread switched to on its own).
+    unsafe fn take(&mut self, teb: *const u8, rsp: u64) {
+        self.buf.clear();
+        self.at = rsp;
+        if teb.is_null() {
+            return;
+        }
+        // NT_TIB: StackBase (the top) at 8, StackLimit (the lowest committed byte) at 16
+        let (top, limit) = ((teb.add(8) as *const u64).read(), (teb.add(16) as *const u64).read());
+        if limit <= rsp && rsp < top {
+            let n = ((top - rsp) as usize).min(Self::MAX);
+            std::ptr::copy_nonoverlapping(rsp as *const u8, self.buf.as_mut_ptr(), n);
+            self.buf.set_len(n);
+        }
+    }
+
+    /// whether the copy holds the `n` bytes at `a` (an address in the copy)
+    fn holds(&self, a: u64, n: u64) -> bool {
+        let lo = self.buf.as_ptr() as u64;
+        a >= lo && a.checked_add(n).is_some_and(|end| end <= lo + self.buf.len() as u64)
+    }
+
+    /// an address in the copied part of the thread's stack, moved into the copy; others as they are
+    fn moved(&self, v: u64) -> u64 {
+        if v >= self.at && v - self.at < self.buf.len() as u64 {
+            v - self.at + self.buf.as_ptr() as u64
+        } else {
+            v
+        }
+    }
+}
+
+/// What RtlVirtualUnwind reads off the stack for a frame of `f` (an image at `base`) whose RIP is
+/// `rip`: whether it starts from the frame register (its number and offset) or from RSP, and how
+/// many bytes up from there the unwind codes reach (pushes, allocations, saved registers, the
+/// return address). None for unwind data it does not know.
+unsafe fn frame_reach(base: u64, f: &windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY, rip: u64) -> Option<(Option<(usize, u64)>, u64)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
+    // an entry with the low bit set names another entry that holds the data
+    let info_of = |e: &IMAGE_RUNTIME_FUNCTION_ENTRY| {
+        let rva = e.Anonymous.UnwindData;
+        let rva = if rva & 1 != 0 { (*((base + (rva & !1) as u64) as *const IMAGE_RUNTIME_FUNCTION_ENTRY)).Anonymous.UnwindData } else { rva };
+        (base + rva as u64) as *const u8
+    };
+    let at = rip.wrapping_sub(base + f.BeginAddress as u64);
+    let (mut p, mut fp, mut reach, mut saved) = (info_of(f), None, 8u64, 0u64);
+    for depth in 0..32 {
+        let (version, flags, count) = (*p & 7, *p >> 3, *p.add(2) as usize);
+        let codes = p.add(4) as *const u16;
+        let slot = |k: usize| codes.add(k).read_unaligned() as u64;
+        // a chained (earlier) part's saves are relative to its RSP: above what the later part's
+        // codes pushed and allocated
+        let shift = reach - 8;
+        let mut i = 0;
+        while i < count {
+            let (code_at, op, op_info) = (slot(i) & 0xFF, (slot(i) >> 8) & 15, slot(i) >> 12);
+            // (the slots a code takes, all of them within the codes: unwind data that runs past
+            // its count is not followed)
+            let slots = match op {
+                1 if op_info == 0 => 2,
+                1 | 5 | 9 => 3,
+                4 | 8 => 2,
+                _ => 1,
+            };
+            if i + slots > count {
+                return None;
+            }
+            match op {
+                0 => (reach, i) = (reach + 8, i + 1),                               // PUSH_NONVOL
+                1 if op_info == 0 => (reach, i) = (reach + slot(i + 1) * 8, i + 2), // ALLOC_LARGE
+                1 => (reach, i) = (reach + (slot(i + 1) | slot(i + 2) << 16), i + 3),
+                2 => (reach, i) = (reach + op_info * 8 + 8, i + 1),                 // ALLOC_SMALL
+                3 => {
+                    // SET_FPREG: RSP comes from the frame register once the prologue has set
+                    // it; the codes of an earlier (chained) part of the function all apply. One
+                    // with no frame register named is not followed.
+                    let reg = *p.add(3);
+                    if reg & 15 == 0 {
+                        return None;
+                    }
+                    if depth > 0 || at >= code_at {
+                        fp = Some(((reg & 15) as usize, (reg >> 4) as u64 * 16));
+                    }
+                    i += 1
+                }
+                4 => (saved, i) = (saved.max(shift + slot(i + 1) * 8 + 8), i + 2),          // SAVE_NONVOL
+                5 => (saved, i) = (saved.max(shift + (slot(i + 1) | slot(i + 2) << 16) + 8), i + 3),
+                6 if version == 2 => i += 1,                                                // EPILOG: no stack
+                8 => (saved, i) = (saved.max(shift + slot(i + 1) * 16 + 16), i + 2),        // SAVE_XMM128
+                9 => (saved, i) = (saved.max(shift + (slot(i + 1) | slot(i + 2) << 16) + 16), i + 3),
+                10 => (reach, i) = (reach + 6 * 8, i + 1),                                  // PUSH_MACHFRAME
+                _ => return None,
+            }
+        }
+        if flags & 4 == 0 {
+            return Some((fp, reach.max(saved)));
+        }
+        // UNW_FLAG_CHAININFO: the function's earlier part follows the codes, at an even slot
+        p = info_of(&*(codes.add((count + 1) & !1) as *const IMAGE_RUNTIME_FUNCTION_ENTRY));
+    }
+    None
+}
+
 /// The return addresses of the frames from `ctx` on (its RIP first), unwound with the
-/// functions' unwind data (registered for the title's images too); up to `n`.
-unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, n: usize) -> Vec<usize> {
+/// functions' unwind data (registered for the title's images too) over the copy `stack` of the
+/// thread's stack; up to `n`. A frame whose stack data would lie outside the copy (a register or
+/// a saved value the thread changed meanwhile) ends the list.
+unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, stack: &StackCopy, n: usize) -> Vec<usize> {
     use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER};
     let mut out = Vec::new();
     for _ in 0..n {
@@ -865,19 +993,38 @@ unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTE
             break;
         }
         out.push(rip as usize);
+        let rsp = stack.moved(ctx.Rsp);
+        ctx.Rsp = rsp;
         let mut base = 0u64;
         let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
         if f.is_null() {
             // a leaf function: the return address is at RSP
-            if !crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
+            if !stack.holds(rsp, 8) {
                 break;
             }
-            ctx.Rip = (ctx.Rsp as *const u64).read_unaligned();
+            ctx.Rip = (rsp as *const u64).read_unaligned();
             ctx.Rsp += 8;
         } else {
+            let Some((fp, reach)) = frame_reach(base, &*f, rip) else { break };
+            // the codes before the frame register is read work from RSP, the rest from it
+            if !stack.holds(rsp, reach) {
+                break;
+            }
+            if let Some((reg, off)) = fp {
+                // Rax..R15 lie in this order in CONTEXT, as the register numbers do
+                let r = (&mut ctx.Rax as *mut u64).add(reg);
+                *r = stack.moved(*r);
+                if !stack.holds((*r).wrapping_sub(off), reach) {
+                    break;
+                }
+            }
             let mut data = std::ptr::null_mut();
             let mut frame = 0u64;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, ctx, &mut data, &mut frame, std::ptr::null_mut());
+        }
+        // a caller's frame lies above the frame it called
+        if stack.moved(ctx.Rsp) <= rsp {
+            break;
         }
     }
     out
@@ -897,6 +1044,7 @@ pub fn dump_threads() {
             return;
         }
         let mut lines = Vec::new();
+        let mut stack = StackCopy::new();
         let mut te: THREADENTRY32 = std::mem::zeroed();
         te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         let mut ok = Thread32First(snap, &mut te) != 0;
@@ -909,16 +1057,21 @@ pub fn dump_threads() {
                     struct Aligned(CONTEXT);
                     let mut c: Aligned = std::mem::zeroed();
                     c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
-                    // only the context is taken while the thread is suspended: the unwinding
-                    // (RtlLookupFunctionEntry), the module lookup (loader lock), the name and the
-                    // formatting (heap) take locks the suspended thread may hold (#106)
+                    let teb = crate::tls::thread_teb(h);
+                    // only the context and a copy of the stack are taken while the thread is
+                    // suspended: the unwinding (RtlLookupFunctionEntry), the module lookup (loader
+                    // lock), the name and the formatting (heap) take locks the suspended thread
+                    // may hold (#106)
                     let got = SuspendThread(h) != u32::MAX && {
                         let ok = GetThreadContext(h, &mut c.0) != 0;
+                        if ok {
+                            stack.take(teb, c.0.Rsp);
+                        }
                         ResumeThread(h);
                         ok
                     };
                     if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                        let frames: Vec<String> = unwind(&mut c.0, &stack, 14).into_iter().map(modules::describe_address).collect();
                         lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
@@ -1209,6 +1362,103 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[repr(align(16))]
+    struct AlignedContext(windows_sys::Win32::System::Diagnostics::Debug::CONTEXT);
+
+    /// This thread's context here, and a copy of its stack from there up.
+    #[inline(never)]
+    unsafe fn context_and_stack_here() -> (AlignedContext, StackCopy) {
+        let mut c: AlignedContext = std::mem::zeroed();
+        windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureContext(&mut c.0);
+        let mut stack = StackCopy::new();
+        stack.take(crate::tls::current_teb(), c.0.Rsp);
+        (c, stack)
+    }
+
+    /// The walk over a copy of the stack finds the callers Windows' own walk of the live stack does.
+    #[test]
+    #[inline(never)]
+    fn a_walk_over_the_copied_stack_finds_the_callers_windows_finds() {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+        unsafe {
+            let (mut c, stack) = context_and_stack_here();
+            let mut trace = [std::ptr::null_mut(); 8];
+            let n = RtlCaptureStackBackTrace(0, 8, trace.as_mut_ptr(), std::ptr::null_mut()) as usize;
+            let trace: Vec<usize> = trace[..n].iter().map(|&p| p as usize).collect();
+            assert!(!stack.buf.is_empty() && stack.buf.len() <= StackCopy::MAX);
+            let frames = unwind(&mut c.0, &stack, 8);
+            // frames: context_and_stack_here, this test, its callers; trace: this test, its callers
+            assert!(frames.len() >= 5 && trace.len() >= 4, "{frames:x?} {trace:x?}");
+            assert_eq!(frames[2..5], trace[1..4], "{frames:x?} {trace:x?}");
+        }
+    }
+
+    /// The thread dump's crash: the thread ran on between its context and the walk, and the
+    /// unwinder read at 0x107. A frame whose RSP or frame register points there (whichever this
+    /// frame unwinds from) ends the walk instead.
+    #[test]
+    fn a_walk_ends_at_a_frame_outside_the_copied_stack() {
+        unsafe {
+            let (mut c, stack) = context_and_stack_here();
+            let rip = c.0.Rip as usize;
+            for r in [&mut c.0.Rsp, &mut c.0.Rbp, &mut c.0.Rbx, &mut c.0.Rsi, &mut c.0.Rdi, &mut c.0.R12, &mut c.0.R13, &mut c.0.R14, &mut c.0.R15] {
+                *r = 0x107;
+            }
+            assert_eq!(unwind(&mut c.0, &stack, 14), vec![rip]);
+            // nothing copied (an RSP outside the stack the TEB names): the RIP alone
+            let (mut c, mut stack) = context_and_stack_here();
+            stack.take(crate::tls::current_teb(), 0x107);
+            assert!(stack.buf.is_empty());
+            assert_eq!(unwind(&mut c.0, &stack, 14), vec![c.0.Rip as usize]);
+        }
+    }
+
+    /// `frame_reach` adds up a frame's pushes, allocations and return address, follows chained
+    /// unwind data, and starts from the frame register only once the prologue has set it.
+    #[test]
+    fn frame_reach_adds_up_a_frame_and_finds_its_frame_register() {
+        use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
+        // an "image": unwind data at 0x100 and 0x200, a chained part's entry at 0x300
+        let mut image = vec![0u8; 0x400];
+        let code = |at: u8, op: u8, info: u8| [at, op | info << 4];
+        // push rbp (1); push rbx (2); sub rsp, 0x28 (6); lea rbp, [rsp+0x20] (11)
+        let first: Vec<u8> = [vec![1, 11, 4, 5 | 2 << 4], code(11, 3, 0).to_vec(), code(6, 2, 4).to_vec(), code(2, 0, 3).to_vec(), code(1, 0, 5).to_vec()].concat();
+        image[0x100..0x100 + first.len()].copy_from_slice(&first);
+        // a chained part with its own sub rsp, 0x1000 (ALLOC_LARGE, two slots) and no prologue
+        // of its frame register; its parent entry (0x300) names the first data
+        let chained: Vec<u8> = [vec![1 | 4 << 3, 7, 2, 0], code(7, 1, 0).to_vec(), vec![0x00, 0x02], 0x10u32.to_le_bytes().to_vec(), 0x40u32.to_le_bytes().to_vec(), 0x100u32.to_le_bytes().to_vec()].concat();
+        image[0x200..0x200 + chained.len()].copy_from_slice(&chained);
+        let base = image.as_ptr() as u64;
+        let entry = |begin: u32, data: u32| IMAGE_RUNTIME_FUNCTION_ENTRY { BeginAddress: begin, EndAddress: begin + 0x30, Anonymous: windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY_0 { UnwindData: data } };
+        unsafe {
+            let f = entry(0x10, 0x100);
+            // return address 8 + 0x28 + two pushes
+            assert_eq!(frame_reach(base, &f, base + 0x10 + 20), Some((Some((5, 0x20)), 0x40)));
+            assert_eq!(frame_reach(base, &f, base + 0x10 + 6), Some((None, 0x40)));
+            assert_eq!(frame_reach(base, &f, base + 0x10), Some((None, 0x40)));
+            // the chained part: its 0x1000 and the whole first part, whose frame register is set
+            let g = entry(0x50, 0x200);
+            assert_eq!(frame_reach(base, &g, base + 0x50), Some((Some((5, 0x20)), 0x1040)));
+            // a chained part whose earlier part saves rbx at [rsp + 0x80]: that RSP is above the
+            // later part's 0x1000, so the save is at 0x1080 from the frame's RSP
+            let parent: Vec<u8> = [vec![1, 4, 2, 0], code(4, 4, 3).to_vec(), vec![0x10, 0x00]].concat();
+            image[0x340..0x340 + parent.len()].copy_from_slice(&parent);
+            let child: Vec<u8> = [vec![1 | 4 << 3, 7, 2, 0], code(7, 1, 0).to_vec(), vec![0x00, 0x02], 0x60u32.to_le_bytes().to_vec(), 0x70u32.to_le_bytes().to_vec(), 0x340u32.to_le_bytes().to_vec()].concat();
+            image[0x380..0x380 + child.len()].copy_from_slice(&child);
+            let h = entry(0x80, 0x380);
+            let reached = frame_reach(base, &h, base + 0x80);
+            assert_eq!(reached, Some((None, 0x1000 + 0x80 + 8)), "{reached:x?}");
+            // a code whose slots run past the count, and a frame register code with none named
+            image[0x3a0..0x3a6].copy_from_slice(&[&[1u8, 4, 1, 0][..], &code(4, 1, 0)[..]].concat());
+            assert_eq!(frame_reach(base, &entry(0x90, 0x3a0), base + 0x90), None);
+            image[0x3c0..0x3c6].copy_from_slice(&[&[1u8, 4, 1, 0][..], &code(4, 3, 0)[..]].concat());
+            assert_eq!(frame_reach(base, &entry(0xa0, 0x3c0), base + 0xa0 + 8), None);
+            // unwind codes it does not know
+            image[0x105] = 7;
+            assert_eq!(frame_reach(base, &f, base + 0x10 + 20), None);
+        }
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {

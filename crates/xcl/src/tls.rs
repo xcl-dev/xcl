@@ -215,6 +215,15 @@ extern "system" {
     ) -> i32;
 }
 
+/// The TEB of the thread behind handle `h` (THREAD_QUERY_INFORMATION); null if it is not known.
+pub unsafe fn thread_teb(h: *mut core::ffi::c_void) -> *mut u8 {
+    let mut tbi: ThreadBasicInformation = std::mem::zeroed();
+    if NtQueryInformationThread(h, 0, &mut tbi as *mut _ as *mut _, std::mem::size_of::<ThreadBasicInformation>() as u32, std::ptr::null_mut()) < 0 {
+        return std::ptr::null_mut();
+    }
+    tbi.teb
+}
+
 #[inline(always)]
 pub unsafe fn current_teb() -> *mut u8 {
     let t: *mut u8;
