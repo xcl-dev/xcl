@@ -7579,7 +7579,9 @@ void main(uint t : SV_GroupIndex) {
 
             // Stand-in synthetic key backed by real `pso1` in pso_async: CreateCommandList must
             // resolve it via resolve_for_bind for PC D3D12 while tracking `standin` in `bind`.
-            let standin = 0x7300_0001usize;
+            // Own the key so parallel dispatch-metadata fixtures cannot register the same key.
+            let standin_key = Box::new(0u8);
+            let standin = (&*standin_key as *const u8) as usize;
             let pso1_raw = pso1.as_raw() as usize;
             pso_async::submit(standin, true, Box::new(move || pso1_raw));
             assert_eq!(pso_async::resolve_wait(standin), pso1_raw);
