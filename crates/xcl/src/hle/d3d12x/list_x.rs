@@ -20,6 +20,7 @@
 //! (`view_want`); what the lists write there is read back to its CPU view, and the CPU reads its
 //! values there (`cpu_at`): the CPU cannot touch the GPU view.
 
+use super::heap_bindings::HeapBindings;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
@@ -5917,9 +5918,9 @@ unsafe fn ensure_global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
 /// Build the default PC descriptor heap list to bind when a command list is missing a required
 /// shader-visible view heap (`heap_windows`) or sampler heap (`SAMPLER_HEAP_DIRECTLY_INDEXED`).
 /// Returns `Some((heaps, has_sampler_heap))` when `SetDescriptorHeaps` must be updated.
-fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[usize], has_sampler: bool) -> Option<(Vec<usize>, bool)> {
+fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[usize], has_sampler: bool) -> Option<(HeapBindings<usize>, bool)> {
     if current.is_empty() {
-        let mut out = Vec::with_capacity(2);
+        let mut out = HeapBindings::default();
         if let Some(v) = view {
             out.push(v);
         }
@@ -5931,10 +5932,10 @@ fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[u
     if current.len() == 1 {
         if !has_sampler {
             if let Some(s) = sampler {
-                return Some((vec![current[0], s], true));
+                return Some((HeapBindings::from_iter([current[0], s]), true));
             }
         } else if let Some(v) = view {
-            return Some((vec![v, current[0]], true));
+            return Some((HeapBindings::from_iter([v, current[0]]), true));
         }
     }
     None
@@ -5945,11 +5946,11 @@ fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[u
 /// (a console descriptor table may be copied via raw CPU memcpy from any heap); heaps that
 /// kept their own shader-visible PC heap bind themselves for their local indices. Heaps whose
 /// own PC backing was downgraded to CPU-only cannot be bound directly.
-pub(super) unsafe fn pc_heaps_with_shared(n: u32, heaps: *const usize) -> (Vec<Option<ID3D12DescriptorHeap>>, bool) {
+pub(super) unsafe fn pc_heaps_with_shared(n: u32, heaps: *const usize) -> (HeapBindings<Option<ID3D12DescriptorHeap>>, bool) {
     let mut view_heap = super::console_heap::global_heap();
     let shared_view = view_heap.as_ref().map(|heap| heap.as_raw() as usize);
     let mut sampler_heap = ensure_global_sampler_heap();
-    let mut out = Vec::new();
+    let mut out = HeapBindings::default();
     for k in 0..n as usize {
         let p = *heaps.add(k) as *mut c_void;
         if p.is_null() || super::console_heap::in_global(p as usize) || super::console_heap::in_global_sampler(p as usize) {
@@ -5970,8 +5971,8 @@ pub(super) unsafe fn pc_heaps_with_shared(n: u32, heaps: *const usize) -> (Vec<O
         }
     }
     let uses_shared_view = shared_view.is_some_and(|shared| view_heap.as_ref().is_some_and(|heap| heap.as_raw() as usize == shared));
-    out.extend(view_heap.map(Some));
-    out.extend(sampler_heap.map(Some));
+    if let Some(h) = view_heap { out.push(Some(h)); }
+    if let Some(h) = sampler_heap { out.push(Some(h)); }
     (out, uses_shared_view)
 }
 
@@ -5991,11 +5992,12 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) -> bool {
     if view_raw.is_none() && sampler_raw.is_none() {
         return false;
     }
-    let mut to_bind: Option<Vec<usize>> = None;
+    let mut to_bind: Option<HeapBindings<usize>> = None;
     let mut shared_view_bound = false;
     with_bindings(this, |b| {
         if let Some((next, has_sampler)) = default_bound_heaps(view_raw, sampler_raw, &b.heaps, b.has_sampler_heap) {
-            b.heaps = next.clone();
+            b.heaps.clear();
+            b.heaps.extend_from_slice(&next);
             b.has_sampler_heap = has_sampler;
             b.shared_view_heap |= view_raw.is_some_and(|view| next.contains(&view));
             to_bind = Some(next);
@@ -6045,10 +6047,10 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     }
     let (h, shared_view_heap) = pc_heaps_with_shared(n, heaps);
     let has_sampler = h.iter().any(|x| x.as_ref().is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
-    let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
-    let kept = raw.clone();
+    let raw: HeapBindings<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
     with_bindings(this, |b| {
-        b.heaps = kept;
+        b.heaps.clear();
+        b.heaps.extend_from_slice(&raw);
         b.has_sampler_heap = has_sampler;
         b.shared_view_heap = shared_view_heap;
     });
@@ -11591,16 +11593,16 @@ mod tests {
 
     #[test]
     fn default_bound_heaps_always_includes_sampler_heap_when_available() {
-        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[], false), Some((vec![0x10, 0x20], true)));
-        assert_eq!(default_bound_heaps(None, Some(0x20), &[], false), Some((vec![0x20], true)));
-        assert_eq!(default_bound_heaps(Some(0x10), None, &[], false), Some((vec![0x10], false)));
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[], false), Some((HeapBindings::from_iter([0x10, 0x20]), true)));
+        assert_eq!(default_bound_heaps(None, Some(0x20), &[], false), Some((HeapBindings::from_iter([0x20]), true)));
+        assert_eq!(default_bound_heaps(Some(0x10), None, &[], false), Some((HeapBindings::from_iter([0x10]), false)));
         // Shared view heap bound alone -> append shared sampler heap
-        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10], false), Some((vec![0x10, 0x20], true)));
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10], false), Some((HeapBindings::from_iter([0x10, 0x20]), true)));
         // Non-global view heap bound alone, or heap_windows() == false (view == None) -> still append shared sampler heap
-        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x77], false), Some((vec![0x77, 0x20], true)));
-        assert_eq!(default_bound_heaps(None, Some(0x20), &[0x77], false), Some((vec![0x77, 0x20], true)));
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x77], false), Some((HeapBindings::from_iter([0x77, 0x20]), true)));
+        assert_eq!(default_bound_heaps(None, Some(0x20), &[0x77], false), Some((HeapBindings::from_iter([0x77, 0x20]), true)));
         // Sampler heap bound alone when heap_windows() needs the shared view heap -> prepend view heap
-        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x99], true), Some((vec![0x10, 0x99], true)));
+        assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x99], true), Some((HeapBindings::from_iter([0x10, 0x99]), true)));
         assert_eq!(default_bound_heaps(None, Some(0x20), &[0x99], true), None);
         // Both heaps already bound -> no-op
         assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x20], true), None);

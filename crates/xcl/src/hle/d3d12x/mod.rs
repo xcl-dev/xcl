@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+mod heap_bindings;
 pub use alloc_pool::AllocatorSubmitStats;
 mod build_queue;
 pub mod bind;

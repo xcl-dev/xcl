@@ -13,6 +13,7 @@
 
 #![allow(non_snake_case)]
 
+use super::heap_bindings::HeapBindings;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -754,19 +755,19 @@ pub struct Translation {
 /// missing a required shader-visible view heap (`heap_windows`) or sampler heap
 /// (`SAMPLER_HEAP_DIRECTLY_INDEXED`). Returns `Some((heaps, has_sampler_heap))` when
 /// `SetDescriptorHeaps` must be updated.
-fn default_dispatch_heaps<H: Clone>(view: Option<H>, sampler: Option<H>, current: &[H], has_sampler: bool) -> Option<(Vec<H>, bool)> {
+fn default_dispatch_heaps<H: Clone>(view: Option<H>, sampler: Option<H>, current: &[H], has_sampler: bool) -> Option<(HeapBindings<Option<H>>, bool)> {
     if current.is_empty() {
         let has_s = sampler.is_some();
-        let mut out = Vec::with_capacity(2);
-        if let Some(v) = view { out.push(v); }
-        if let Some(s) = sampler { out.push(s); }
+        let mut out = HeapBindings::default();
+        if let Some(v) = view { out.push(Some(v)); }
+        if let Some(s) = sampler { out.push(Some(s)); }
         return (!out.is_empty()).then_some((out, has_s));
     }
     if current.len() == 1 {
         if !has_sampler {
-            if let Some(s) = sampler { return Some((vec![current[0].clone(), s], true)); }
+            if let Some(s) = sampler { return Some((HeapBindings::from_iter([Some(current[0].clone()), Some(s)]), true)); }
         } else if let Some(v) = view {
-            return Some((vec![v, current[0].clone()], true));
+            return Some((HeapBindings::from_iter([Some(v), Some(current[0].clone())]), true));
         }
     }
     None
@@ -781,9 +782,9 @@ unsafe fn heap_on_device(heap: Option<ID3D12DescriptorHeap>, dev_raw: usize) -> 
 
 unsafe fn ensure_dispatch_heaps_with(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool, view: Option<ID3D12DescriptorHeap>, sampler: Option<ID3D12DescriptorHeap>) -> bool {
     let Some((next, next_has_sampler)) = default_dispatch_heaps(view, sampler, bound, *has_sampler) else { return false };
-    let args: Vec<Option<ID3D12DescriptorHeap>> = next.iter().cloned().map(Some).collect();
-    list.SetDescriptorHeaps(&args);
-    *bound = next;
+    list.SetDescriptorHeaps(&next);
+    bound.clear();
+    bound.extend(next.iter().flatten().cloned());
     *has_sampler = next_has_sampler;
     true
 }
@@ -871,7 +872,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 } else {
                     let (heaps, uses_shared_view) = super::list_x::pc_heaps_with_shared(n as u32, named.as_ptr());
                     list.SetDescriptorHeaps(&heaps);
-                    bound_heaps = heaps.into_iter().flatten().collect();
+                    bound_heaps.clear();
+                    bound_heaps.extend(heaps.iter().flatten().cloned());
                     has_sampler_heap = bound_heaps.iter().any(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
                     shared_view_bound = uses_shared_view;
                 }
@@ -1254,14 +1256,14 @@ mod tests {
     #[test]
     fn default_dispatch_heaps_binds_and_upgrades_missing_view_or_sampler() {
         // 0 heaps bound: binds both under heap_windows, or sampler alone when view == None.
-        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[], false), Some((vec![0x10, 0x20], true)));
-        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[], false), Some((vec![0x20], true)));
-        assert_eq!(default_dispatch_heaps(Some(0x10usize), None, &[], false), Some((vec![0x10], false)));
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[], false), Some((HeapBindings::from_iter([Some(0x10), Some(0x20)]), true)));
+        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[], false), Some((HeapBindings::from_iter([Some(0x20)]), true)));
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), None, &[], false), Some((HeapBindings::from_iter([Some(0x10)]), false)));
         assert_eq!(default_dispatch_heaps::<usize>(None, None, &[], false), None);
         // 1 view heap bound -> appends sampler heap; 1 sampler heap bound -> prepends view heap when needed.
-        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x77], false), Some((vec![0x77, 0x20], true)));
-        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[0x77], false), Some((vec![0x77, 0x20], true)));
-        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x99], true), Some((vec![0x10, 0x99], true)));
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x77], false), Some((HeapBindings::from_iter([Some(0x77), Some(0x20)]), true)));
+        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[0x77], false), Some((HeapBindings::from_iter([Some(0x77), Some(0x20)]), true)));
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x99], true), Some((HeapBindings::from_iter([Some(0x10), Some(0x99)]), true)));
         assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[0x99], true), None);
         // Both heaps already bound -> no-op.
         assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x10, 0x20], true), None);
