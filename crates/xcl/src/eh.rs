@@ -17,6 +17,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use crate::hooks;
 use crate::modules;
 
+mod fault_dump;
+
 pub fn register_function_table(base: usize, rva: u32, size: u32) -> bool {
     let count = size / std::mem::size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>() as u32;
     let ok = unsafe {
@@ -67,6 +69,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         let rec = &*(*info).ExceptionRecord;
         let addr = rec.ExceptionAddress as usize;
         let mut extra = String::new();
+        let mut fault = None;
         if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
             let op = match rec.ExceptionInformation[0] {
                 0 => "read",
@@ -75,11 +78,13 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 _ => "?",
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            fault = Some(rec.ExceptionInformation[1] as u64);
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
         }
         let ctx = (*info).ContextRecord;
+        let mut dump_regs = Vec::new();
         let regs = if ctx.is_null() {
             String::new()
         } else {
@@ -100,6 +105,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12),
                 ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
             ];
+            if fault_dump::enabled() {
+                dump_regs.extend_from_slice(&regs);
+            }
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
@@ -109,6 +117,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        fault_dump::log(&dump_regs, fault);
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }

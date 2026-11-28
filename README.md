@@ -360,6 +360,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   On AMD, cold 128–256 KiB compute pipelines use a separate lane (three background / four
   wanted at once on hosts with at least 32 GiB RAM, two / three below that), configurable with
   `XCL_MEDIUM_PSO_CONCURRENCY` and `XCL_MEDIUM_PSO_WANTED_CONCURRENCY`.
+- With `XCL_FAULT_DUMP=1`, a title's unhandled exception also logs the memory around each register,
+  the faulting address and, for a fault below 4 GiB, that address under the upper half of the
+  registers that point at memory: 256 bytes on either side as 32-bit words, at most 300 lines for
+  each of the first 2 faults.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
