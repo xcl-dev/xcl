@@ -4,7 +4,7 @@ use std::process::Command;
 // `pso.rs` also contains cache storage and pipeline setup. Keep it out of the source hash so
 // those changes do not discard translations; bump this only when its container parsing,
 // translation options, profiles, or post-translation HLSL changes.
-const TRANSLATION_GLUE_REVISION: &str = "pso-glue-v4";
+const TRANSLATION_GLUE_REVISION: &str = "pso-glue-v5";
 
 const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/dxbc.rs",

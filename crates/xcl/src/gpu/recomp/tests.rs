@@ -5367,6 +5367,74 @@ fn gpu_compute_mode_dispatch_abi() {
     }
 }
 
+/// A console compute container (`pso::direct_compute`'s input): `code` in groups of `threads`,
+/// with 3 user SGPRs and the thread id in v0..v2.
+fn cs_container(code: &[u8], threads: [u32; 3], wave64: bool) -> Vec<u8> {
+    use crate::gpu::xbox::tests::{fssm, sample};
+    let mut f = fssm(code, &[(6, 0)]);
+    f[0x138..0x13C].copy_from_slice(&(3u32 << 1 | 2 << 11).to_le_bytes());
+    for (k, t) in threads.iter().enumerate() {
+        f[0x13C + 4 * k..0x140 + 4 * k].copy_from_slice(&t.to_le_bytes());
+    }
+    if !wave64 {
+        f[0xD4..0xD8].copy_from_slice(&0x20u32.to_le_bytes());
+    }
+    sample(5, &[f])
+}
+
+/// Each lane stores its lane and its wave's first thread index at s0 + 8 · its thread index
+/// (s1 = x, s2 = x · y).
+fn wave_threads_program(wave64: bool) -> Vec<u8> {
+    program_of(&[
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 3)], None), // thread index
+        ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 193), ("SRC1", 128)], None),
+        if wave64 { ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 193), ("SRC1", V + 5)], None) } else { Vec::new() }, // lane
+        ins("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 3)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 3)], None),
+        ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 131), ("VSRC1", 3)], None),
+        ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ins("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ])
+}
+
+#[test]
+fn direct_compute_translates_2d_and_3d_groups() {
+    for threads in [[8, 8, 1], [4, 4, 4]] {
+        for (wave64, split) in [(false, false), (true, false), (true, true)] {
+            let blob = cs_container(&wave_threads_program(wave64), threads, wave64);
+            super::pso::direct_compute(&blob, 0, 1, split).unwrap_or_else(|e| panic!("{threads:?} wave64 {wave64} split {split}: {e}"));
+        }
+    }
+}
+
+/// Each wave of a 2-D or 3-D group takes consecutive console threads, lane l the l-th, as on
+/// the console (the PC driver need not form its waves that way).
+#[test]
+fn gpu_direct_compute_waves_take_consecutive_threads_of_2d_and_3d_groups() {
+    if !gpu_ready() {
+        return;
+    }
+    for wave64 in [false, true] {
+        let lanes = if wave64 { 64 } else { 32 };
+        for threads in [[8, 8, 1], [4, 4, 4], [8, 8, 4]] {
+            let blob = cs_container(&wave_threads_program(wave64), threads, wave64);
+            let what = format!("{threads:?} wave64 {wave64}");
+            let dxil = super::pso::direct_compute(&blob, 0, 1, wave64 && runner::split_wave64()).unwrap_or_else(|e| panic!("{what}: {e}")).dxil;
+            let total = threads.iter().product::<u32>() as usize;
+            let base = 0x100usize;
+            let mut io = vec![0u32; 128];
+            io[..3].copy_from_slice(&[base as u32, threads[0], threads[0] * threads[1]]);
+            let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![u32::MAX; (base + total * 8) / 4]).unwrap();
+            for t in 0..total {
+                let at = (base + t * 8) / 4;
+                assert_eq!((out[at], out[at + 1]), ((t % lanes) as u32, (t - t % lanes) as u32), "{what}: thread {t} (lane, the wave's first thread)");
+            }
+        }
+    }
+}
+
 /// A wave32 program in a 64-lane hardware wave (what VS / PS may get from the driver): the
 /// two halves behave as separate waves – ballots, lane counts, readlane and mbcnt per half.
 #[test]
