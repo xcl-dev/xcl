@@ -3771,6 +3771,105 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// Shape sweep of the pass-through mesh pipeline across the `MsInterface` shapes a retail
+/// title produces: thread counts, vertex/primitive counts up to the D3D12 maximum (256/256),
+/// and output-element counts that cross the 32 KB per-group limit into the split path. Each
+/// shape writes one full record (nv = max_vertices, np = max_primitives, positions scattered
+/// over the viewport) with a synthetic compute shader, then rasterises it exactly as the
+/// two-pass draw does (`runner::mesh_draw_split`) – the same path a minimal single-dispatch
+/// repro takes. A shape-dependent GPU hang or device removal (0x887A0005) shows up as the one
+/// shape whose draw returns an error while the smaller shapes pass; the 10 s fence wait in
+/// `wait_for_submission` turns a hang into an error too, and a removal poisons the shared
+/// device, so the sweep stops at the first failure and names its shape. If every shape
+/// completes, the pipeline shape alone is not the trigger (look at the bound targets and
+/// depth/compression state instead).
+#[test]
+fn gpu_mesh_shape_sweep() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::{MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    // (threads, max_vertices, max_primitives, output params besides SV_Position)
+    let shapes: &[(u32, u32, u32, u32)] = &[
+        (1, 3, 1, 0),        // the minimal single-dispatch repro shape
+        (128, 64, 64, 1),
+        (128, 128, 128, 1),
+        (128, 256, 256, 1),  // max counts, one group
+        (128, 128, 128, 8),  // 9 rows * 16 B * 128 = 18 KB: still one group
+        (128, 128, 128, 16), // over 32 KB per group -> split path
+        (128, 128, 128, 21), // the retail NGG transform shape (21 wide rows)
+        (128, 256, 256, 16), // largest declaration, split path
+        (64, 256, 1, 21),    // 256 vertices, one primitive: the compact-group split
+    ];
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for &(threads, mv, mp, params) in shapes {
+        let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+        for k in 0..params {
+            outputs.push(sig("TEXCOORD", 0, k + 1, k));
+        }
+        let ms = MsInterface { outputs, threads, max_vertices: mv, max_primitives: mp };
+        let split = passthrough_split(&ms, passthrough_elements(&ms, None));
+        let vd = ms.vert_dwords();
+        let vdq = vd / 4;
+        let rd = ms.record_dwords();
+        let tri_base = MESH_HEADER + mv as usize * vd;
+        let label = format!("threads {threads}, {mv}v/{mp}p, {params} params (split {split})");
+
+        // one synthetic record: nv/np full, positions scattered over clip space so triangles
+        // (i, i+1, i+2) cover pixels, params zero, 9-bit packed indices (< nv, no null bit)
+        let cs_src = format!(
+            "RWByteAddressBuffer res : register(u1);
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {{
+    uint rec = gid.x * {rd}u;
+    res.Store(rec * 4u, {mv}u);
+    res.Store(rec * 4u + 4u, {mp}u);
+    for (uint i = 0u; i < {mv}u; i++) {{
+        uint b = (rec + {MESH_HEADER}u + i * {vd}u) * 4u;
+        float fi = (float)i;
+        float x = -1.0 + 2.0 * frac(fi * 0.123 + 0.05);
+        float y = -1.0 + 2.0 * frac(fi * 0.371 + 0.05);
+        res.Store4(b, asuint(float4(x, y, 0.0, 1.0)));
+        for (uint p = 1u; p < {vdq}u; p++) res.Store4(b + p * 16u, uint4(0u, 0u, 0u, 0u));
+    }}
+    for (uint j = 0u; j < {mp}u; j++) {{
+        uint a = j % {mv}u;
+        uint bb = (j + 1u) % {mv}u;
+        uint cc = (j + 2u) % {mv}u;
+        res.Store((rec + {tri_base}u + j) * 4u, a | (bb << 10u) | (cc << 20u));
+    }}
+}}
+"
+        );
+
+        let draw = || -> Result<(), String> {
+            let cs = super::dxc::compile(&cs_src, "main", "cs_6_6", &[]).map_err(|e| format!("cs: {e}"))?;
+            let pass = mesh_passthrough(&ms);
+            let msb = super::dxc::compile(&pass, "main", "ms_6_6", &[]).map_err(|e| format!("ms: {e}\n{pass}"))?;
+            let fields: String = (0..params).map(|k| format!(" float4 p{k} : TEXCOORD{k};")).collect();
+            let ps_src = format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return float4(1, 1, 1, 1); }}\n");
+            let ps = super::dxc::compile(&ps_src, "main", "ps_6_6", &[]).map_err(|e| format!("ps: {e}"))?;
+            runner::mesh_draw_split(&cs, &msb, &ps, 1, split, rd, &[], &[], 64, [-1.0; 4]).map(|_| ())
+        };
+        if let Err(err) = draw() {
+            failures.push((label, err));
+            break; // a device removal poisons the shared device; the first failure is the signal
+        }
+    }
+    assert!(failures.is_empty(), "mesh shape(s) failed to draw: {failures:#?}");
+}
+
 #[test]
 fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
     use super::{mesh_passthrough, MsInterface};
