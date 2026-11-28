@@ -44,9 +44,12 @@ impl Lw {
                 None => {
                     let k = self.static_used.len() as u32;
                     let cur = self.cur();
+                    // DispatchX can terminate the physical entry before this sampler's first use.
+                    let before = self.s.m.set_insert_before_term(true);
                     self.s.m.set_block(self.init.entry);
                     let h = self.s.sampler(self.sampler_base + k, 1, has_c);
                     self.s.m.set_block(cur);
+                    self.s.m.set_insert_before_term(before);
                     self.static_used.push((w, has_c, h));
                     h
                 }
