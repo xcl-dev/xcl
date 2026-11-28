@@ -82,6 +82,59 @@ fn log_open(api: &str, path: &str, flags: u32) {
     }
 }
 
+/// Whether `path` is the NVIDIA driver's shader cache file of a process: a `.nvph` file directly
+/// in `NVIDIA\DXCache` of this user's `AppData\Local` (`LOCALAPPDATA`) or of the `LocalLow`
+/// folder beside it, where the driver keeps them. A title's own file in folders of those names
+/// elsewhere is not one.
+fn is_driver_shader_cache(path: &str) -> bool {
+    static ROOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let roots = ROOTS.get_or_init(|| driver_cache_roots(&std::env::var("LOCALAPPDATA").unwrap_or_default()));
+    is_driver_cache_in(path, roots)
+}
+
+/// The folders the driver keeps its shader cache files in for the user's `AppData\Local` folder
+/// `local`, in lowercase: `<local>\nvidia\dxcache\` and `<local>\..\locallow\nvidia\dxcache\`.
+fn driver_cache_roots(local: &str) -> Vec<String> {
+    let local = local.trim().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+    if local.is_empty() {
+        return Vec::new();
+    }
+    let mut roots = vec![format!(r"{local}\nvidia\dxcache\")];
+    if let Some((parent, _)) = local.rsplit_once('\\') {
+        roots.push(format!(r"{parent}\locallow\nvidia\dxcache\"));
+    }
+    roots
+}
+
+/// Whether `path` (with or without `\\?\`) is a `.nvph` file directly in one of `roots`.
+fn is_driver_cache_in(path: &str, roots: &[String]) -> bool {
+    let lower = path.replace('/', "\\").to_ascii_lowercase();
+    let plain = lower.strip_prefix(r"\\?\").unwrap_or(&lower);
+    roots.iter().any(|root| {
+        plain.strip_prefix(root.as_str()).is_some_and(|name| name.len() > ".nvph".len() && name.ends_with(".nvph") && !name.contains('\\'))
+    })
+}
+
+/// `XCL_DRIVER_SHADER_CACHE=0`: the display driver's opens of its own shader cache file fail
+/// (access denied), so it runs without one. The NVIDIA driver maps that file whole into the
+/// process and reads all of it at start: for a retail title whose file had grown to 4 GiB,
+/// 3.9 GB of the process's working set from the first second, on a machine whose memory the
+/// title fills. XCL keeps the driver's pipeline blobs in its own cache
+/// (`XCL_PSO_DISK_CACHE_MIN_MS`), so the driver's file holds them a second time.
+fn driver_cache_refused(path: &str) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*OFF.get_or_init(|| std::env::var("XCL_DRIVER_SHADER_CACHE").is_ok_and(|v| v.trim() == "0")) || !is_driver_shader_cache(path) {
+        return false;
+    }
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("VFS: the driver's shader cache file {path} is refused (XCL_DRIVER_SHADER_CACHE=0): #{n}");
+    }
+    unsafe { SetLastError(vfs::ERROR_ACCESS_DENIED) };
+    true
+}
+
 fn apply_open_decision(
     decision: Decision,
     disposition: u32,
@@ -111,6 +164,9 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    if driver_cache_refused(&path) {
+        return INVALID_HANDLE_VALUE;
+    }
     log_open("CreateFileW", &path, fl);
     apply_open_decision(
         v.open_decision(&path, acc, disp, fl),
@@ -124,6 +180,9 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let orig = orig!(O_CREATE_FILE_A as FnCreateFileA);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    if driver_cache_refused(&path) {
+        return INVALID_HANDLE_VALUE;
+    }
     log_open("CreateFileA", &path, fl);
     apply_open_decision(
         v.open_decision(&path, acc, disp, fl),
@@ -139,6 +198,9 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, disp, params) };
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
+    if driver_cache_refused(&path) {
+        return INVALID_HANDLE_VALUE;
+    }
     log_open("CreateFile2", &path, flags);
     apply_open_decision(
         v.open_decision(&path, acc, disp, flags),
@@ -1248,6 +1310,25 @@ mod tests {
         CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
     };
+
+    #[test]
+    fn only_the_drivers_shader_cache_files_are_recognised() {
+        let roots = driver_cache_roots(r"C:\Users\a\AppData\Local");
+        let is = |path: &str| is_driver_cache_in(path, &roots);
+        assert!(is(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\32e6a9dbc29925ed.nvph"));
+        assert!(is(r"\\?\c:\users\a\appdata\locallow\nvidia\dxcache\0002A9DBC29925ED.NVPH"));
+        assert!(!is(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\"), "the folder itself");
+        assert!(!is(r"C:\Games\Title\data\cache.nvph"), "a title's own file of that type");
+        assert!(!is(r"G:\assets\NVIDIA\DXCache\title.nvph"), "a title's path with the driver's folder names");
+        assert!(!is(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\sub\title.nvph"), "not directly in the driver's folder");
+        assert!(!is(r"C:\Users\b\AppData\Local\NVIDIA\DXCache\32e6a9dbc29925ed.nvph"), "another user's");
+        assert!(!is(r"C:\ProgramData\NVIDIA Corporation\Drs\nvdrssel.bin"), "the driver's settings");
+        // this process's own folder, as the driver opens it
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            assert!(is_driver_shader_cache(&format!(r"{local}\NVIDIA\DXCache\32e6a9dbc29925ed.nvph")));
+            assert!(!is_driver_shader_cache(r"G:\assets\NVIDIA\DXCache\title.nvph"));
+        }
+    }
 
     struct HookFixture {
         dir: PathBuf,
