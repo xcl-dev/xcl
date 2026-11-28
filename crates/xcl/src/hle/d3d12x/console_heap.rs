@@ -1343,7 +1343,127 @@ pub fn named_by_index(i: u32) -> usize {
 
 pub fn write(s: &Slot, words: &[u32]) {
     let n = words.len().min(if s.sampler { 4 } else { 8 });
+    if !s.sampler && super::present::trace_frame() {
+        let mut old = [0u32; 8];
+        unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, old.as_mut_ptr(), 8) };
+        if rewrites_image(&old, &words[..n]) {
+            *REWRITES.lock().unwrap().get_or_insert_with(Default::default).entry(s.generation).or_default() += 1;
+        }
+    }
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };
+}
+
+/// `XCL_TRACE_FRAME`: per view heap (generation), the views written over an image view with
+/// other words. The slot's PC descriptor changes with it, and so does every copy of the slot
+/// made as memory (its T# names that PC descriptor), where the console's copy keeps the old view.
+static REWRITES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+/// `XCL_TRACE_FRAME`: stale copies seen in the first slots of descriptor tables at draws
+static STALE_AT_BIND: AtomicU64 = AtomicU64::new(0);
+
+/// Whether writing `new` over `old` changes an image view (a buffer V# carries its address,
+/// so copies of it keep their own value).
+fn rewrites_image(old: &[u32; 8], new: &[u32]) -> bool {
+    old[3] >> 28 >= 8 && old[..new.len()] != *new
+}
+
+/// The PC index that a view slot `k` of `h` owns.
+fn own_view_index(h: &Heap, k: u32) -> u32 {
+    match h.pages.get((k / PAGE_SLOTS) as usize) {
+        Some(&f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
+        Some(_) => 0,
+        None => 2 * k,
+    }
+}
+
+unsafe fn view_words(h: &Heap, k: u32) -> [u32; 8] {
+    let mut w = [0u32; 8];
+    std::ptr::copy_nonoverlapping((h.shadow + (k * SLOT) as usize) as *const u32, w.as_mut_ptr(), 8);
+    w
+}
+
+/// The image now in the slot that owns PC index `index`, as a T# in a slot of `h` names it: an
+/// index in the shared heap for a heap in it, in `h`'s own PC heap otherwise. None: no slot
+/// owns it, or that slot holds something other than its own image (its PC descriptor is unknown).
+fn owner_image(heaps: &[Heap], h: &Heap, index: u32) -> Option<[u32; 8]> {
+    let (o, k) = if h.pages.is_empty() {
+        if index % 2 != 0 {
+            return None;
+        }
+        (h, index / 2)
+    } else {
+        heaps.iter().filter(|o| !o.sampler).find_map(|o| {
+            o.pages.iter().enumerate().find_map(|(p, &f)| {
+                (f != UNMAPPED && index >= f && index - f < 2 * PAGE_SLOTS && (index - f) % 2 == 0).then(|| (o, p as u32 * PAGE_SLOTS + (index - f) / 2))
+            })
+        })?
+    };
+    if k >= o.n {
+        return None;
+    }
+    let w = unsafe { view_words(o, k) };
+    (w[3] >> 28 >= 8 && w[0] == index).then_some(w)
+}
+
+/// An image T# in slot `k` of `h` that names another slot's PC descriptor (a copy made as
+/// memory) whose view has changed since: the copy's other words are no longer that view's.
+fn stale_copy(heaps: &[Heap], h: &Heap, k: u32, w: &[u32; 8]) -> bool {
+    w[3] >> 28 >= 8 && w[0] != own_view_index(h, k) && owner_image(heaps, h, w[0]).is_some_and(|o| o[1..] != w[1..])
+}
+
+/// `XCL_TRACE_FRAME`, at a draw: whether the view slot at console GPU address `addr32` holds a
+/// stale copy (counted for the census).
+pub fn stale_copy_at(addr32: u32) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    let cpu = (u.base() + addr32 as usize) as u64;
+    let heaps = HEAPS.lock().unwrap();
+    let Some(h) = heaps.iter().find(|h| !h.sampler && cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * SLOT) as usize) as u64) else { return false };
+    let k = ((cpu - h.shadow as u64) / SLOT as u64) as u32;
+    let stale = stale_copy(&heaps, h, k, &unsafe { view_words(h, k) });
+    if stale {
+        STALE_AT_BIND.fetch_add(1, Ordering::Relaxed);
+    }
+    stale
+}
+
+/// What the slots of a view heap hold (`census`).
+#[derive(Default, Debug, PartialEq)]
+struct ViewCensus {
+    empty: u32,
+    own: u32,
+    other: u32,
+    buffers: u32,
+    stale: u32,
+    /// (slot, index) of the first copies and of the first stale ones
+    examples: Vec<(u32, u32)>,
+    stale_examples: Vec<(u32, u32)>,
+}
+
+fn view_census(heaps: &[Heap], h: &Heap) -> ViewCensus {
+    let mut c = ViewCensus::default();
+    for k in 0..h.n {
+        let w = unsafe { view_words(h, k) };
+        if w.iter().all(|&x| x == 0) {
+            c.empty += 1;
+        } else if w[3] >> 28 >= 8 {
+            if w[0] == own_view_index(h, k) {
+                c.own += 1;
+            } else {
+                c.other += 1;
+                if c.examples.len() < 8 {
+                    c.examples.push((k, w[0]));
+                }
+                if stale_copy(heaps, h, k, &w) {
+                    c.stale += 1;
+                    if c.stale_examples.len() < 8 {
+                        c.stale_examples.push((k, w[0]));
+                    }
+                }
+            }
+        } else {
+            c.buffers += 1;
+        }
+    }
+    c
 }
 
 /// Copy a console slot's descriptor to another slot of the same kind, the PC heap index
@@ -1406,38 +1526,18 @@ pub fn census() {
             if h.visible { "shader visible" } else { "CPU only" }
         );
     }
+    let rewrites = REWRITES.lock().unwrap().clone().unwrap_or_default();
     for h in heaps.iter().filter(|h| !h.sampler) {
-        let (mut empty, mut own, mut other, mut buffers) = (0u32, 0u32, 0u32, 0u32);
-        let mut examples: Vec<(u32, u32)> = Vec::new();
-        let own_index = |k: u32| match h.pages.get((k / PAGE_SLOTS) as usize) {
-            Some(&f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
-            Some(_) => 0,
-            None => 2 * k,
-        };
-        for k in 0..h.n {
-            let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SLOT) as usize) as *const u32, 8) };
-            if w.iter().all(|&x| x == 0) {
-                empty += 1;
-            } else if w[3] >> 28 >= 8 {
-                if w[0] == own_index(k) {
-                    own += 1;
-                } else {
-                    other += 1;
-                    if examples.len() < 8 {
-                        examples.push((k, w[0]));
-                    }
-                }
-            } else {
-                buffers += 1;
-            }
-        }
+        let ViewCensus { empty, own, other, buffers, stale, examples, stale_examples } = view_census(&heaps, h);
         crate::xlog_info!(
-            "frame trace: view heap {:#x} ({} slots, {}): {own} images with their own PC index, {other} with another (slot, index: {examples:?}), {buffers} buffers, {empty} empty",
+            "frame trace: view heap {:#x} ({} slots, {}): {own} images with their own PC index, {other} with another (slot, index: {examples:?}), {stale} of them stale (slot, index: {stale_examples:?}), {} image views rewritten, {buffers} buffers, {empty} empty",
             h.obj,
             h.n,
-            if h.visible { "shader visible" } else { "CPU only" }
+            if h.visible { "shader visible" } else { "CPU only" },
+            rewrites.get(&h.generation).copied().unwrap_or(0)
         );
     }
+    crate::xlog_info!("frame trace: {} stale copies seen in descriptor tables at draws", STALE_AT_BIND.load(Ordering::Relaxed));
 }
 
 /// The descriptor at a console GPU address (low 32 bits, as in a descriptor table), if it
@@ -2035,6 +2135,39 @@ mod tests {
         assert!(v.len() < 128, "{} entries", v.len());
         assert_eq!(v.iter().filter(|&&i| n.claim(i, a)).count(), 1, "only slot 1 is a's now");
         assert!(n.candidates(b).unwrap().len() < 128);
+    }
+
+    /// A copy made as memory names its source's PC descriptor: making another view in the source
+    /// slot changes what the copy shows, where the console's copy keeps the old view.
+    #[test]
+    fn a_memory_copy_whose_source_slot_is_rewritten_is_stale() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        assert!(register(0xA7, 4, 0x1000, 0x5000, 32, false, false, true));
+        let v = start(0xA7).unwrap();
+        let (s0, s2) = (slot(v).unwrap(), slot(v + 64).unwrap());
+        let a = [s0.index, 0x0470_0000, 0x0001_C03F, 9 << 28, 0, 0, 0, 0];
+        write(&s0, &a);
+        // the title's own copy: the words as they are, the source's index included
+        unsafe { std::ptr::copy_nonoverlapping(s0.at as *const u32, s2.at as *mut u32, 8) };
+        let count = || {
+            let heaps = HEAPS.lock().unwrap();
+            let h = heaps.iter().find(|h| h.obj == 0xA7).unwrap();
+            view_census(&heaps, h)
+        };
+        let c = count();
+        assert_eq!((c.own, c.other, c.stale), (1, 1, 0));
+        assert!(!stale_copy_at((v + 64 - u.base() as u64) as u32));
+        let b = [s0.index, 0x0470_0000, 0x0003_C07F, 9 << 28, 0, 0, 0, 0];
+        assert!(rewrites_image(&a, &b) && !rewrites_image(&a, &a));
+        assert!(!rewrites_image(&[0x1234, 0, 64, 0x3101_6FAC, 0, 0, 0, 0], &b), "a buffer V# is copied by value");
+        write(&s0, &b);
+        let c = count();
+        assert_eq!((c.other, c.stale, c.stale_examples), (1, 1, vec![(2, s0.index)]));
+        assert!(stale_copy_at((v + 64 - u.base() as u64) as u32));
+        // the source slot holding something else: its PC descriptor is unknown, not counted
+        write(&s0, &[0x1234, 0, 64, 0x3101_6FAC, 0, 0, 0, 0]);
+        assert_eq!(count().stale, 0);
+        unregister(0xA7);
     }
 
     #[test]

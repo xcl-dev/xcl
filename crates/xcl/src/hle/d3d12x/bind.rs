@@ -4500,6 +4500,8 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
                                 super::title_textures::address(named).map(|a| format!("{a:#x}"))
                             )
                         });
+                        let stale = if super::console_heap::stale_copy_at((t + 32 * k) as u32) { " (stale copy)" } else { "" };
+                        let k = format!("{k}{stale}");
                         match super::console_heap::resource_at(at) {
                             Some(r) => {
                                 if super::title_textures::address(r).is_some() {
