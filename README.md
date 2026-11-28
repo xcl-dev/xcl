@@ -302,9 +302,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   builds its direct-dispatch pieces and whole fallback, and additionally saves both its pieces and
   whole fallback under the indirect root; other split programs do not pay for those potentially
   long driver compiles.
-- With a v1 PSO manifest recorded by `XCL_PSO_MANIFEST=1`, `--through-present N` builds the
-  compute pipelines first used up to that recorded present, in first-use order. A missing cutoff
-  or unmatched compute key stops the pass before any build. Graphics PSOs require additional state.
+- With a v1 PSO manifest recorded by `XCL_PSO_MANIFEST=1`, `--precompile --pipelines
+  --pso-manifest FILE --through-present N` builds the compute pipelines first used up to
+  that recorded present, in first-use order. A missing cutoff or unmatched compute key stops
+  the pass before any build. Graphics PSOs require additional state.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
