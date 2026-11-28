@@ -62,6 +62,8 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// cleanly without prematurely breaking synchronization. Overridable via `XCL_GPU_WAIT_TIMEOUT_MS`
 /// for diagnostics.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Cap on tracked per-list immediate-write values (for same-list write-then-wait detection).
+const MAX_WRITTEN_VALUES: usize = 256;
 fn wait_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -794,6 +796,9 @@ struct ListState {
     written_ranges: RecordedWriteProducers,
     /// Writes produced by this physical segment only (not cumulative across a split).
     segment_write_producers: RecordedWriteProducers,
+    /// `(va, bytes, value)` of this list's last immediate write (`write`) to each address; a later
+    /// write over it of unknown value (fill, copy) removes it
+    written_values: Vec<(u64, u64, u64)>,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
@@ -889,6 +894,8 @@ impl ListState {
         if size == 0 {
             return;
         }
+        let end = va.saturating_add(size);
+        self.written_values.retain(|&(s, n, _)| !(va < s + n && s < end));
         self.written_ranges.insert(producer, va, size);
         self.segment_write_producers.insert(producer, va, size);
         if producer == WriteProducer::InSegmentGpu && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
@@ -925,6 +932,13 @@ impl ListState {
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
         // GPU writes are already ordered before later commands in the same physical list.
         self.written_ranges.overlaps(WriteProducer::InSegmentGpu, va, size)
+    }
+
+    /// Whether this list's last immediate write to exactly `va..va + size`, masked, meets the wait;
+    /// true when there is no known value (a fill, a copy, a partial write), as before.
+    fn own_write_meets(&self, va: u64, size: u64, comparison: u32, mask: u64, value: u64) -> bool {
+        let own = self.written_values.iter().find(|&&(w, len, _)| w == va && len == size);
+        own.is_none_or(|&(_, _, v)| compare_u64(comparison, v & mask, value) == Some(true))
     }
 
     fn wait_placement(&self, va: u64, size: u64) -> WaitPlacement {
@@ -1168,6 +1182,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
     };
     state.written_ranges.clear();
     state.segment_write_producers.clear();
+    state.written_values.clear();
     effects
 }
 
@@ -1220,6 +1235,7 @@ struct SplitCarry {
     active_query: Option<(Query, D3D12_QUERY_TYPE)>,
     ended_early: Vec<Query>,
     written_ranges: RecordedWriteProducers,
+    written_values: Vec<(u64, u64, u64)>,
     bindings: Bindings,
 }
 
@@ -1244,6 +1260,7 @@ impl SplitCarry {
             active_query,
             ended_early,
             written_ranges: state.written_ranges.clone(),
+            written_values: state.written_values.clone(),
             bindings: state.bindings.clone(),
         })
     }
@@ -1262,6 +1279,7 @@ impl SplitCarry {
             depth_bounds: self.depth_bounds,
             occlusion: Occlusion { active: None, ended_early: self.ended_early.clone() },
             written_ranges: self.written_ranges.clone(),
+            written_values: self.written_values.clone(),
             pred_buf: self.pred_buf.clone(),
             pred_in_state: false,
             predication: self.predication,
@@ -1738,6 +1756,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.segment_write_producers.clear();
+        s.written_values.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -1903,6 +1922,16 @@ fn note_write(list: usize, producer: WriteProducer, va: u64, size: u64) {
 fn note_texture_write(list: usize, res: usize, subresource: u32) {
     let Some(write) = super::title_textures::capture_gpu_write(res, subresource) else { return };
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().texture_writes.push(write);
+}
+
+/// `note_write` for an immediate write of `words`, keeping its value for `wait_memory`.
+fn note_write_value(list: usize, va: u64, words: &[u32]) {
+    let mut g = LISTS.lock().unwrap();
+    let s = g.get_or_insert_with(HashMap::new).entry(list).or_default();
+    s.note_write(WriteProducer::InSegmentGpu, va, 4 * words.len() as u64);
+    if words.len() <= 2 && s.written_values.len() < MAX_WRITTEN_VALUES {
+        s.written_values.push((va, 4 * words.len() as u64, words.iter().rev().fold(0, |v, &w| v << 32 | w as u64)));
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3596,7 +3625,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
-    note_write(list as usize, WriteProducer::InSegmentGpu, va, n);
+    note_write_value(list as usize, va, words);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -4279,7 +4308,11 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     let placement = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-        let placement = s.wait_placement(va, n);
+        let mut placement = s.wait_placement(va, n);
+        // (only when the value it wrote meets the wait: else another queue is to produce it)
+        if placement == WaitPlacement::OrderedInSegment && !s.own_write_meets(va, n, comparison, mask, value) {
+            placement = if s.write64_signals.is_empty() { WaitPlacement::RecordHere } else { WaitPlacement::SplitAfterWrite64 };
+        }
         match placement {
             WaitPlacement::OrderedInSegment => return,
             WaitPlacement::RecordHere => {
@@ -4773,6 +4806,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 s.occlusion = Occlusion { active: None, ended_early };
                 s.written_ranges.clear();
                 s.segment_write_producers.clear();
+                s.written_values.clear();
                 s.clear_sparse_writes();
                 s.clear_write64_signals();
                 s.clear_waits();
@@ -5531,6 +5565,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.segment_write_producers.clear();
+        s.written_values.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -6835,6 +6870,97 @@ mod tests {
         assert!(s.has_prior_write(0x0FFC, 8));
         assert!(!s.has_prior_write(0x1008, 4));
         assert!(!s.has_prior_write(0x0FF8, 8));
+    }
+
+    /// A wait on an address the same list wrote is dropped only when the value that write left
+    /// meets it: a list that resets a counter to 0 and then waits for another queue to raise it
+    /// keeps its wait.
+    #[test]
+    fn a_wait_after_an_own_write_is_dropped_only_when_the_written_value_meets_it() {
+        let cell64 = AtomicU64::new(0);
+        let cell32 = AtomicU32::new(0);
+        let (va64, va32) = (&cell64 as *const AtomicU64 as u64, &cell32 as *const AtomicU32 as u64);
+        let mut token = 0usize;
+        let list = (&mut token as *mut usize).cast::<c_void>();
+        // records the writes (as `write` does) and the wait, and returns the waits left on the list
+        let kept = |writes: &[(u64, &[u32])], wait: &dyn Fn()| -> usize {
+            for &(va, words) in writes {
+                note_write_value(list as usize, va, words);
+            }
+            wait();
+            let n = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.pending_waits.len());
+            on_release(list as usize);
+            n
+        };
+        let w64 = |v: u64| [v as u32, (v >> 32) as u32];
+        use D3D12_COMPARISON_FUNC as F;
+        // (value written, comparison, value waited for, wait kept)
+        for (written, op, wanted, keep) in [
+            (0u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1u64, true),
+            (5, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1, false),
+            (0xFFFF_FFFF, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1 << 32, true),
+            (0, D3D12_COMPARISON_FUNC_EQUAL, 1, true),
+            (1, D3D12_COMPARISON_FUNC_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_NOT_EQUAL, 1, true),
+            (0, D3D12_COMPARISON_FUNC_NOT_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_LESS, 1, true),
+            (0, D3D12_COMPARISON_FUNC_LESS, 1, false),
+            (2, D3D12_COMPARISON_FUNC_LESS_EQUAL, 1, true),
+            (1, D3D12_COMPARISON_FUNC_LESS_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_GREATER, 1, true),
+            (2, D3D12_COMPARISON_FUNC_GREATER, 1, false),
+            (0, D3D12_COMPARISON_FUNC_ALWAYS, 1, false),
+            (0, D3D12_COMPARISON_FUNC_NEVER, 1, false),
+        ] {
+            let F(op) = op;
+            let got = kept(&[(va64, &w64(written))], &|| unsafe { wait64_x(list, va64, op as u32, wanted, 0, 0) });
+            assert_eq!(got, keep as usize, "64-bit: wrote {written:#x}, wait op {op} {wanted:#x}");
+            if wanted <= u32::MAX as u64 && written <= u32::MAX as u64 {
+                let got = kept(&[(va32, &[written as u32])], &|| unsafe { wait32_x(list, va32, op as u32, wanted as u32, u32::MAX, 0) });
+                assert_eq!(got, keep as usize, "32-bit: wrote {written:#x}, wait op {op} {wanted:#x}");
+            }
+        }
+        let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+        let eq = D3D12_COMPARISON_FUNC_EQUAL.0 as u32;
+        // the mask applies to the written value too
+        assert_eq!(kept(&[(va32, &[0x1234_00FF])], &|| unsafe { wait32_x(list, va32, eq, 0xFF, 0xFF, 0) }), 0);
+        assert_eq!(kept(&[(va32, &[0x0000_12FE])], &|| unsafe { wait32_x(list, va32, eq, 0xFF, 0xFF, 0) }), 1);
+        // the last write before the wait counts
+        assert_eq!(kept(&[(va64, &w64(5)), (va64, &w64(0))], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 1);
+        assert_eq!(kept(&[(va64, &w64(0)), (va64, &w64(5))], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 0);
+        // a write to another address leaves the wait alone
+        assert_eq!(kept(&[(va32, &[5])], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 1);
+        // a write of unknown value over it (a fill or a copy) still drops the wait, as before
+        let fill = || {
+            note_write_value(list as usize, va64, &w64(0));
+            note_write(list as usize, WriteProducer::InSegmentGpu, va64, 8);
+            unsafe { wait64_x(list, va64, ge, 1, 0, 0) }
+        };
+        assert_eq!(kept(&[], &fill), 0);
+    }
+
+    #[test]
+    fn a_split_segment_keeps_the_written_value_for_a_later_wait() {
+        let cell = AtomicU64::new(0);
+        let va = &cell as *const AtomicU64 as u64;
+        let (mut a, mut b) = (0usize, 0usize);
+        let (list, next) = ((&mut a as *mut usize).cast::<c_void>(), (&mut b as *mut usize).cast::<c_void>());
+        let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+        // `Write64(va, 0)`, then a split moves the recording to `next` with what `split` carries over
+        note_write_value(list as usize, va, &[0, 0]);
+        let continued = {
+            let mut g = LISTS.lock().unwrap();
+            let s = g.as_mut().unwrap().get_mut(&(list as usize)).unwrap();
+            s.allocator = 0xa110;
+            SplitCarry::capture(s).unwrap().continuation_state(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        };
+        on_release(list as usize);
+        LISTS.lock().unwrap().as_mut().unwrap().insert(next as usize, continued);
+        // a wait the written 0 does not meet stays on the segment
+        unsafe { wait64_x(next, va, ge, 1, 0, 0) };
+        let n = LISTS.lock().unwrap().as_ref().unwrap()[&(next as usize)].pending_waits.len();
+        on_release(next as usize);
+        assert_eq!(n, 1, "the wait after the split was dropped");
     }
 
     #[test]
