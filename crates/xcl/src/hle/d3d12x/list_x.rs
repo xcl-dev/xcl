@@ -4571,6 +4571,9 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         }
     }
     let next_pc = reserve_closed_segment(wrapper, &dev, ty)?;
+    // the list that takes the producer's place if its Close fails (`replace_failed`); without
+    // one, a failed Close fails the whole recording closed
+    let stand = reserve_closed_segment(wrapper, &dev, ty);
     let deferred = if let Some(what) = deferred_what {
         match prepare_deferred_segment(wrapper, list, ty) {
             Some(seg) => Some((seg, ListState {
@@ -4586,6 +4589,9 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
             })),
             None => {
                 super::title_list::put_spare(wrapper, next_pc);
+                if let Some(stand) = stand {
+                    super::title_list::put_spare(wrapper, stand);
+                }
                 return None;
             }
         }
@@ -4627,14 +4633,33 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
     let ext = *(list as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
+    static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
     if close_hr < 0 {
-        super::title_list::fail_closed(wrapper, list, next_pc, true);
-        if let Some((seg, _)) = deferred {
-            super::title_list::put_spare(wrapper, seg);
+        // A list whose Close failed removes the device when it is submitted, and no Reset opens
+        // it again, but it does not hold its allocator: an empty list closed on that allocator
+        // takes its place with what XCL tracked of it (waits, Write64 signals, CPU writes; what
+        // it recorded for the GPU is lost), and the recording goes on in `next_pc`. Without such
+        // a list the whole recording fails closed until the title's next Reset.
+        match stand {
+            Some(stand) if record_empty(stand, alloc, ty) => {
+                move_list_state(list as usize, stand as usize);
+                super::title_list::replace_failed(wrapper, list, stand);
+                warn(&CLOSE_ERR, "mid-list split", format_args!("Close failed ({close_hr:#x}); what the list recorded before the split is lost"));
+            }
+            _ => {
+                if let Some(stand) = stand {
+                    super::title_list::quarantine(wrapper, stand);
+                }
+                super::title_list::fail_closed(wrapper, list, next_pc, true);
+                if let Some((seg, _)) = deferred {
+                    super::title_list::put_spare(wrapper, seg);
+                }
+                warn(&CLOSE_ERR, "mid-list split", format_args!("Close failed ({close_hr:#x}); the recording is lost"));
+                return None;
+            }
         }
-        static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
-        warn(&CLOSE_ERR, "mid-list split", format_args!("Close failed ({close_hr:#x})"));
-        return None;
+    } else if let Some(stand) = stand {
+        super::title_list::put_spare(wrapper, stand);
     }
     if !reset_reserved_segment(next_pc, alloc, ty, init_pso) {
         super::title_list::fail_closed(wrapper, list, next_pc, false);
@@ -4797,6 +4822,42 @@ unsafe fn reset_reserved_segment(list: *mut c_void, alloc: usize, ty: D3D12_COMM
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (tests) `record_empty` fails, as when no list can be recorded in a failed list's place.
+    static RECORD_EMPTY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Reset `p`, a closed list, onto `alloc` and close it again, empty.
+unsafe fn record_empty(p: *mut c_void, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE) -> bool {
+    #[cfg(test)]
+    if RECORD_EMPTY_FAILS.with(|f| f.get()) {
+        return false;
+    }
+    if !reset_reserved_segment(p, alloc, ty, 0) {
+        return false;
+    }
+    let ext = *(p as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+    real::preserve_vtable(p, ext);
+    hr >= 0
+}
+
+/// What XCL tracks of the list `from` goes to `to`, which takes its place in a recording, but
+/// not its texture writes and transitions: what `from` recorded for the GPU is lost.
+fn move_list_state(from: usize, to: usize) {
+    let mut g = LISTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let Some(mut s) = m.remove(&from) else { return };
+    s.texture_writes.clear();
+    s.texture_transitions.clear();
+    if let Some(mut old) = m.insert(to, s) {
+        old.clear_sparse_writes();
+        old.clear_write64_signals();
+        old.clear_waits();
     }
 }
 
@@ -8004,6 +8065,178 @@ mod tests {
         s.write64_signals.push((0x4000, 1));
         assert_eq!(s.wait_placement(0x5000, 8), WaitPlacement::SplitAfterWrite64);
         assert_eq!(s.wait_placement(0x3000, 4), WaitPlacement::OrderedInSegment, "GPU overlap keeps the existing Write64 behavior");
+    }
+
+    /// A direct list of a title wrapper, its queue and allocator, and a readback buffer for
+    /// `mark` (Err: why the test cannot run here).
+    unsafe fn split_close_rig() -> Result<(ID3D12Device, ID3D12CommandQueue, ID3D12CommandAllocator, *mut c_void, *mut c_void, ID3D12Resource), &'static str> {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let dev = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0).map_err(|_| "no GPU")?;
+        if !close_refuses_open_query(&dev) {
+            return Err("Close does not refuse an open pipeline-statistics query");
+        }
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+        let a = alloc.as_raw() as usize;
+        let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+        real::adopt(primary, real::Kind::CommandList);
+        on_create(primary, a, 0, ty);
+        super::super::bind::reset(primary, a, 0);
+        let w = super::super::title_list::wrap(primary);
+        let mut rb: Option<ID3D12Resource> = None;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+        Ok((dev, q, alloc, primary, w, rb.unwrap()))
+    }
+
+    /// Whether the runtime refuses to Close a list of its own with a query begun as `refuse_close`
+    /// does (vkd3d-proton under Wine records it and closes the list: #2622).
+    unsafe fn close_refuses_open_query(dev: &ID3D12Device) -> bool {
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Count: 1, NodeMask: 0 }, &mut heap).unwrap();
+        list.BeginQuery(heap.as_ref().unwrap(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+        list.Close().is_err()
+    }
+
+    /// The PC lists `w`'s submit runs.
+    fn segments_of(w: *mut c_void) -> Vec<*mut c_void> {
+        let mut s = Vec::new();
+        assert!(super::super::title_list::push_segments(w, &mut s));
+        s
+    }
+
+    /// Writes `value` at `at` of `rb` on the GPU, recorded on `list`.
+    unsafe fn mark(list: *mut c_void, rb: &ID3D12Resource, at: u64, value: u32) {
+        type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
+        let p = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: rb.GetGPUVirtualAddress() + at, Value: value };
+        pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, 1, &p, &D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT);
+    }
+
+    /// Submits `segs` on `q` as the title's ExecuteCommandLists does and waits for the GPU: false
+    /// when the device was removed.
+    unsafe fn submit_segments(dev: &ID3D12Device, q: &ID3D12CommandQueue, segs: &[*mut c_void]) -> bool {
+        execute_with_waits_on(q.as_raw(), segs, |chunk| {
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: ExecFn = std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            exec(q.as_raw(), chunk.len() as u32, chunk.as_ptr());
+            signal_write64_fences(q.as_raw(), chunk);
+        });
+        let Ok(done) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return false };
+        q.Signal(&done, 1).is_ok() && crate::gpu::fence::wait(&done, 1, dev, None, 5000).is_ok() && dev.GetDeviceRemovedReason().is_ok()
+    }
+
+    /// Makes the native Close of `list` fail, as a recording the runtime refuses does: a pipeline
+    /// statistics query begun and not ended (XCL ends only occlusion queries at a split).
+    unsafe fn refuse_close(dev: &ID3D12Device, list: *mut c_void) -> ID3D12QueryHeap {
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Count: 1, NodeMask: 0 }, &mut heap).unwrap();
+        let heap = heap.unwrap();
+        pc::<QueryFn>(list, PC_BEGIN_QUERY)(list, heap.as_raw() as usize, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+        heap
+    }
+
+    /// A mid-list split whose Close fails leaves only that list out: a closed list takes its
+    /// place with its Write64 signal, the recording goes on in the next segment and reaches the
+    /// GPU, and the title's next Reset records on another list, since the failed one cannot be
+    /// Reset. Before, the whole recording failed closed until the next Reset.
+    #[test]
+    fn a_split_whose_close_fails_leaves_that_list_out_and_goes_on() {
+        unsafe {
+            let (dev, q, alloc, primary, w, rb) = match split_close_rig() {
+                Ok(rig) => rig,
+                Err(reason) => return crate::gpu::recomp::runner::skip_test(reason),
+            };
+            let slot = |i: usize| *(*(w as *const *const usize)).add(i);
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(slot(9));
+            let reset: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(slot(10));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+            let cells = Box::new([AtomicU64::new(0), AtomicU64::new(1)]);
+            let va = |i: usize| &cells[i] as *const AtomicU64 as u64;
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+
+            mark(primary, &rb, 0, 0x1111);
+            let _heap = refuse_close(&dev, primary);
+            note_write64_recorded(primary, va(0), 1);
+            wait64_x(primary, va(1), ge, 1, 0, 0);
+            let segs = segments_of(w);
+            assert_eq!(segs.len(), 2, "the split went on");
+            assert!(!segs.contains(&primary), "the list whose Close failed is not submitted");
+            mark(segs[1], &rb, 4, 0x2733);
+            assert_eq!(close(w), 0, "the title's Close finds its list recording");
+
+            assert!(submit_segments(&dev, &q, &segments_of(w)), "the device stays");
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let got = [*(p as *const u32), *(p as *const u32).add(1)];
+            rb.Unmap(0, None);
+            assert_eq!(got, [0, 0x2733], "what was recorded after the split ran on the GPU");
+            let submitted = SYNC_GRAPH.lock().unwrap().as_ref().unwrap().cells.get(&va(0)).map(|c| c.submitted_max);
+            assert_eq!(submitted, Some(1), "the failed list's Write64 was signalled in its place");
+
+            // the next recording: the primary cannot be Reset, another list records
+            assert_eq!(reset(w, alloc.as_raw() as usize, 0), 0);
+            let segs = segments_of(w);
+            assert_eq!(segs.len(), 1);
+            assert_ne!(segs[0], primary);
+            mark(segs[0], &rb, 8, 0x3344);
+            assert_eq!(close(w), 0);
+            assert!(submit_segments(&dev, &q, &segments_of(w)), "the device stays");
+
+            assert_eq!(release(w), 0);
+            if let Some(g) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                for i in 0..2 {
+                    g.cells.remove(&va(i));
+                }
+            }
+        }
+    }
+
+    /// A mid-list split whose Close fails where no list can be recorded empty in its place fails
+    /// the whole recording closed, as before: only the closed standby is left to submit, not the
+    /// failed list. (Not submitted here: on an RTX 2070 SUPER, main's standby, made closed and
+    /// never recorded, removed the device when submitted, which ends the whole test binary.)
+    #[test]
+    fn a_split_whose_close_fails_with_no_list_in_its_place_fails_the_recording_closed() {
+        unsafe {
+            let (dev, _q, _alloc, primary, w, _rb) = match split_close_rig() {
+                Ok(rig) => rig,
+                Err(reason) => return crate::gpu::recomp::runner::skip_test(reason),
+            };
+            let slot = |i: usize| *(*(w as *const *const usize)).add(i);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+            let cells = Box::new([AtomicU64::new(0), AtomicU64::new(1)]);
+            let va = |i: usize| &cells[i] as *const AtomicU64 as u64;
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+
+            let _heap = refuse_close(&dev, primary);
+            note_write64_recorded(primary, va(0), 1);
+            RECORD_EMPTY_FAILS.with(|f| f.set(true));
+            wait64_x(primary, va(1), ge, 1, 0, 0);
+            RECORD_EMPTY_FAILS.with(|f| f.set(false));
+            let segs = segments_of(w);
+            assert_eq!(segs.len(), 1, "only the closed standby is submitted");
+            assert_ne!(segs[0], primary, "the list whose Close failed is not submitted");
+            assert_eq!(release(w), 0);
+            if let Some(g) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                for i in 0..2 {
+                    g.cells.remove(&va(i));
+                }
+            }
+        }
     }
 
     #[test]

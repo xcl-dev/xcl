@@ -338,7 +338,8 @@ pub(super) fn prepare_split(wrapper: *mut c_void, n: usize) -> bool {
         || b.extra_active.len() + n > MAX_EXTRA_SEGMENTS
         || b.extra_active.try_reserve(n).is_err()
         || b.spares.try_reserve(n).is_err()
-        || b.unresettable.try_reserve(1).is_err()
+        // (the producer, and a stand-in for it whose empty recording failed: `replace_failed`)
+        || b.unresettable.try_reserve(2).is_err()
     {
         return false;
     }
@@ -392,6 +393,35 @@ pub(super) fn drop_segment(wrapper: *mut c_void, pc: *mut c_void) {
 #[cfg(test)]
 pub(super) fn spares_for_test(wrapper: *mut c_void) -> Vec<usize> {
     SEGMENTS.lock().unwrap().as_ref().and_then(|m| m.get(&(wrapper as usize))).map_or(Vec::new(), |b| b.spares.clone())
+}
+
+/// The closed list `stand` takes the place of `failed`, a list of `wrapper`'s recording whose
+/// Close failed: submitted, `failed` would remove the device, and no Reset opens it again. It is
+/// kept only to be released with the wrapper (the primary is that anyway); a failed primary makes
+/// the title's next Reset record on another list.
+pub(super) fn replace_failed(wrapper: *mut c_void, failed: *mut c_void, stand: *mut c_void) {
+    let primary = unsafe { *((wrapper as usize + F_PRIMARY) as *const usize) };
+    let (failed, stand) = (failed as usize, stand as usize);
+    let mut sg = SEGMENTS.lock().unwrap();
+    let b = sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default();
+    if b.first == Some(failed) || (b.first.is_none() && failed == primary) {
+        b.first = Some(stand);
+    } else if let Some(k) = b.extra_active.iter().position(|&p| p == failed) {
+        b.extra_active[k] = stand;
+    } else {
+        return;
+    }
+    if failed == primary {
+        b.primary_broken = true;
+    } else {
+        b.unresettable.push(failed);
+    }
+}
+
+/// Keep `pc`, a list of `wrapper` in no known state, only to release it with the wrapper.
+pub(super) fn quarantine(wrapper: *mut c_void, pc: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().unresettable.push(pc as usize);
 }
 
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
@@ -655,6 +685,48 @@ mod tests {
         SEGMENTS.lock().unwrap().as_mut().unwrap().get_mut(&(wrapper as usize)).unwrap().failed = Some(0x9100);
         assert!(!prepare_fail_closed(wrapper), "an already failed recording cannot preflight again");
         SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize));
+    }
+
+    /// A list whose Close failed leaves the recording for the closed list in its place (the
+    /// primary as the recording's first list too), a quarantined list is not submitted, and all
+    /// of them are released once, with the wrapper.
+    #[test]
+    fn a_list_whose_close_failed_gives_its_place_and_goes_with_the_wrapper() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        let fake = || Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let [primary, seg, stand, stand2, odd] = [fake(), fake(), fake(), fake(), fake()];
+        let p = |f: *mut Fake| f as *mut c_void;
+        unsafe {
+            let o = wrap(p(primary));
+            let segs = |o| {
+                let mut s = Vec::new();
+                assert!(push_segments(o, &mut s));
+                s
+            };
+            replace_failed(o, p(primary), p(stand));
+            assert_eq!(segs(o), vec![p(stand)]);
+            activate_segment(o, p(primary), p(seg));
+            assert_eq!(segs(o), vec![p(stand), p(seg)]);
+            replace_failed(o, p(seg), p(stand2));
+            assert_eq!(segs(o), vec![p(stand), p(stand2)]);
+            quarantine(o, p(odd));
+            assert_eq!(segs(o), vec![p(stand), p(stand2)], "a quarantined list is not submitted");
+            {
+                let books = SEGMENTS.lock().unwrap();
+                let b = &books.as_ref().unwrap()[&(o as usize)];
+                assert!(b.primary_broken);
+                assert_eq!(b.unresettable, vec![seg as usize, odd as usize]);
+            }
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(o as *const *const usize)).add(2));
+            assert_eq!(rel(o), 0);
+            for f in [primary, seg, stand, stand2, odd] {
+                assert_eq!((*f).refs, 0, "released once");
+                drop(Box::from_raw(f));
+            }
+        }
     }
 
     #[test]
