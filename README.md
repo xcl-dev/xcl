@@ -303,7 +303,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   whole fallback under the indirect root; other split programs do not pay for those potentially
   long driver compiles.
 - With a v1 PSO manifest recorded by `XCL_PSO_MANIFEST=1`, `--precompile --pipelines
--  -pso-manifest FILE --through-present N` builds the compute pipelines first used up to
+  --pso-manifest FILE --through-present N` builds the compute pipelines first used up to
   that recorded present, in first-use order. A missing cutoff or unmatched compute key stops
   the pass before any build. Graphics PSOs require additional state.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
