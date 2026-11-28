@@ -1384,6 +1384,9 @@ struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<(PipelineRoot, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     warm_blobs: Option<warm_blobs::Verified>,
+    /// `CreateComputePipelineState` calls, with and without a blob
+    #[cfg(test)]
+    native_creates: AtomicUsize,
     verified: AtomicUsize,
     made: AtomicUsize,
     refused: AtomicUsize,
@@ -1971,6 +1974,69 @@ mod pipeline_cap_tests {
         assert!(!path.exists(), "rejected blob should not be retried next run");
     }
 
+    /// #2939: a driver that takes a blob it cannot use (here the stock pipeline's blob with 16
+    /// bytes appended, ettehn's 1,418 → 1,402 byte case) returns a pipeline compiled from the
+    /// DXIL. That pipeline is made with one native create, and its own blob replaces the stale one.
+    #[test]
+    fn a_stale_blob_the_driver_takes_is_made_with_one_create_and_replaced() {
+        use super::{Pipelines, recomp, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-padded-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 42); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        let compiled = recomp::pso::Compiled { dispatch_chain: None, dxil, samplers: vec![], dispatch_remap: None };
+        let path = scratch.0.join("padded.pso");
+
+        pipelines.make_with_cache_path(&compiled, Some(path.clone()));
+        let good = std::fs::read(&path).expect("the driver's blob of the first build");
+        assert_eq!(pipelines.native_creates.load(Ordering::Relaxed), 1);
+
+        let mut padded = good.clone();
+        padded.extend([0; 16]);
+        // whether this driver takes the padded blob at all: one that refuses it never gets here
+        let rs = recomp::pso::abi_root_signature_with(&pipelines.dev, true, &[]).expect("ABI root signature");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: compiled.dxil.as_ptr().cast(), BytecodeLength: compiled.dxil.len() },
+            CachedPSO: D3D12_CACHED_PIPELINE_STATE { pCachedBlob: padded.as_ptr().cast(), CachedBlobSizeInBytes: padded.len() },
+            ..Default::default()
+        };
+        let taken = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        if let Err(e) = taken {
+            recomp::runner::skip_test(&format!("the driver refuses a blob with bytes appended ({e}): no successful stale probe on this adapter"));
+            return;
+        }
+        std::fs::write(&path, &padded).expect("padded blob");
+        pipelines.make_with_cache_path(&compiled, Some(path.clone()));
+        let creates = pipelines.native_creates.load(Ordering::Relaxed) - 1;
+        let (made, refused, reused) = (pipelines.made.load(Ordering::Relaxed), pipelines.refused.load(Ordering::Relaxed), pipelines.reused.load(Ordering::Relaxed));
+        let kept = std::fs::read(&path).expect("blob after the stale probe");
+        println!("adapter={} good_blob={} padded_blob={} creates={creates} made={made} refused={refused} reused={reused} kept_blob={}", recomp::runner::adapter().unwrap_or_default(), good.len(), padded.len(), kept.len());
+        assert_eq!((made, refused, reused), (2, 0, 0));
+        assert_eq!(kept.len(), good.len(), "the stale blob is replaced by the driver's own");
+        assert_eq!(creates, 1, "a successful stale probe is not created a second time");
+    }
+
     #[test]
     fn split_compute_program_prebuilds_and_caches_chain_pieces() {
         use super::{Pipelines, recomp, Ordering};
@@ -2120,6 +2186,8 @@ impl Pipelines {
                 dev,
                 signatures: Mutex::new(Default::default()),
                 warm_blobs: None,
+                #[cfg(test)]
+                native_creates: AtomicUsize::new(0),
                 verified: AtomicUsize::new(0),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
@@ -2359,71 +2427,71 @@ impl Pipelines {
             loaded = path.as_deref().and_then(driver_cache::load);
             cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
         }
-        let from_cache = cached.as_ref().and_then(|bytes| {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            // a driver that cannot use the blob may compile from the DXIL itself and still
-            // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
-                .ok()
-                .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
-        });
-        // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
-        // size cap and start the expensive uncached driver compile.
-        if cached.is_some() && from_cache.is_none() {
+        // (a blob is written where this process may write it: it claimed the pipeline, or the
+        // blob there was handed to the driver)
+        let persist_path = path.as_deref().filter(|_| _claim.is_some() || cached.is_some());
+        let build = build_with_blob(
+            cached.as_deref().map(Vec::as_slice),
+            persist_path.is_some(),
+            over_cap,
+            |blob| {
+                desc.CachedPSO = blob.map_or_else(Default::default, |b| D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr().cast(), CachedBlobSizeInBytes: b.len() });
+                #[cfg(test)]
+                self.native_creates.fetch_add(1, Ordering::Relaxed);
+                unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            },
+            |pso| {
+                DriverBlob::of(unsafe { pso.GetCachedBlob() }.ok()?)
+            },
+        );
+        // A stale blob is not a usable cache hit: remove the file object that supplied it.
+        if cached.is_some() && !matches!(build, BlobBuild::Made { reused: true, .. }) {
             if let Some(loaded) = loaded.take() {
                 let _ = loaded.invalidate();
             }
         }
-        if cached.is_some() && from_cache.is_none() && over_cap {
-            self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
-        }
-        let r = if let Some(pso) = from_cache {
-            if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
-                book.record(warm_blobs::stamp(path, layout, blob));
+        let r = match build {
+            // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
+            // size cap and start the expensive uncached driver compile.
+            BlobBuild::Capped => {
+                self.capped.fetch_add(1, Ordering::Relaxed);
+                self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
             }
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
-        } else {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            let persist_path = path.as_deref().filter(|_| _claim.is_some() || cached.is_some());
-            let persistence = pso.as_ref().ok().map(|pso| match persist_path {
-                None => PersistenceOutcome::Disabled,
-                Some(path) => match unsafe { pso.GetCachedBlob() } {
-                    Ok(blob) => {
-                        let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                        let len = unsafe { blob.GetBufferSize() };
-                        if bytes.is_null() || len == 0 {
-                            PersistenceOutcome::BlobUnavailable
-                        } else {
-                            let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
-                            if driver_cache::write(path, bytes) {
-                                if let Some(((book, layout), _)) = receipt {
-                                    book.record(warm_blobs::stamp(path, layout, bytes));
-                                }
-                                PersistenceOutcome::Saved
-                            } else {
-                                PersistenceOutcome::WriteFailed
+            BlobBuild::Made { pso, reused: true, .. } => {
+                if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
+                    book.record(warm_blobs::stamp(path, layout, blob));
+                }
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                Ok(pso)
+            }
+            BlobBuild::Made { pso, reused: false, replacement } => {
+                let persistence = match (persist_path, replacement) {
+                    (None, _) => PersistenceOutcome::Disabled,
+                    (Some(_), None) => PersistenceOutcome::BlobUnavailable,
+                    (Some(path), Some(blob)) => {
+                        if driver_cache::write(path, blob.as_ref()) {
+                            if let Some(((book, layout), _)) = receipt {
+                                book.record(warm_blobs::stamp(path, layout, blob.as_ref()));
                             }
+                            PersistenceOutcome::Saved
+                        } else {
+                            PersistenceOutcome::WriteFailed
                         }
                     }
-                    Err(_) => PersistenceOutcome::BlobUnavailable,
-                },
-            });
-            record_fresh_creation(persistence, &self.created, &self.persistence);
-            if let Some(outcome) = persistence {
-                if matches!(outcome, PersistenceOutcome::BlobUnavailable | PersistenceOutcome::WriteFailed)
+                };
+                record_fresh_creation(Some(persistence), &self.created, &self.persistence);
+                if matches!(persistence, PersistenceOutcome::BlobUnavailable | PersistenceOutcome::WriteFailed)
                     && !self.persistence_warned.swap(true, Ordering::Relaxed)
                 {
                     if let Some(path) = persist_path {
                         crate::xlog_warn!("Shader preparation: failed to persist driver blob {}; this pipeline will be rebuilt on the next run", path.display());
                     }
                 }
+                Ok(pso)
             }
-            pso
+            BlobBuild::Refused(e) => Err(e),
         };
         let library = match &r {
             Ok(pso) => pipeline_library::store(library_name, pso),
@@ -2454,6 +2522,221 @@ fn parse_pipeline_keys(text: &str) -> std::collections::HashSet<u64> {
 /// to `used-pipelines.txt`. Return the keys this record satisfied so unmatched inputs can be named.
 fn selected_keys(blob: &[u8], selected: &std::collections::HashSet<u64>) -> Vec<u64> {
     [shader::fnv64(blob), pipeline_key(blob)].into_iter().filter(|key| selected.contains(key)).collect()
+}
+
+/// What `--pipelines` made of one program, with the driver's blob of an earlier run or without one
+/// (`build_with_blob`).
+enum BlobBuild<P, B, E> {
+    /// `reused`: made from the blob handed over. `replacement`: the driver's blob of a pipeline
+    /// that was not, to keep for the next run.
+    Made { pso: P, reused: bool, replacement: Option<B> },
+    Refused(E),
+    /// a program over the cap whose blob was not used: not compiled without it
+    Capped,
+}
+
+/// The driver's blob of a made pipeline, read in place: only a blob that replaces a stale one is
+/// read, to be written out.
+struct DriverBlob(windows::Win32::Graphics::Direct3D::ID3DBlob);
+
+impl DriverBlob {
+    /// `None` for an empty blob
+    fn of(blob: windows::Win32::Graphics::Direct3D::ID3DBlob) -> Option<Self> {
+        let blob = Self(blob);
+        (!blob.as_ref().is_empty()).then_some(blob)
+    }
+}
+
+impl AsRef<[u8]> for DriverBlob {
+    fn as_ref(&self) -> &[u8] {
+        let bytes = unsafe { self.0.GetBufferPointer() }.cast::<u8>();
+        let len = unsafe { self.0.GetBufferSize() };
+        if bytes.is_null() || len == 0 {
+            return &[];
+        }
+        // the blob owns its buffer, which lives as long as it does
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    }
+}
+
+/// The pipeline of one program: `create(Some(blob))` with the blob kept from an earlier run
+/// (`cached`), `create(None)` without one; `blob_of` is the driver's blob of a made pipeline,
+/// asked for a pipeline made without a blob only when it can be kept (`keep`: there is a path
+/// to write it to).
+///
+/// A driver that cannot use the blob may compile from the DXIL itself and still succeed (#1774):
+/// that pipeline is made, so it is not created a second time (#2939). It is a hit only when it
+/// carries a blob of the size handed over; otherwise its own blob replaces the stale one. A
+/// refused blob is compiled again without it. Over the cap a blob that was not used is a miss,
+/// as before: that compile takes tens of minutes and gigabytes and is left to the runtime.
+fn build_with_blob<P, B: AsRef<[u8]>, E>(cached: Option<&[u8]>, keep: bool, over_cap: bool, mut create: impl FnMut(Option<&[u8]>) -> Result<P, E>, blob_of: impl Fn(&P) -> Option<B>) -> BlobBuild<P, B, E> {
+    if let Some(bytes) = cached {
+        match create(Some(bytes)) {
+            Ok(pso) => {
+                let blob = blob_of(&pso);
+                let reused = blob.as_ref().is_some_and(|b| b.as_ref().len() == bytes.len());
+                if !reused && over_cap {
+                    return BlobBuild::Capped;
+                }
+                return BlobBuild::Made { pso, reused, replacement: blob.filter(|_| !reused && keep) };
+            }
+            Err(_) if over_cap => return BlobBuild::Capped,
+            Err(_) => {}
+        }
+    }
+    match create(None) {
+        Ok(pso) => {
+            let replacement = if keep { blob_of(&pso) } else { None };
+            BlobBuild::Made { pso, reused: false, replacement }
+        }
+        Err(e) => BlobBuild::Refused(e),
+    }
+}
+
+#[cfg(test)]
+mod build_with_blob_tests {
+    use super::{build_with_blob, BlobBuild};
+
+    /// A driver for `build_with_blob`: each create is recorded with the blob it was handed, and
+    /// answers `answer(blob)`; a made pipeline is the blob the driver returns for it.
+    struct Driver {
+        creates: Vec<Option<Vec<u8>>>,
+    }
+
+    impl Driver {
+        fn build(&mut self, cached: Option<&[u8]>, over_cap: bool, answer: impl Fn(Option<&[u8]>) -> Result<Vec<u8>, &'static str>) -> BlobBuild<Vec<u8>, Vec<u8>, &'static str> {
+            self.build_keeping(cached, true, over_cap, answer).0
+        }
+
+        /// `build`, with `keep`; also the number of blobs asked of made pipelines
+        fn build_keeping(&mut self, cached: Option<&[u8]>, keep: bool, over_cap: bool, answer: impl Fn(Option<&[u8]>) -> Result<Vec<u8>, &'static str>) -> (BlobBuild<Vec<u8>, Vec<u8>, &'static str>, usize) {
+            let exports = std::cell::Cell::new(0);
+            let built = build_with_blob(
+                cached,
+                keep,
+                over_cap,
+                |blob| {
+                    self.creates.push(blob.map(<[u8]>::to_vec));
+                    answer(blob)
+                },
+                |pso| {
+                    exports.set(exports.get() + 1);
+                    Some(pso.clone()).filter(|b| !b.is_empty())
+                },
+            );
+            (built, exports.get())
+        }
+    }
+
+    #[test]
+    fn without_a_path_a_pipeline_made_without_a_blob_is_not_asked_for_its_blob() {
+        // XCL_PSO_DISK_CACHE=0: nothing to write the blob to, so it is not exported (akimfomin)
+        let mut d = Driver { creates: vec![] };
+        let (built, exports) = d.build_keeping(None, false, false, |_| Ok(good()));
+        let BlobBuild::Made { reused, replacement, .. } = built else { panic!("not made") };
+        assert_eq!(d.creates, vec![None]);
+        assert_eq!(exports, 0);
+        assert!(!reused);
+        assert_eq!(replacement, None);
+    }
+
+    #[test]
+    fn with_a_path_a_pipeline_made_without_a_blob_is_asked_for_its_blob_once() {
+        let mut d = Driver { creates: vec![] };
+        let (_, exports) = d.build_keeping(None, true, false, |_| Ok(good()));
+        assert_eq!(exports, 1);
+    }
+
+    /// the driver's blob of the stock pipeline; a stale one is longer (ettehn's 1,418 → 1,402 bytes)
+    fn good() -> Vec<u8> {
+        (0..1402u32).map(|i| (i * 7) as u8).collect()
+    }
+
+    #[test]
+    fn a_stale_blob_the_driver_takes_is_one_create_and_replaced() {
+        let mut stale = good();
+        stale.extend([0; 16]);
+        let mut d = Driver { creates: vec![] };
+        let BlobBuild::Made { pso, reused, replacement } = d.build(Some(&stale), false, |_| Ok(good())) else { panic!("not made") };
+        assert_eq!(d.creates, vec![Some(stale)], "one native create, with the blob");
+        assert_eq!(pso, good());
+        assert!(!reused);
+        assert_eq!(replacement, Some(good()));
+    }
+
+    #[test]
+    fn a_stale_blob_over_the_cap_the_driver_takes_is_capped_after_one_create() {
+        let mut stale = good();
+        stale.extend([0; 16]);
+        let mut d = Driver { creates: vec![] };
+        assert!(matches!(d.build(Some(&stale), true, |_| Ok(good())), BlobBuild::Capped));
+        assert_eq!(d.creates.len(), 1);
+    }
+
+    #[test]
+    fn a_blob_the_driver_hands_back_over_the_cap_is_a_hit() {
+        let mut d = Driver { creates: vec![] };
+        let BlobBuild::Made { reused, .. } = d.build(Some(&good()), true, |b| Ok(b.unwrap().to_vec())) else { panic!("not made") };
+        assert_eq!(d.creates.len(), 1);
+        assert!(reused);
+    }
+
+    #[test]
+    fn a_returned_blob_of_the_same_size_but_other_bytes_is_one_create() {
+        // akimfomin's control: a size comparison cannot tell these apart, but the one-create rule
+        // holds whatever the hit rule makes of them
+        let mut d = Driver { creates: vec![] };
+        let other: Vec<u8> = good().iter().map(|b| !b).collect();
+        let BlobBuild::Made { pso, .. } = d.build(Some(&good()), false, |_| Ok(other.clone())) else { panic!("not made") };
+        assert_eq!(d.creates.len(), 1);
+        assert_eq!(pso, other);
+    }
+
+    #[test]
+    fn the_blob_the_driver_hands_back_is_a_hit_and_not_written_again() {
+        let mut d = Driver { creates: vec![] };
+        let BlobBuild::Made { reused, replacement, .. } = d.build(Some(&good()), false, |b| Ok(b.unwrap().to_vec())) else { panic!("not made") };
+        assert_eq!(d.creates.len(), 1);
+        assert!(reused);
+        assert_eq!(replacement, None);
+    }
+
+    #[test]
+    fn a_made_pipeline_without_a_blob_is_no_hit() {
+        let mut d = Driver { creates: vec![] };
+        let BlobBuild::Made { reused, replacement, .. } = d.build(Some(&good()), false, |_| Ok(vec![])) else { panic!("not made") };
+        assert_eq!(d.creates.len(), 1);
+        assert!(!reused);
+        assert_eq!(replacement, None);
+    }
+
+    #[test]
+    fn a_refused_blob_is_compiled_again_without_it() {
+        let mut d = Driver { creates: vec![] };
+        let answer = |b: Option<&[u8]>| if b.is_some() { Err("E_INVALIDARG") } else { Ok(good()) };
+        let BlobBuild::Made { reused, replacement, .. } = d.build(Some(b"garbage"), false, answer) else { panic!("not made") };
+        assert_eq!(d.creates, vec![Some(b"garbage".to_vec()), None]);
+        assert!(!reused);
+        assert_eq!(replacement, Some(good()));
+    }
+
+    #[test]
+    fn a_refused_blob_over_the_cap_is_capped_after_one_create() {
+        let mut d = Driver { creates: vec![] };
+        let built = d.build(Some(b"garbage"), true, |b| if b.is_some() { Err("E_INVALIDARG") } else { Ok(good()) });
+        assert!(matches!(built, BlobBuild::Capped));
+        assert_eq!(d.creates.len(), 1);
+    }
+
+    #[test]
+    fn without_a_blob_one_create_and_its_blob_is_kept() {
+        let mut d = Driver { creates: vec![] };
+        let BlobBuild::Made { reused, replacement, .. } = d.build(None, false, |_| Ok(good())) else { panic!("not made") };
+        assert_eq!(d.creates, vec![None]);
+        assert!(!reused);
+        assert_eq!(replacement, Some(good()));
+        assert!(matches!(d.build(None, false, |_| Err("refused")), BlobBuild::Refused("refused")));
+    }
 }
 
 /// A compute program a title used in an earlier run (`--used-only`): its pipeline's key, as the
