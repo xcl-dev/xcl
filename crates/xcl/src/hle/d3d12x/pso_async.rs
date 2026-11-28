@@ -3382,12 +3382,15 @@ fn sweep_native_generations() {
 }
 
 /// Keep the exact native generations used by one executed title submission until its strong
-/// queue receipt completes. Completed batches are swept whenever another pinned batch arrives.
+/// queue receipt completes. Completed batches are swept whenever another submission is retired,
+/// including one that has already completed: if only those followed, an earlier batch would
+/// otherwise keep its pipelines for good.
 pub(super) fn retire_native_generations<'a>(
     receipt: super::alloc_pool::SubmissionReceipt,
     pins: impl Iterator<Item = &'a NativeGeneration>,
 ) {
     if receipt.is_complete() {
+        sweep_native_generations();
         return;
     }
     let pins = dedup_generations(pins.cloned(), NativeGeneration::identity);
@@ -10978,6 +10981,9 @@ fn resolve_retained_for_emission(pso: usize, p: &Arc<Pending>) -> PipelineChoice
 /// (0: another `Pending` owns the build, none, or still being built – the worker's result is
 /// then released when its last owner is gone).
 pub fn released(pso: usize) -> usize {
+    // Submissions that have completed since the last retirement give up their pins first, so
+    // the real pipeline goes now when no GPU work holds it (not at some later submission).
+    sweep_native_generations();
     let Some(p) = PENDING.remove(pso) else { return 0 };
     let mut orphaned = false;
     let mut dropped_generation = None;
