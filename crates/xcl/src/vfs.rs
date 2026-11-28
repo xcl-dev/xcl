@@ -105,6 +105,10 @@ fn strip_verbatim(p: &str) -> String {
     if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
         return format!("\\\\{r}");
     }
+    // WARNING: upper/lower case matters here: "\\\\?\\UNC\\" is the UNC verbatim prefix, but api might return lowercase, could return exception and trace here
+    if let Some(r) = p.strip_prefix("\\\\?\\unc\\") {
+        return format!("\\\\{r}");
+    }
     if let Some(r) = p.strip_prefix("\\\\?\\") {
         return r.to_string();
     }
@@ -267,9 +271,10 @@ impl Vfs {
             return Target::Pass;
         }
         let p = strip_verbatim(&p);
-        if p.starts_with("\\\\") {
+/*        if p.starts_with("\\\\") {
             return Target::Pass; // UNC
         }
+*/
         let (p, translated) = match self.apply_mounts(&p) {
             Some(t) if !self.in_own_folders(&p, &full) => (t, true),
             _ => (p, false),

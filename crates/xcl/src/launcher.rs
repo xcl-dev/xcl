@@ -220,6 +220,30 @@ fn sanitize(s: &str) -> String {
     }
 }
 
+//  Normalizes verbatim paths: 
+// `\\?\C:\x` -> `C:\x`, 
+// `\\?\UNC\srv\share\x` -> `\\srv\share\x`.
+// WARNING: upper/lower case matters here: "\\\\?\\UNC\\" is the UNC verbatim prefix, but api might return lowercase, could return exception and trace here
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(r) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{r}"))
+    } else if let Some(r) = s.strip_prefix(r"\\?\unc\") {
+        PathBuf::from(format!(r"\\{r}"))
+    } else if let Some(r) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(r)
+    }  else {
+        p.to_path_buf()
+    }
+}
+
+/// Compares two paths as text, ignoring ASCII case.
+/// WARNING: track same_path comparison usage. Paths that differ only in case compare equal, which can be wrong on
+/// case-sensitive file systems.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
 /// The package folder of `exe`: the nearest folder above it (up to 4 levels) whose
 /// MicrosoftGame.config names it – Unreal titles keep theirs in `<Game>/Binaries/XSX`, and the
 /// package root is what the title's paths (and its D: drive) start from.
@@ -227,7 +251,7 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
     let mut dir = exe.parent()?;
     for _ in 0..5 {
         let (exes, _) = read_game_config(dir);
-        if exes.iter().any(|e| std::fs::canonicalize(dir.join(e)).ok().is_some_and(|p| PathBuf::from(p.to_string_lossy().trim_start_matches("\\\\?\\")) == exe)) {
+        if exes.iter().any(|e| std::path::absolute(dir.join(e)).ok().is_some_and(|p| same_path(&p, exe))) {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
@@ -235,16 +259,37 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Finds the package root of `exe`: the nearest folder, starting at the exe's own folder and
+/// going up 4 more levels, whose MicrosoftGame.config lists this exe as an `<Executable>`.
+/// The manifest often sits above the exe (Unreal titles: `<Game>/Binaries/XSX`), and that
+/// folder is what the title's paths and its D: drive start from.
+/// Searched lexically: the path is taken as given, so a mapped drive keeps its letter.
+/// Returns None if no manifest names the exe; `package_root` handles the junction fallback.
+fn package_root(exe: &Path) -> Option<(PathBuf, PathBuf)> {
+    if let Some(root) = config_root(exe) {
+        return Some((root, exe.to_path_buf()));
+    }
+    let real = strip_verbatim(&std::fs::canonicalize(exe).ok()?);
+    if same_path(&real, exe) {
+        return None;
+    }
+    config_root(&real).map(|root| (root, real))
+}
+
 fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String), String> {
-    let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
-    let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
+    let target = std::path::absolute(target).map_err(|e| format!("{}: {e}", target.display()))?;
+    if !target.exists() { return Err(format!("{} does not exist", target.display())); }
+//    let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
     let (root, exe) = if target.is_dir() {
         (target, None)
     } else {
         if is_xcl_copy(&target) {
             return Err(format!("{} is XCL itself, not a game – give the game exe or folder", target.display()));
         }
-        (config_root(&target).unwrap_or(target.parent().ok_or("no parent folder")?.to_path_buf()), Some(target))
+        match package_root(&target) {
+            Some((root, exe)) => (root, Some(exe)),
+            None => (target.parent().ok_or("no parent folder")?.to_path_buf(), Some(target)),
+        }
     };
     let (_, identity) = read_game_config(&root);
     let title = sanitize(&identity.unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
