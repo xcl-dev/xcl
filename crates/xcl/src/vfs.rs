@@ -190,16 +190,17 @@ impl Vfs {
         }
     }
 
-    /// `dir` is a folder of XCL's own outside the title's data folder – the shader cache, which
-    /// titles share. A console drive mount must not translate its paths either: with the cache on
-    /// the PC's D: drive ("D:" is the console's game drive) the title's process wrote its DXIL
-    /// into the overlay and looked for it in the game folder, so what `xcl shaders --precompile`
-    /// had put into the cache was never found and every run compiled again.
+    /// `dir` is a folder of XCL's own outside the title's data folder – the shader cache,
+    /// `xcl.exe`'s directory, or configured host tool DLL folders (`XCL_DXC_DIR`, …). A console
+    /// drive mount must not translate its paths either: with the cache or DXC on the PC's D: drive
+    /// ("D:" is the console's game drive) the title's process wrote its DXIL into the overlay and
+    /// looked for it or `dxcompiler.dll` in the game folder. Bare drive roots are ignored so an
+    /// empty or root path cannot disable a whole console drive mount.
     pub fn own_folder(mut self, dir: &Path) -> Vfs {
         let dir = dir.to_string_lossy();
         let dir = full_path(&dir).unwrap_or_else(|| dir.into_owned());
         let dir = trim_sep(&strip_verbatim(&norm(&dir))).to_lowercase();
-        if !dir.is_empty() {
+        if !dir.is_empty() && !(dir.len() == 2 && dir.as_bytes()[1] == b':') {
             self.own_roots_lc.push(dir);
         }
         self
