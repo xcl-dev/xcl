@@ -1432,6 +1432,18 @@ fn commit_reset(
 mod tests {
     use super::*;
 
+    /// STATE is process-wide and other tests running in parallel take it briefly, so a single
+    /// `try_lock` can fail without the caller holding it. Retry until a generous deadline: when
+    /// this thread holds STATE, `try_lock` keeps returning `WouldBlock` and this returns false.
+    fn state_not_held_by_caller() -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if STATE.try_lock().is_ok() { return true; }
+            if std::time::Instant::now() >= deadline { return false; }
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn release_probe_transfers_only_the_logical_final_reference() {
         use std::cell::Cell;
@@ -1557,7 +1569,7 @@ mod tests {
             refs: Cell<u32>,
         }
         unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
-            let outside = STATE.try_lock().is_ok();
+            let outside = state_not_held_by_caller();
             OUTSIDE.store(outside, Ordering::Relaxed);
             if outside && MUTATE.swap(false, Ordering::Relaxed) {
                 let mut g = STATE.lock().unwrap();
@@ -1682,11 +1694,11 @@ mod tests {
         assert!(pending.finish_with_queue_ops(
             first_queue,
             || {
-                assert!(STATE.try_lock().is_ok(), "fence creation must run outside STATE");
+                assert!(state_not_held_by_caller(), "fence creation must run outside STATE");
                 Some(first_fence.clone())
             },
             |_, value| {
-                assert!(STATE.try_lock().is_ok(), "queue Signal must run outside STATE");
+                assert!(state_not_held_by_caller(), "queue Signal must run outside STATE");
                 assert_eq!(value, 1);
                 true
             },
@@ -1744,7 +1756,7 @@ mod tests {
             reused_queue,
             || Some(old_fence.clone()),
             |_, value| {
-                assert!(STATE.try_lock().is_ok(), "queue invalidation can run while Signal is outside STATE");
+                assert!(state_not_held_by_caller(), "queue invalidation can run while Signal is outside STATE");
                 assert_eq!(value, 1);
                 STATE.lock().unwrap().as_mut().unwrap().fences.insert(
                     reused_queue,
@@ -1965,6 +1977,12 @@ mod tests {
             backing.submit_pins = 0;
         }
         sweep_release_owners_with(drop, drop);
+        // Tests running in parallel sweep the same STATE (e.g. through `forget`), so another thread
+        // can take this retired backing first and release it just after our sweep returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while object.releases.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert_eq!(
             (object.refs.load(Ordering::Acquire), object.releases.load(Ordering::Acquire)),
             (0, 1),
