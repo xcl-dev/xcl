@@ -348,12 +348,12 @@ fn main() {
         ensure!(c == a, "freed blocks merge and are reused: {c:?}");
         ensure!(std::slice::from_raw_parts(c as *const u8, 0x30000).iter().all(|&x| x == 0), "reused block not zeroed");
         XMemFree(c, attrs);
-        // 4 MiB page-size semantics (XALLOC_PAGESIZE_4MB = 2 << 14): 4 MiB-aligned & zeroed
-        let attrs_4m = (1u64 << 29) | (2u64 << 14);
-        let big = XMemAlloc(0x1000, attrs_4m);
-        ensure!(!big.is_null() && (big as usize) % (4 << 20) == 0, "4MB page alloc not 4 MiB aligned: {big:?}");
-        ensure!(*(big as *const u64) == 0 && *((big as usize + (4 << 20) - 8) as *const u64) == 0, "4MB page alloc not zeroed");
-        XMemFree(big, attrs_4m);
+        // Page-size code 2 requests 2 MiB-aligned, zeroed memory.
+        let attrs_2m = (1u64 << 29) | (2u64 << 14);
+        let big = XMemAlloc(0x1000, attrs_2m);
+        ensure!(!big.is_null() && (big as usize) % (2 << 20) == 0, "2MB page alloc not 2 MiB aligned: {big:?}");
+        ensure!(*(big as *const u64) == 0 && *((big as usize + (2 << 20) - 8) as *const u64) == 0, "2MB page alloc not zeroed");
+        XMemFree(big, attrs_2m);
         Ok(())
     });
 

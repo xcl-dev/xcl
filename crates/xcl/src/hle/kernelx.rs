@@ -1401,10 +1401,10 @@ unsafe fn aligned_heap_free(p: *mut c_void) {
 }
 
 /// Rounded byte size and alignment for an XMem graphics allocation honoring `page_size`
-/// (`2` = `XALLOC_PAGESIZE_4MB`, otherwise 64 KiB sparse tile grain) and `alignment`.
+/// (`2` = 2 MiB pages, otherwise 64 KiB sparse tile grain) and `alignment`.
 fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> Option<(usize, usize)> {
     let page_grain = match a.page_size {
-        2 => 4 << 20, // XALLOC_PAGESIZE_4MB
+        2 => 2 << 20,
         _ => crate::gpu::uma::GRAIN,
     };
     let align = (1usize << a.alignment.min(usize::BITS - 2)).max(page_grain);
@@ -1489,7 +1489,7 @@ pub unsafe fn adopt_title_hooks(main: &crate::modules::MappedModule) {
 /// asserts that they start there.
 pub const D3D_DESCRIPTOR_HEAP: u64 = 4 | 1 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
 
-/// XALLOC_ATTRIBUTES of a display target's memory: 4 MiB pages (the retail game's hook for its back buffers
+/// XALLOC_ATTRIBUTES of a display target's memory: 2 MiB pages (the retail game's hook for its back buffers
 /// takes every request with them), allocator 0x80, graphics memory.
 pub const D3D_DISPLAY_TARGET: u64 = 2 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
 
@@ -3505,6 +3505,60 @@ mod tests {
             assert_eq!(VirtualFree(base, grain, 0x8002), 1, "return a replacement to a placeholder");
             assert_eq!(VirtualFree(base, 3 * grain, 0x8001), 1, "coalesce adjacent placeholders");
             assert_eq!(VirtualFree(base, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn xmem_graphics_page_size_two_uses_two_mib_grain() {
+        const PAGE: usize = 2 << 20;
+        let attrs = XAllocAttrs::decode((2 << 14) | (1 << 29));
+        for (size, rounded) in [(0, PAGE), (1, PAGE), (PAGE - 1, PAGE), (PAGE, PAGE), (PAGE + 1, 2 * PAGE), (2 * PAGE, 2 * PAGE)] {
+            assert_eq!(xmem_graphics_layout(size, attrs), Some((rounded, PAGE)), "size {size}");
+        }
+        let larger_alignment = XAllocAttrs::decode((2 << 14) | (23 << 24) | (1 << 29));
+        assert_eq!(xmem_graphics_layout(1, larger_alignment), Some((PAGE, 8 << 20)), "alignment does not enlarge the allocation's page grain");
+    }
+
+    #[test]
+    fn xmem_graphics_page_grain_preserves_other_codes_and_checks_overflow() {
+        const PAGE: usize = 2 << 20;
+        // Code 3 is reserved; keep its existing fallback rather than defining a new contract here.
+        for code in [0, 1, 3] {
+            let attrs = XAllocAttrs::decode((code << 14) | (1 << 29));
+            assert_eq!(xmem_graphics_layout(0x1_0001, attrs), Some((0x2_0000, 0x1_0000)));
+            assert!(xmem_graphics_layout(usize::MAX, attrs).is_none());
+        }
+        let attrs = XAllocAttrs::decode((2 << 14) | (1 << 29));
+        let largest = usize::MAX & !(PAGE - 1);
+        assert_eq!(xmem_graphics_layout(largest, attrs), Some((largest, PAGE)));
+        assert!(xmem_graphics_layout(largest + 1, attrs).is_none());
+        assert!(xmem_graphics_layout(usize::MAX, attrs).is_none());
+    }
+
+    #[test]
+    fn xmem_two_mib_layout_accounts_and_releases_owned_memory() {
+        const PAGE: usize = 2 << 20;
+        // An owned CPU-only window keeps global UMA state and GPU initialization out of the fixture.
+        let u = crate::gpu::uma::Uma::with_windows(1, 16 << 20).expect("owned memory window");
+        let attrs = XAllocAttrs::decode((2 << 14) | (1 << 29));
+        for (requested, expected) in [(1, PAGE), (PAGE, PAGE), (PAGE + 1, 2 * PAGE)] {
+            let (size, align) = xmem_graphics_layout(requested, attrs).unwrap();
+            let p = u.alloc(size, align).expect("owned allocation");
+            let (recorded, used) = (u.block_len(p as usize), u.used());
+            let address = p as usize;
+            unsafe {
+                p.write(0x37);
+                p.add(requested - 1).write(0x69);
+            }
+            // Reclaim before assertions so the negative control also leaves no live allocation.
+            let released = u.free(address);
+            assert!(released);
+            assert_eq!(u.used(), 0);
+            assert_eq!(u.block_len(address), None);
+            assert!(!u.free(address), "one allocation is released only once");
+            assert_eq!(address % PAGE, 0);
+            assert_eq!(recorded, Some(expected), "request {requested}: recorded allocation size");
+            assert_eq!(used, expected, "request {requested}: memory charged");
         }
     }
 
