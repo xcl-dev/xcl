@@ -1478,6 +1478,9 @@ fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
         // CopyTextureRegion's arguments): 11–14 = PC 15–18 (CopyBufferRegion, CopyTextureRegion,
         // CopyResource, CopyTiles); what follows is not known yet (`console_extensions`)
         Kind::DmaList => (11..=14).map(|x| (x, x + 4)).collect(),
+        // a resource's #18 GetProtectedResourceSession / #19 GetDesc1 are the PC's #15 / #16 (the
+        // console's own #15 – #17 are `console_slots`)
+        Kind::Resource => vec![(18, 15), (19, 16)],
         _ => Vec::new(),
     }
 }
@@ -1594,7 +1597,10 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
             ]
         }
         Kind::DescriptorHeap => vec![(8, heap_get_desc_x as usize), (9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
-        Kind::Resource => vec![(11, res_gpu_va_x as usize)],
+        // #15 the description getter, #16 / #17 get / set validation flags (#17 is the PC
+        // Resource3's GetDesc2: the runtime keeps its own)
+        Kind::Resource => vec![(11, res_gpu_va_x as usize), (15, res_placement_desc_x as usize),(16, res_validation_flags_x as usize), (17, res_set_validation_flags_x as usize)],
+        Kind::Heap => vec![(10, heap_gpu_base_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
@@ -2676,6 +2682,42 @@ fn forget_pso(pso: usize) {
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
     drop(gone);
+}
+
+/// resource #15 (console): the resource's description written to the hidden return buffer, the
+/// PC's GetDesc (#10) of it: the console desc is the PC's first 0x34 bytes and console-only
+/// fields (zeroed here); the PC #15 (GetProtectedResourceSession) ran instead, with the return
+/// buffer as its arguments. `this` and the buffer in either order (`this_first`).
+unsafe extern "system" fn res_placement_desc_x(a: *mut c_void, b: *mut c_void) -> *mut c_void {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let (this, ret) = if this_first(a, b) { (a, b) } else { (b, a) };
+    if this.is_null() || ret.is_null() || !crate::gpu::shader::readable(ret as usize, 0x38) {
+        return ret;
+    }
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: resource #15 – the PC description; the console-only fields are zero"));
+    let f: unsafe extern "system" fn(*mut c_void, *mut D3D12_RESOURCE_DESC) -> *mut D3D12_RESOURCE_DESC = std::mem::transmute(orig_fn(this, 10));
+    let mut d: D3D12_RESOURCE_DESC = std::mem::zeroed();
+    f(this, &mut d);
+    let mut out = [0u8; 0x38];
+    out[..0x34].copy_from_slice(std::slice::from_raw_parts(&d as *const _ as *const u8, 0x34));
+    std::ptr::copy_nonoverlapping(out.as_ptr(), ret as *mut u8, 0x38);
+    ret
+}
+
+/// resource #16 GetValidationFlags (console): none are set
+unsafe extern "system" fn res_validation_flags_x(_this: *mut c_void) -> u32 {
+    0
+}
+
+/// resource #17 SetValidationFlags (console): nothing validates on the PC
+unsafe extern "system" fn res_set_validation_flags_x(_this: *mut c_void, _flags: u32) {}
+
+/// heap #10 (console): the address of the heap's memory as the title uses it – the block that
+/// stands for it (`heap_block`, taken now: the title asks for it to place buffers there). A heap
+/// with none (textures only, DENY_BUFFERS, unified memory full) has no address of its own on the
+/// PC: 0, what the unmapped slot answered before.
+unsafe extern "system" fn heap_gpu_base_x(this: *mut c_void) -> u64 {
+    heap_block(this as usize).map_or(0, |(p, _)| p as u64)
 }
 
 /// resource #11 GetGPUVirtualAddress for console code
@@ -13191,6 +13233,82 @@ mod gpu_view_tests {
         assert_eq!(title_buffer_window(&u, c + c_len - 0x100, 0x200), None);
         assert_eq!(title_buffer_window(&u, end + 0x1_0000, 0x100), None, "an empty window");
         assert_eq!(u.view_release(g), Some(2 * WINDOW));
+    }
+}
+
+#[cfg(test)]
+mod console_object_tail_tests {
+    use super::*;
+
+    #[test]
+    fn resource_tail_slots_are_the_console_ones() {
+        let slots = console_slots(Kind::Resource);
+        let at = |n: usize| slots.iter().find(|e| e.0 == n).map(|e| e.1);
+        assert_eq!(at(16), Some(res_validation_flags_x as usize));
+        assert_eq!(at(17), Some(res_set_validation_flags_x as usize));
+        assert_eq!(at(15), Some(res_placement_desc_x as usize));
+        // the PC's #15 / #16 sit at #18 / #19 for a title
+        assert_eq!(console_remap(Kind::Resource), vec![(18, 15), (19, 16)]);
+        let validation: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(at(16).unwrap()) };
+        let set: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(at(17).unwrap()) };
+        unsafe {
+            set(std::ptr::null_mut(), 0xFFFF_FFFF);
+            assert_eq!(validation(std::ptr::null_mut()), 0);
+        }
+    }
+
+    unsafe extern "system" fn fake_get_desc(_this: *mut c_void, ret: *mut D3D12_RESOURCE_DESC) -> *mut D3D12_RESOURCE_DESC {
+        *ret = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 640,
+            Height: 480,
+            DepthOrArraySize: 1,
+            MipLevels: 3,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28),
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAGS(5),
+            ..Default::default()
+        };
+        ret
+    }
+
+    #[test]
+    fn resource_slot_15_writes_the_pc_description_to_the_return_buffer() {
+        let mut pc = [0usize; 24];
+        pc[10] = fake_get_desc as usize;
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        let this = Box::into_raw(Box::new([vtbl])) as *mut c_void;
+        unsafe {
+            for this_first_order in [true, false] {
+                let mut buf = [0xAAu8; 0x38];
+                let ret = buf.as_mut_ptr() as *mut c_void;
+                let r = if this_first_order { res_placement_desc_x(this, ret) } else { res_placement_desc_x(ret, this) };
+                assert_eq!(r, ret);
+                let d = std::ptr::read_unaligned(buf.as_ptr() as *const D3D12_RESOURCE_DESC);
+                assert_eq!((d.Width, d.Height, d.MipLevels, d.Format.0, d.Flags.0), (640, 480, 3, 28, 5), "the PC description (this first: {this_first_order})");
+                assert_eq!(&buf[0x34..], &[0u8; 4], "the console-only field is zero");
+            }
+            drop(Box::from_raw(this as *mut [usize; 1]));
+        }
+        EXTS.lock().unwrap().as_mut().unwrap().remove(&vtbl);
+    }
+
+    #[test]
+    fn heap_slot_10_is_the_block_standing_for_the_heap() {
+        assert_eq!(console_slots(Kind::Heap), vec![(10, heap_gpu_base_x as usize)]);
+        let with_block = 0x7300_0001usize;
+        HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            with_block,
+            HeapUma { size: 0x1_0000, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: Some(0x6_0000_0000) },
+        );
+        unsafe {
+            assert_eq!(heap_gpu_base_x(with_block as *mut c_void), 0x6_0000_0000);
+            // not a heap that takes a block: 0
+            assert_eq!(heap_gpu_base_x(0x7300_0003 as *mut c_void), 0);
+        }
+        HEAP_UMA.lock().unwrap().as_mut().unwrap().remove(&with_block);
     }
 }
 
