@@ -46,6 +46,7 @@ pub enum State {
 
 static STATE: OnceLock<State> = OnceLock::new();
 static DEBUG_LAYER: OnceLock<Result<(), String>> = OnceLock::new();
+static GPU_VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Candidate directories in search order.
 pub(crate) fn candidates(env_override: Option<PathBuf>, exe_dir: Option<PathBuf>, local_app_data: Option<PathBuf>) -> Vec<PathBuf> {
@@ -363,6 +364,26 @@ pub fn enable_debug_layer() -> &'static Result<(), String> {
     DEBUG_LAYER.get_or_init(|| {
         let debug = configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug).map_err(|e| e.to_string())?;
         unsafe { debug.EnableDebugLayer() };
+        Ok(())
+    })
+}
+
+/// Enable the debug layer with GPU-based validation at most once per process (`ID3D12Debug1`).
+/// GBV adds shader-side checks the plain debug layer and DRED miss – out-of-bounds UAV or
+/// descriptor access, `SetMeshOutputCounts` past the declared maximum, resource-state and
+/// RT/DSV-format mismatches – reported as a validation message and often a controlled device
+/// removal that names the call. It must run before the first device is created and makes draws
+/// much slower, so it is opt-in (`XCL_D3D12_GBV`). Enabling it after a device exists would
+/// remove that device, as with the plain debug layer.
+pub fn enable_gpu_based_validation() -> &'static Result<(), String> {
+    GPU_VALIDATION.get_or_init(|| {
+        let debug = configuration_interface::<ID3D12Debug1>(&CLSID_D3D12Debug).map_err(|e| e.to_string())?;
+        // SAFETY: `debug` is a valid `ID3D12Debug1`; both calls configure process-wide debug
+        // state and must precede device creation (the callers gate on that).
+        unsafe {
+            debug.EnableDebugLayer();
+            debug.SetEnableGPUBasedValidation(true);
+        }
         Ok(())
     })
 }

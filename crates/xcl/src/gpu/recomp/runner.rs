@@ -89,6 +89,10 @@ fn init() -> Result<Gpu, String> {
             // The debug layer must be enabled before this runner creates a device.
             let _ = crate::gpu::agility::enable_debug_layer();
         }
+        if std::env::var_os("XCL_D3D12_GBV").is_some() {
+            // GPU-based validation (shader-side checks); also before device creation.
+            let _ = crate::gpu::agility::enable_gpu_based_validation();
+        }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");

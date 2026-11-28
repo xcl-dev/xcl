@@ -370,6 +370,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- With `XCL_D3D12_GBV=1`, the D3D12 debug layer runs with GPU-based validation: shader-side
+  checks (out-of-bounds UAV/descriptor access, mesh output counts past the declared maximum,
+  resource-state and render-target/depth format mismatches) that the plain debug layer and DRED
+  miss, written to `xcl.log`. It needs the Agility SDK `D3D12SDKLayers.dll` next to `D3D12Core.dll`
+  and makes draws much slower.
 - `XCL_TEXTURE_LEVEL_PAGES=1` gives sampled title textures backing as their mip levels stream in.
   Zero-filled mip uploads in a batch share one staging span and still clear any mapped tiles.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib

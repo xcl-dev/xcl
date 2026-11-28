@@ -805,6 +805,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             crate::gpu::agility::State::NotFound => {}
         }
         let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
+        let gbv = std::env::var_os("XCL_D3D12_GBV").is_some();
         if debug {
             match crate::gpu::agility::enable_debug_layer() {
                 Ok(()) => {
@@ -813,6 +814,15 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 Err(e) => {
                     crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
                 }
+            }
+        }
+        // `XCL_D3D12_GBV=1`: GPU-based validation (shader-side bounds/state/format checks the
+        // debug layer and DRED miss). Much slower, and like the debug layer it must be set
+        // before the device is created.
+        if gbv {
+            match crate::gpu::agility::enable_gpu_based_validation() {
+                Ok(()) => crate::xlog_info!("D3D12: GPU-based validation enabled (draws will be slow)"),
+                Err(e) => crate::xlog_warn!("D3D12: GPU-based validation requested but unavailable: {e}"),
             }
         }
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
@@ -863,8 +873,8 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         };
         driver_cache::note_vendor(vendor);
         ADAPTER_VENDOR.store(vendor, Ordering::Release);
-        if debug {
-            // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
+        if debug || gbv {
+            // the debug layer's / GBV messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
                 let mut cookie = 0u32;
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
