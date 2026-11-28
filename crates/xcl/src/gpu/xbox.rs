@@ -336,6 +336,11 @@ fn analyze_fssm(f: &mut Fssm) {
     if f.code.is_none() {
         f.code = scan_code_region(d);
     }
+    if f.code_from_header && f.version == 0x101 && ps_exports_patched() {
+        if let Some((o, l)) = f.code {
+            patch_ps_exports(&mut f.data, o, l);
+        }
+    }
     if let Some((o, l)) = f.code {
         let code = &f.data[o..o + l];
         // Segments end at s_endpgm. One that is linked to the previous program by a
@@ -369,6 +374,63 @@ fn analyze_fssm(f: &mut Fssm) {
             }
         }
     }
+}
+
+/// `XCL_PS_EXPORT_PATCH=0` leaves pixel shaders' render-target exports as the compiler stored them.
+fn ps_exports_patched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_PS_EXPORT_PATCH").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Size of one render target's entry in a pixel shader's export patch table: its code offset
+/// (dwords, `u32::MAX`: no export), then ten variants of ten dwords.
+const EXPORT_PATCH_BYTES: usize = 4 + 10 * 10 * 4;
+/// The variant that exports every channel as a raw 32-bit value (SPI_SHADER_32_ABGR).
+const EXPORT_PATCH_32_ABGR: usize = 9;
+
+/// A pixel shader's render-target exports are stored for one export format (the compiler's
+/// default, FP16: `v_cvt_pkrtz_f16_f32` and a compressed `exp`). The console patches them at
+/// pipeline creation for each target's format from a table in the PS stage data: per render
+/// target, the code offset and the export code for each of the ten SPI_SHADER_COL_FORMAT
+/// values (ZERO, 32_R, 32_GR, 32_AR, FP16_ABGR, UNORM16, SNORM16, UINT16, SINT16, 32_ABGR).
+/// Left unpatched, a target of 32 bits a channel gets the FP16 conversion of its value: a
+/// packed R32_UINT lighting target held `f16(asfloat(bits))` (0x7BFF where the packed value
+/// was large) instead of its bits. Every target is patched to 32_ABGR: the channels leave the
+/// shader unconverted and the PC target converts them, which is right for every PC format.
+/// Layout (payload = FSSM + 0x10): payload + 0x30 the PS record offset (0xDEADBEEF… when the
+/// FSSM has no PS); stage data E = record + 0x54; E + 0x148 the patch size in dwords; E + 0x14C
+/// eight entries of `EXPORT_PATCH_BYTES`. Layout as documented by VIctory
+/// (https://github.com/Marvisak/VIctory, crates/victory-shader/src/native.rs, GPL-3.0; the same
+/// in its VIctory-NVIDIA fork), checked against a retail pack's pixel shaders; the code here is
+/// written independently. Returns the number of exports patched.
+fn patch_ps_exports(d: &mut [u8], code_at: usize, code_len: usize) -> usize {
+    let Some(record) = rd64(d, 0x10 + 0x30) else { return 0 };
+    if record == 0xDEAD_BEEF_DEAD_BEEF {
+        return 0;
+    }
+    let Some(e) = usize::try_from(record).ok().and_then(|r| r.checked_add(0x10 + 0x54)) else { return 0 };
+    let Some(size) = rd32(d, e + 0x148).map(|n| n as usize) else { return 0 };
+    if size == 0 || size > 10 {
+        return 0;
+    }
+    let mut patched = 0;
+    for mrt in 0..8 {
+        let at = e + 0x14C + mrt * EXPORT_PATCH_BYTES;
+        let Some(offset) = rd32(d, at) else { break };
+        if offset == u32::MAX || (offset as usize + size) * 4 > code_len {
+            continue;
+        }
+        let src = at + 4 + EXPORT_PATCH_32_ABGR * 40;
+        let Some(words) = d.get(src..src + size * 4).map(<[u8]>::to_vec) else { continue };
+        // a variant that is all zeros was not filled in: keep the code as it is
+        if words.iter().all(|&b| b == 0) {
+            continue;
+        }
+        let dst = code_at + offset as usize * 4;
+        d[dst..dst + size * 4].copy_from_slice(&words);
+        patched += 1;
+    }
+    patched
 }
 
 /// Static branch targets of a code segment (PCs in the same space as `pc`), far jumps included.
@@ -1071,5 +1133,80 @@ mod merged_es_tests {
         assert_eq!(segs.len(), 1);
         assert_eq!((segs[0].offset, segs[0].len), (0, 8));
         assert!(is_setpc(0xBE80_2020) && !is_setpc(S_ENDPGM));
+    }
+}
+
+#[cfg(test)]
+mod ps_export_patch_tests {
+    use super::*;
+
+    /// An FSSM-shaped buffer: the PS record at payload 0xB0 (data 0xC0), its patch table with
+    /// MRT 0 at code dword 1 and MRT 1 absent, 3 dwords a variant; code at data 0x1000.
+    fn fssm_with_patch(size: u32, abgr: [u32; 3]) -> (Vec<u8>, usize) {
+        let mut d = vec![0u8; 0x1100];
+        let put = |d: &mut Vec<u8>, at: usize, w: u32| d[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        d[0x40..0x48].copy_from_slice(&0xB0u64.to_le_bytes());
+        let e = 0xC0 + 0x54;
+        put(&mut d, e + 0x148, size);
+        let mrt0 = e + 0x14C;
+        put(&mut d, mrt0, 1);
+        // variant 4 (FP16, what the code holds) and variant 9 (32_ABGR)
+        for (k, w) in [0x5E04_170Eu32, 0xBF80_0000, 0xF800_040F].iter().enumerate() {
+            put(&mut d, mrt0 + 4 + 4 * 40 + 4 * k, *w);
+        }
+        for (k, w) in abgr.iter().enumerate() {
+            put(&mut d, mrt0 + 4 + 9 * 40 + 4 * k, *w);
+        }
+        put(&mut d, mrt0 + EXPORT_PATCH_BYTES, u32::MAX);
+        for m in 2..8 {
+            put(&mut d, mrt0 + m * EXPORT_PATCH_BYTES, u32::MAX);
+        }
+        // code: s_nop, then the FP16 export sequence, then s_endpgm
+        for (k, w) in [0xBF80_0000u32, 0x5E04_170E, 0xBF80_0000, 0xF800_040F, S_ENDPGM].iter().enumerate() {
+            put(&mut d, 0x1000 + 4 * k, *w);
+        }
+        (d, 0x1000)
+    }
+
+    fn word(d: &[u8], at: usize) -> u32 {
+        rd32(d, at).unwrap()
+    }
+
+    #[test]
+    fn each_target_gets_the_32_abgr_export() {
+        let abgr = [0xBF80_0000, 0xF800_000F, 0x0910_0B0E];
+        let (mut d, code) = fssm_with_patch(3, abgr);
+        assert_eq!(patch_ps_exports(&mut d, code, 0x14), 1);
+        assert_eq!([word(&d, code + 4), word(&d, code + 8), word(&d, code + 12)], abgr);
+        // the dwords around the patch are left alone
+        assert_eq!((word(&d, code), word(&d, code + 16)), (0xBF80_0000, S_ENDPGM));
+    }
+
+    #[test]
+    fn implausible_tables_change_nothing() {
+        let abgr = [0xBF80_0000, 0xF800_000F, 0x0910_0B0E];
+        // no PS record
+        let (mut d, code) = fssm_with_patch(3, abgr);
+        d[0x40..0x48].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+        let before = d.clone();
+        assert_eq!(patch_ps_exports(&mut d, code, 0x14), 0);
+        assert_eq!(d, before);
+        // a patch size over ten dwords, or zero
+        for size in [0, 11] {
+            let (mut d, code) = fssm_with_patch(size, abgr);
+            let before = d.clone();
+            assert_eq!(patch_ps_exports(&mut d, code, 0x14), 0);
+            assert_eq!(d, before);
+        }
+        // a patch running past the end of the code
+        let (mut d, code) = fssm_with_patch(3, abgr);
+        let before = d.clone();
+        assert_eq!(patch_ps_exports(&mut d, code, 0x0C), 0);
+        assert_eq!(d, before);
+        // a 32_ABGR variant left empty
+        let (mut d, code) = fssm_with_patch(3, [0; 3]);
+        let before = d.clone();
+        assert_eq!(patch_ps_exports(&mut d, code, 0x14), 0);
+        assert_eq!(d, before);
     }
 }

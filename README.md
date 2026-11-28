@@ -393,6 +393,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- Pixel shaders get the render-target export patches the console applies at pipeline creation:
+  every target exports 32 bits a channel, and the PC target converts. Without them a 32-bit target
+  (a packed `R32_UINT` lighting target) got the FP16 conversion of its values. `XCL_PS_EXPORT_PATCH=0`
+  keeps the exports as stored.
 - `XCL_TEXTURE_LEVEL_PAGES=1` gives sampled title textures backing as their mip levels stream in.
   Zero-filled mip uploads in a batch share one staging span and still clear any mapped tiles.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
