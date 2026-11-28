@@ -3229,12 +3229,22 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 /// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
 /// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
 /// calls and only unreadable pages are zeroed.
-unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+pub(super) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+    copy_committed(src, dst, len, true)
+}
+
+/// `copy_committed_region`, but a page that cannot be read keeps what `dst` holds (the per-draw
+/// mirror sync compares it with the mirror's bytes: a page the title freed keeps the mirror's).
+pub(super) unsafe fn copy_committed_pages(src: usize, dst: *mut u8, len: usize) {
+    copy_committed(src, dst, len, false)
+}
+
+unsafe fn copy_committed(src: usize, dst: *mut u8, len: usize, zero: bool) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const PAGE: usize = 0x1000;
 
-    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) {
+    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize, zero: bool) {
         if len == 0 {
             return;
         }
@@ -3248,16 +3258,18 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
         let len = len - read;
         let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
         if page_end == src + len {
-            std::ptr::write_bytes(dst, 0, len);
+            if zero {
+                std::ptr::write_bytes(dst, 0, len);
+            }
             return;
         }
         let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
         let left = mid - src;
-        copy_rec(proc, src, dst, left);
-        copy_rec(proc, mid, dst.add(left), len - left);
+        copy_rec(proc, src, dst, left, zero);
+        copy_rec(proc, mid, dst.add(left), len - left, zero);
     }
 
-    copy_rec(GetCurrentProcess(), src, dst, len);
+    copy_rec(GetCurrentProcess(), src, dst, len, zero);
 }
 
 /// The bytes at `at` into `to` in one read, all zeros when it fails: for memory committed whole
