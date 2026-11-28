@@ -7671,8 +7671,72 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     }
 }
 
+/// A console title's pipeline-state flags as the PC's. The console's enum is not the PC's: its
+/// TOOL_DEBUG is 0x8000_0000, it has 0x8000 / 0x10_0000 / 0x20_0000 / 0x40_0000 of its own and
+/// no 0x4 (dynamic depth bias) or 0x8 (dynamic strip cut): XCL adds 0x4 itself, so a title's 0x4
+/// / 0x8 is not a request for it. Only 0x1 (the console's meaning is not known) passes; any other
+/// bit is logged once and dropped. Applied where a title's desc or stream becomes a PC one,
+/// before the driver-cache key is formed.
+pub(super) fn pc_pso_flags(console: u32) -> u32 {
+    const PASS: u32 = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG.0 as u32;
+    const CONSOLE_ONLY: u32 = 0x8000 | 0x10_0000 | 0x20_0000 | 0x40_0000 | 0x8000_0000 | 0x4 | 0x8;
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let unknown = console & !(PASS | CONSOLE_ONLY);
+    if unknown != 0 {
+        let new = unknown & !SEEN.fetch_or(unknown, Ordering::Relaxed);
+        if new != 0 {
+            crate::xlog_warn!("D3D12.X: pipeline state flags {console:#x}: unknown bits {new:#x} dropped");
+        }
+    }
+    console & PASS
+}
+
+/// `desc` (a compute pipeline desc) with `pc_pso_flags` applied, when that changes it.
+unsafe fn pc_compute_desc_flags(desc: *const c_void) -> Option<D3D12_COMPUTE_PIPELINE_STATE_DESC> {
+    if desc.is_null() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let pc = pc_pso_flags(copy.Flags.0 as u32) as i32;
+    if pc == copy.Flags.0 {
+        return None;
+    }
+    copy.Flags = D3D12_PIPELINE_STATE_FLAGS(pc);
+    Some(copy)
+}
+
+/// The bytes of a pipeline stream with the FLAGS subobject (20) mapped by `pc_pso_flags`, when
+/// that changes it.
+fn pc_stream_flags_bytes(buf: &[u8]) -> Option<Vec<u8>> {
+    let subs = known_subobjects(buf);
+    let (_, p) = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS.0 as u32 && s.1.len() == 4)?;
+    let off = p.as_ptr() as usize - buf.as_ptr() as usize;
+    let console = u32::from_le_bytes((*p).try_into().ok()?);
+    let pc = pc_pso_flags(console);
+    if pc == console {
+        return None;
+    }
+    let mut out = buf.to_vec();
+    out[off..off + 4].copy_from_slice(&pc.to_le_bytes());
+    Some(out)
+}
+
+/// A title's pipeline stream (`desc`: { size, pointer }) with `pc_pso_flags` applied.
+unsafe fn pc_stream_flags(desc: *const c_void) -> Option<Vec<u8>> {
+    if desc.is_null() || !crate::gpu::shader::readable(desc as usize, 16) {
+        return None;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return None;
+    }
+    pc_stream_flags_bytes(std::slice::from_raw_parts(base as *const u8, size))
+}
+
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
+    let pc = pc_compute_desc_flags(desc);
+    let desc = pc.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
@@ -9387,6 +9451,9 @@ fn subobjects_have_unreadable_shader(subs: &[(u32, &[u8])]) -> bool {
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
+    let pc_stream = pc_stream_flags(desc);
+    let pc_header = pc_stream.as_ref().map(|s| [s.len(), s.as_ptr() as usize]);
+    let desc = pc_header.as_ref().map_or(desc, |h| h.as_ptr() as *const c_void);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
     if missed {
@@ -10214,6 +10281,81 @@ mod submission_timing_tests {
         assert_eq!(slow_submission_us_value(Some("0")), 0);
         assert_eq!(slow_submission_us_value(Some("17")), 17_000);
         assert_eq!(slow_submission_us_value(Some("18446744073709551615")), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod pso_flags_tests {
+    use super::*;
+
+    #[test]
+    fn console_only_bits_do_not_reach_the_pc() {
+        for bit in [0x8000u32, 0x10_0000, 0x20_0000, 0x40_0000, 0x8000_0000, 0x4, 0x8] {
+            assert_eq!(pc_pso_flags(bit), 0, "console bit {bit:#x}");
+        }
+        assert_eq!(pc_pso_flags(0), 0);
+        assert_eq!(pc_pso_flags(0x10_0000 | 0x8000_0000), 0);
+        assert_eq!(pc_pso_flags(0x8000 | 0x20_0000 | 0x40_0000 | 0x4 | 0x8), 0);
+        // an unknown bit is dropped too (and logged once)
+        assert_eq!(pc_pso_flags(0x2_0000), 0);
+        assert_eq!(pc_pso_flags(0x2_0000 | 0x1), 0x1);
+    }
+
+    #[test]
+    fn stream_flags_subobject_is_mapped() {
+        // { FLAGS (20), 0x8000_0000 | 0x4 } then { NODE_MASK (18), 3 }
+        let mut s = Vec::new();
+        for (ty, v) in [(20u32, 0x8000_0004u32), (18, 3)] {
+            s.extend_from_slice(&ty.to_le_bytes());
+            s.extend_from_slice(&v.to_le_bytes());
+        }
+        let out = pc_stream_flags_bytes(&s).expect("console bits must change the stream");
+        assert_eq!(out.len(), s.len());
+        assert_eq!(&out[4..8], &0u32.to_le_bytes());
+        assert_eq!(&out[8..], &s[8..], "the other subobjects stay as they are");
+        assert!(pc_stream_flags_bytes(&out).is_none(), "PC flags are left alone");
+        assert!(pc_stream_flags_bytes(&s[8..]).is_none(), "no FLAGS subobject");
+    }
+
+    #[test]
+    fn compute_desc_flags_are_mapped() {
+        let mut d = D3D12_COMPUTE_PIPELINE_STATE_DESC { Flags: D3D12_PIPELINE_STATE_FLAGS((0x10_0000 | 0x8000_0000u32) as i32), ..Default::default() };
+        let pc = unsafe { pc_compute_desc_flags(&d as *const _ as *const c_void) }.expect("console bits must change the desc");
+        assert_eq!(pc.Flags.0, 0);
+        d.Flags = D3D12_PIPELINE_STATE_FLAGS(0);
+        assert!(unsafe { pc_compute_desc_flags(&d as *const _ as *const c_void) }.is_none());
+    }
+
+    /// A console compute desc with flags 0x10_0000 | 0x8000_0000 creates a PSO through the hooked
+    /// device (the PC runtime refuses the console's values).
+    #[test]
+    fn console_compute_flags_create_a_pso_on_d3d12() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() || dev.is_none() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            adopt(dev.as_raw(), Kind::Device);
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature");
+            let cs = dummy_cs_bytecode();
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                Flags: D3D12_PIPELINE_STATE_FLAGS((0x10_0000 | 0x8000_0000u32) as i32),
+                ..Default::default()
+            };
+            let pso = dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc);
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+            pso.expect("a console compute desc with console-only flags must create a PSO");
+        }
     }
 }
 

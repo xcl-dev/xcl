@@ -203,6 +203,9 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
 /// device supports it (retrying without the flag if creation fails), and record it as a base.
 unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // the title's flags as the PC's first: the 0x4 below is XCL's own request, not the title's
+    let pc = pc_gfx_desc_flags(desc);
+    let desc = pc.as_ref().map_or(desc, |g| g.0.as_ptr() as *const c_void);
     let mut used_dynamic = false;
     let hr = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         let orig = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
@@ -229,6 +232,21 @@ unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, ri
         note_base(*ppv, desc, used_dynamic);
     }
     hr
+}
+
+/// `desc` (a title's graphics pipeline desc) with `real::pc_pso_flags` applied, when that changes it.
+unsafe fn pc_gfx_desc_flags(desc: *const c_void) -> Option<GfxDesc> {
+    if desc.is_null() || !crate::gpu::shader::readable(desc as usize, GFX_DESC) {
+        return None;
+    }
+    let mut d = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
+    let console = rd32(&d.0, PSO_FLAGS);
+    let pc = real::pc_pso_flags(console);
+    if pc == console {
+        return None;
+    }
+    d.0[PSO_FLAGS..PSO_FLAGS + 4].copy_from_slice(&pc.to_le_bytes());
+    Some(d)
 }
 
 /// size of D3D12_GRAPHICS_PIPELINE_STATE_DESC
