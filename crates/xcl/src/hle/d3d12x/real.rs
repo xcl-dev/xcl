@@ -944,6 +944,9 @@ struct Class {
     iface: &'static Iface,
     public: usize,
     scanned: usize,
+    /// The runtime methods copied into `ext`, for a vtable outside any module: Agility SDK 1.620+
+    /// frees an open command list's heap vtable with the list, and another's can take its address.
+    copied: Option<Box<[usize]>>,
 }
 
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
@@ -973,6 +976,7 @@ pub(super) fn test_command_list_class(orig: usize, ext: usize) -> TestCommandLis
         iface,
         public: iface.methods.len(),
         scanned: iface.methods.len(),
+        copied: None,
     });
     TestCommandListClass { ext }
 }
@@ -1157,10 +1161,11 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
-    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind) {
+    let ot = orig as *const usize;
+    let same_methods = |c: &Class| c.copied.as_ref().is_none_or(|m| m.iter().enumerate().all(|(i, &f)| *ot.add(i) == f));
+    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind && same_methods(c)) {
         return c.ext;
     }
-    let ot = orig as *const usize;
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
@@ -1272,7 +1277,8 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         scanned - public,
         crate::modules::describe_address(orig)
     );
-    CLASSES.lock().unwrap().push(Class { orig, kind, ext, iface, public, scanned });
+    let copied = (module_of(orig) == 0).then(|| (0..scanned).map(|i| *ot.add(i)).collect());
+    CLASSES.lock().unwrap().push(Class { orig, kind, ext, iface, public, scanned, copied });
     ext
 }
 
@@ -11675,6 +11681,7 @@ mod mesh_stream_tests {
             iface,
             public: iface.methods.len(),
             scanned: iface.methods.len(),
+            copied: None,
         });
         {
             let mut roots = ABI_RS_SAMPLERS.lock().unwrap();
@@ -12415,3 +12422,75 @@ mod heap_release_order_tests {
     }
 }
 
+#[cfg(test)]
+mod class_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn a_direct_list_at_a_released_compute_lists_vtable_records_with_its_own_methods() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            adopt(dev.as_raw(), Kind::Device);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let clear = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_D32_FLOAT, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 } } };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut depth: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, Some(&clear), &mut depth).unwrap();
+            let dsv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() }).unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateDepthStencilView(depth.as_ref().unwrap(), None, dsv);
+            let compute_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let direct_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let runtime_vtable = |l: &ID3D12GraphicsCommandList| {
+                let v = vt(l.as_raw());
+                if is_ext(v as usize) { *v.sub(1) } else { v as usize }
+            };
+            // the only class of `c` is one made from the methods there now
+            let made_from_now = |c: usize| {
+                let classes = CLASSES.lock().unwrap();
+                let mut of_c = classes.iter().filter(|k| k.orig == c && k.kind == Kind::CommandList);
+                match (of_c.next(), of_c.next()) {
+                    (Some(k), None) => k.copied.as_ref().is_some_and(|m| m.iter().enumerate().all(|(i, &f)| *(c as *const usize).add(i) == f)),
+                    _ => false,
+                }
+            };
+            let mut compute_made = HashSet::new();
+            for _ in 0..200 {
+                let compute: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &compute_alloc, None).unwrap();
+                let c = runtime_vtable(&compute);
+                if made_from_now(c) {
+                    compute_made.insert(c);
+                }
+                compute.Close().unwrap();
+                drop(compute);
+                compute_alloc.Reset().unwrap();
+
+                let direct: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &direct_alloc, None).unwrap();
+                let d = runtime_vtable(&direct);
+                if compute_made.contains(&d) {
+                    direct.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                    assert!(direct.Close().is_ok(), "ClearDepthStencilView of a direct list at a compute list's vtable {d:#x} failed its Close");
+                    return;
+                }
+                direct.Close().unwrap();
+                drop(direct);
+                direct_alloc.Reset().unwrap();
+            }
+        }
+        crate::gpu::recomp::runner::skip_test("no direct list got a released compute list's vtable");
+    }
+}
