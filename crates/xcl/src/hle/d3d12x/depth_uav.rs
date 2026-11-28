@@ -889,7 +889,7 @@ pub(super) unsafe fn dsv_ranges_copied(dev: *mut c_void, nd: u32, dsts: *const u
 }
 
 /// Destination and source ranges cut where either one ends: (dst, src, n) runs.
-fn pieces(dsts: &[(u64, u32)], srcs: &[(u64, u32)], inc: u64) -> Vec<(u64, u64, u32)> {
+pub(super) fn pieces(dsts: &[(u64, u32)], srcs: &[(u64, u32)], inc: u64) -> Vec<(u64, u64, u32)> {
     let (mut out, mut d, mut s, mut dk, mut sk) = (Vec::new(), 0, 0, 0u32, 0u32);
     while d < dsts.len() && s < srcs.len() {
         let n = (dsts[d].1 - dk).min(srcs[s].1 - sk);

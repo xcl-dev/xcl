@@ -228,6 +228,27 @@ pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
     }
 }
 
+/// `n` RTVs copied from `src` to `dst` (handles `inc` apart): each destination names the resource
+/// its source names, or none.
+pub(super) unsafe fn rtvs_copied(n: u32, dst: u64, src: u64, inc: u64) {
+    let mut g = RTVS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    for k in 0..n as u64 {
+        let (to, from) = ((dst + k * inc) as usize, (src + k * inc) as usize);
+        let res = m.get(&from).copied();
+        if let Some(r) = res {
+            add_ref(r);
+        }
+        let old = match res {
+            Some(r) => m.insert(to, r),
+            None => m.remove(&to),
+        };
+        if let Some(o) = old {
+            release(o);
+        }
+    }
+}
+
 /// `XCL_TRACE_FRAME=1`: what console code does with each resource it later presents –
 /// render-target binds, UAV views, copy destinations, clears (logged at the first presents)
 static USES: Mutex<Option<HashMap<usize, [u64; 4]>>> = Mutex::new(None);
