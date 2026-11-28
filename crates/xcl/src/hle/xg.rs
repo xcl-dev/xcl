@@ -44,7 +44,17 @@ const PLANE_BYTES: usize = MIP + 15 * MIP_BYTES;
 const MAX_MIPS: usize = 15;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![XGCreateTextureComputer, XGSuggestSwizzleMode]
+    crate::hle_exports![
+        XGCreateTextureComputer, XGSuggestSwizzleMode,
+        XGCreateTexture1DComputer, XGCreateTexture2DComputer, XGCreateTexture3DComputer,
+        XGComputeTexture1DLayout, XGComputeTexture2DLayout, XGComputeTexture3DLayout,
+        XGComputeBufferLayout, XGCreateTextureComputerFromDescriptor, XGComputeTileShape,
+        XGComputeOptimalSwizzleMode, XGComputeOptimalDepthStencilSwizzleMode, XGValidateDepthStencilSwizzleMode,
+        XGInitializeLibrary, XGTerminateLibrary, XGSetHardwareVersion,
+        XGEnableExclusiveLocking, XGEnterExclusiveLock, XGLeaveExclusiveLock,
+        XGEncodeDCC, XGDecodeDCC, XGValidateDescriptor, XGShuffleTextureBufferForDirectStorage,
+        XGCreateBVHComputer, XGCreateBVHComputer2,
+    ]
 }
 
 /// The swizzle mode the console's library picks for a 2D texture with `Layout` 0 / 2: 64KB_D
@@ -499,7 +509,13 @@ fn vtbl() -> &'static [usize] {
             copy_from as usize,
             get_resource_tiling as usize,
         ];
-        for i in v.len()..12 {
+        // #11 texture-view descriptor getter, #12 IsTiledResource (a bool: the generic stub's
+        // E_NOTIMPL would read as true), #13 swizzle-pattern info getter
+        for i in v.len()..14 {
+            if i == 12 {
+                v.push(is_tiled_resource as usize);
+                continue;
+            }
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
             v.push(stub);
         }
@@ -561,6 +577,290 @@ pub unsafe extern "system" fn XGCreateTextureComputer(desc: *const u8, out: *mut
     }
 }
 
+/// The older, D3D11-shaped texture descs (u32 fields) of `XGCreateTexture1D/2D/3DComputer` and
+/// `XGComputeTexture1D/2D/3DLayout`, as the D3D12-shaped desc `Texture::new` takes.
+/// 2D: width, height, mips, array, format, samples, quality, usage, bind, CPU access, misc,
+/// swizzle mode, pitch; 1D: without height and the two sample fields; 3D: depth for the array,
+/// no sample fields. Bind: render target 0x20, depth 0x40, UAV 0x80; misc 0x4: a cube. The mode
+/// is explicit (0 linear, 1–31); a requested pitch (≠ 0) is not modelled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OldDesc {
+    D1,
+    D2,
+    D3,
+}
+
+const MISC_CUBE: u32 = 0x4;
+
+/// D3D11 bind flags → D3D12_RESOURCE_FLAGS (render target, depth-stencil, UAV)
+fn resource_flags(bind: u32) -> u32 {
+    (bind & 0x20 != 0) as u32 | ((bind & 0x40 != 0) as u32) << 1 | ((bind & 0x80 != 0) as u32) << 2
+}
+
+/// A D3D12_RESOURCE_DESC (0x38 bytes) as `Texture::new` reads it.
+fn d3d12_desc(dim: u32, width: u64, height: u32, depth_or_array: u32, mips: u32, format: u32, samples: u32, layout: u32, flags: u32) -> Result<[u8; 0x38], HRESULT> {
+    let (Ok(depth_or_array), Ok(mips)) = (u16::try_from(depth_or_array), u16::try_from(mips)) else { return Err(E_INVALIDARG) };
+    let mut d = [0u8; 0x38];
+    d[0..4].copy_from_slice(&dim.to_le_bytes());
+    d[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+    d[0x18..0x1C].copy_from_slice(&height.to_le_bytes());
+    d[0x1C..0x1E].copy_from_slice(&depth_or_array.to_le_bytes());
+    d[0x1E..0x20].copy_from_slice(&mips.to_le_bytes());
+    d[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+    d[0x24..0x28].copy_from_slice(&samples.max(1).to_le_bytes());
+    d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+    Ok(d)
+}
+
+unsafe fn old_desc(kind: OldDesc, p: *const u32) -> Result<[u8; 0x38], HRESULT> {
+    if p.is_null() {
+        return Err(E_POINTER);
+    }
+    let f = |i: usize| p.add(i).read_unaligned();
+    // (dimension, width, height, depth or array, mips, format, samples, bind, misc, mode, pitch)
+    let (dim, w, h, n, mips, format, samples, bind, misc, mode, pitch) = match kind {
+        OldDesc::D1 => (2, f(0), 1, f(2), f(1), f(3), 1, f(5), f(7), f(8), f(9)),
+        OldDesc::D2 => (3, f(0), f(1), f(3), f(2), f(4), f(5), f(8), f(10), f(11), f(12)),
+        OldDesc::D3 => (4, f(0), f(1), f(2), f(3), f(4), 1, f(6), f(8), f(9), f(10)),
+    };
+    if mode > 0x1F {
+        return Err(E_INVALIDARG);
+    }
+    if pitch != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("xg: a texture desc with a requested pitch ({pitch}) is not modelled"));
+        return Err(E_NOTIMPL);
+    }
+    let cube = kind == OldDesc::D2 && misc & MISC_CUBE != 0;
+    let n = if cube { n.checked_mul(6).ok_or(E_INVALIDARG)? } else { n };
+    d3d12_desc(dim, w as u64, h, n, mips, format, samples, 0x100 | mode, resource_flags(bind))
+}
+
+unsafe fn old_desc_computer(kind: OldDesc, desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = std::ptr::null_mut();
+    match old_desc(kind, desc) {
+        Ok(d) => XGCreateTextureComputer(d.as_ptr(), out),
+        Err(hr) => hr,
+    }
+}
+
+unsafe fn old_desc_layout(kind: OldDesc, desc: *const u32, out: *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match old_desc(kind, desc).and_then(|d| Texture::new(&d)) {
+        Ok(t) => {
+            t.write(&mut *(out as *mut [u8; LAYOUT_BYTES]));
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+/// `HRESULT XGCreateTexture1DComputer(const XG_TEXTURE1D_DESC*, XGTextureAddressComputer**)`
+pub unsafe extern "system" fn XGCreateTexture1DComputer(desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    old_desc_computer(OldDesc::D1, desc, out)
+}
+
+/// `HRESULT XGCreateTexture2DComputer(const XG_TEXTURE2D_DESC*, XGTextureAddressComputer**)`
+pub unsafe extern "system" fn XGCreateTexture2DComputer(desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    old_desc_computer(OldDesc::D2, desc, out)
+}
+
+/// `HRESULT XGCreateTexture3DComputer(const XG_TEXTURE3D_DESC*, XGTextureAddressComputer**)`
+pub unsafe extern "system" fn XGCreateTexture3DComputer(desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    old_desc_computer(OldDesc::D3, desc, out)
+}
+
+/// `HRESULT XGComputeTexture1DLayout(const XG_TEXTURE1D_DESC*, XG_RESOURCE_LAYOUT*)`
+pub unsafe extern "system" fn XGComputeTexture1DLayout(desc: *const u32, out: *mut u8) -> HRESULT {
+    old_desc_layout(OldDesc::D1, desc, out)
+}
+
+/// `HRESULT XGComputeTexture2DLayout(const XG_TEXTURE2D_DESC*, XG_RESOURCE_LAYOUT*)`
+pub unsafe extern "system" fn XGComputeTexture2DLayout(desc: *const u32, out: *mut u8) -> HRESULT {
+    old_desc_layout(OldDesc::D2, desc, out)
+}
+
+/// `HRESULT XGComputeTexture3DLayout(const XG_TEXTURE3D_DESC*, XG_RESOURCE_LAYOUT*)`
+pub unsafe extern "system" fn XGComputeTexture3DLayout(desc: *const u32, out: *mut u8) -> HRESULT {
+    old_desc_layout(OldDesc::D3, desc, out)
+}
+
+/// `HRESULT XGComputeBufferLayout(const XG_BUFFER_DESC*, XG_RESOURCE_LAYOUT*)` (desc: byte
+/// width, usage, bind, CPU access, misc, structure stride): one linear plane and level of the
+/// byte width, 256-byte aligned (the alignment is not checked against the console's library).
+pub unsafe extern "system" fn XGComputeBufferLayout(desc: *const u32, out: *mut u8) -> HRESULT {
+    if desc.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    let bytes = desc.read_unaligned();
+    let b = &mut *(out as *mut [u8; LAYOUT_BYTES]);
+    b.fill(0);
+    let q = |b: &mut [u8; LAYOUT_BYTES], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let w = |b: &mut [u8; LAYOUT_BYTES], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let (size, align) = (bytes as u64, 256u64);
+    q(b, 0, size);
+    q(b, 8, align);
+    w(b, 0x10, 1);
+    w(b, 0x14, 1);
+    w(b, 0x1B38, 1); // D3D12_RESOURCE_DIMENSION_BUFFER
+    let (pb, m) = (PLANE, PLANE + MIP);
+    w(b, pb, 1);
+    q(b, pb + 8, size);
+    q(b, pb + 0x10, size);
+    q(b, pb + 0x20, align);
+    w(b, pb + 0x28, 1);
+    q(b, m, size);
+    q(b, m + 0x10, size);
+    w(b, m + 0x18, bytes);
+    w(b, m + 0x1C, bytes);
+    w(b, m + 0x20, align as u32);
+    for o in [0x24, 0x30, 0x38] {
+        w(b, m + o, bytes);
+    }
+    for o in [0x28, 0x2C, 0x34, 0x3C, 0x40, 0x44, 0x60] {
+        w(b, m + o, 1);
+    }
+    S_OK
+}
+
+/// `HRESULT XGCreateTextureComputerFromDescriptor(const UINT32 descriptor[8], computer**)`: a
+/// hardware texture descriptor (T#) read with `gpu::desc`; E_INVALIDARG for anything else.
+pub unsafe extern "system" fn XGCreateTextureComputerFromDescriptor(words: *const [u32; 8], out: *mut *mut c_void) -> HRESULT {
+    if words.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    *out = std::ptr::null_mut();
+    let Some(t) = crate::gpu::desc::image(&words.read_unaligned()) else { return E_INVALIDARG };
+    let Some((r, _)) = crate::gpu::desc::image_d3d12(&t) else { return E_INVALIDARG };
+    match d3d12_desc(r.Dimension.0 as u32, r.Width, r.Height, r.DepthOrArraySize as u32, r.MipLevels as u32, r.Format.0 as u32, r.SampleDesc.Count, 0x100 | t.swizzle_mode, 0) {
+        Ok(d) => XGCreateTextureComputer(d.as_ptr(), out),
+        Err(hr) => hr,
+    }
+}
+
+/// `HRESULT XGComputeTileShape(dimension, format, bytes per element, samples, XG_TILE_SHAPE*
+/// texels, XG_TILE_SHAPE* elements)`: D3D12's standard 64 KiB tile shape (outputs optional; the
+/// texel shape is zeros for an unknown format).
+pub unsafe extern "system" fn XGComputeTileShape(dim: u32, format: u32, bpe: u32, samples: u32, texels: *mut [u32; 3], elements: *mut [u32; 3]) -> HRESULT {
+    let Some(shape) = tile_shape(dim, bpe, samples) else { return E_INVALIDARG };
+    if !elements.is_null() {
+        *elements = shape;
+    }
+    if !texels.is_null() {
+        *texels = match element(format) {
+            Some((_, side)) => [shape[0] * side, shape[1] * side, shape[2]],
+            None => [0; 3],
+        };
+    }
+    S_OK
+}
+
+/// D3D12's standard 64 KiB tile shape in elements (D3D12_RESOURCE_DIMENSION: 2 1D, 3 2D, 4 3D);
+/// each MSAA step halves the height, then the width.
+fn tile_shape(dim: u32, bpe: u32, samples: u32) -> Option<[u32; 3]> {
+    if !bpe.is_power_of_two() || bpe > 16 || !samples.max(1).is_power_of_two() || samples > 16 {
+        return None;
+    }
+    let e = bpe.trailing_zeros() as usize;
+    Some(match dim {
+        2 => [0x1_0000 / bpe, 1, 1],
+        3 => {
+            let (mut w, mut h) = ([256, 256, 128, 128, 64][e], [256, 128, 128, 64, 64][e]);
+            for k in 0..samples.max(1).trailing_zeros() {
+                if k % 2 == 0 { h /= 2 } else { w /= 2 }
+            }
+            [w, h, 1]
+        }
+        4 if samples <= 1 => [[64, 32, 32, 32, 16][e], [32, 32, 32, 16, 16][e], [32, 32, 16, 16, 16][e]],
+        _ => return None,
+    })
+}
+
+/// `XG_SWIZZLE_MODE XGComputeOptimalSwizzleMode(dimension, format, width, height, depth or
+/// array, samples, bind, misc)`: the mode `XGSuggestSwizzleMode` takes for the same texture.
+pub unsafe extern "system" fn XGComputeOptimalSwizzleMode(dim: u32, format: u32, width: u32, height: u32, depth_or_array: u32, samples: u32, bind: u32, misc: u32) -> u32 {
+    let n = if dim == 3 && misc & MISC_CUBE != 0 { depth_or_array.saturating_mul(6) } else { depth_or_array };
+    let Ok(d) = d3d12_desc(dim, width as u64, height.max(1), n.clamp(1, 0xFFFF), 1, format, samples, 0, resource_flags(bind)) else { return 0 };
+    let mut layout = 0u32;
+    if XGSuggestSwizzleMode(d.as_ptr(), 0, &mut layout) < 0 {
+        return 0;
+    }
+    layout & 0x1F
+}
+
+/// `HRESULT XGComputeOptimalDepthStencilSwizzleMode(format, width, height, depth, samples,
+/// compressed, tiled, texture-compatible, XG_SWIZZLE_MODE*)`: 64KB_Z_X, as depth buffers have.
+pub unsafe extern "system" fn XGComputeOptimalDepthStencilSwizzleMode(_format: u32, _w: u32, _h: u32, _depth: u32, _samples: u32, _compressed: u32, _tiled: u32, _texture: u32, out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = 0x18;
+    S_OK
+}
+
+/// `HRESULT XGValidateDepthStencilSwizzleMode(format, samples, mode)`: the Z modes.
+pub unsafe extern "system" fn XGValidateDepthStencilSwizzleMode(_format: u32, _samples: u32, mode: u32) -> HRESULT {
+    if matches!(mode, 4 | 8 | 0x10 | 0x14 | 0x18) { S_OK } else { E_FAIL }
+}
+
+static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `HRESULT XGInitializeLibrary()`: S_OK, S_FALSE when it already was.
+pub unsafe extern "system" fn XGInitializeLibrary() -> HRESULT {
+    if INITIALIZED.swap(true, Ordering::AcqRel) { crate::util::S_FALSE } else { S_OK }
+}
+
+/// `HRESULT XGTerminateLibrary()`: S_OK, S_FALSE when it was not initialized.
+pub unsafe extern "system" fn XGTerminateLibrary() -> HRESULT {
+    if INITIALIZED.swap(false, Ordering::AcqRel) { S_OK } else { crate::util::S_FALSE }
+}
+
+static HARDWARE_VERSION: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// `HRESULT XGSetHardwareVersion(version)` (4 Series S, 5 Series X, 6 devkit): recorded and
+/// logged once. The layouts keep the pipe configuration of the console XCL reports.
+pub unsafe extern "system" fn XGSetHardwareVersion(version: u32) -> HRESULT {
+    if HARDWARE_VERSION.swap(version, Ordering::Relaxed) == u32::MAX {
+        let series_s = crate::state::config().is_series_s();
+        let differs = if series_s { version != 4 } else { version == 4 };
+        crate::xlog_info!(
+            "xg: hardware version {version}{}",
+            if differs { format!(" – the layouts stay those of the {} XCL reports", if series_s { "Series S" } else { "Series X" }) } else { String::new() }
+        );
+    }
+    S_OK
+}
+
+/// `void XGEnableExclusiveLocking(BOOL)` / `void XGLeaveExclusiveLock()`: no locking.
+pub unsafe extern "system" fn XGEnableExclusiveLocking(_on: i32) {}
+
+pub unsafe extern "system" fn XGLeaveExclusiveLock() {}
+
+/// `BOOL XGEnterExclusiveLock()`: FALSE, locking is off.
+pub unsafe extern "system" fn XGEnterExclusiveLock() -> i32 {
+    0
+}
+
+/// Entry points no title is known to call: E_NOTIMPL and one log line each. Their arguments are
+/// not known well enough to null an output.
+macro_rules! xg_not_implemented {
+    ($($name:ident),*) => {$(
+        pub unsafe extern "system" fn $name() -> HRESULT {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!(concat!("xg: ", stringify!($name), " is not implemented")));
+            E_NOTIMPL
+        }
+    )*};
+}
+
+xg_not_implemented!(XGEncodeDCC, XGDecodeDCC, XGValidateDescriptor, XGShuffleTextureBufferForDirectStorage, XGCreateBVHComputer, XGCreateBVHComputer2);
+
 unsafe extern "system" fn add_ref(p: *mut c_void) -> u32 {
     (*(p as *const Computer)).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
@@ -608,6 +908,11 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
 
 unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
+}
+
+/// #12 `bool IsTiledResource()`: never – the computer does not model reserved textures.
+unsafe extern "system" fn is_tiled_resource(_p: *mut c_void) -> u8 {
+    0
 }
 
 /// #10 GetResourceTiling(&tiles, &packed mip info, &tile shape, &count, first subresource,
@@ -801,6 +1106,160 @@ mod tests {
                 assert_eq!(back7[row.clone()], lin[row], "7-argument form, row {y}");
             }
             release(c);
+        }
+    }
+
+    fn layout_of_computer(c: *mut c_void) -> Vec<u8> {
+        let mut b = vec![0xCDu8; LAYOUT_BYTES];
+        unsafe {
+            assert_eq!(get_resource_layout(c, b.as_mut_ptr()), S_OK);
+            release(c);
+        }
+        b
+    }
+
+    /// XG_TEXTURE2D_DESC: width, height, mips, array, format, samples, quality, usage, bind,
+    /// CPU access, misc, swizzle mode, pitch
+    fn desc_2d(width: u32, height: u32, mips: u32, array: u32, format: u32, bind: u32, misc: u32, mode: u32) -> [u32; 13] {
+        [width, height, mips, array, format, 1, 0, 0, bind, 0, misc, mode, 0]
+    }
+
+    #[test]
+    fn older_2d_desc_computers_and_layouts_match_the_d3d12_desc_ones() {
+        unsafe {
+            for (bind, mode, flags) in [(0, 9, 0u32), (0x20, 0x1B, 1), (0x80, 0x15, 4), (0, 0, 0)] {
+                let old = desc_2d(300, 200, 0, 3, 28, bind, 0, mode);
+                let mut a = std::ptr::null_mut();
+                assert_eq!(XGCreateTexture2DComputer(old.as_ptr(), &mut a), S_OK);
+                let mut d = desc(300, 200, 3, 0, 28, 0x100 | mode);
+                d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+                let mut b = std::ptr::null_mut();
+                assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut b), S_OK);
+                let la = layout_of_computer(a);
+                assert_eq!(la, layout_of_computer(b), "bind {bind:#x} mode {mode:#x}");
+                let mut lc = vec![0u8; LAYOUT_BYTES];
+                assert_eq!(XGComputeTexture2DLayout(old.as_ptr(), lc.as_mut_ptr()), S_OK);
+                assert_eq!(lc, la);
+            }
+        }
+    }
+
+    #[test]
+    fn older_desc_cubes_1d_and_3d_and_bad_modes() {
+        let size = |l: &[u8]| u64::from_le_bytes(l[0..8].try_into().unwrap());
+        unsafe {
+            let mut one = vec![0u8; LAYOUT_BYTES];
+            let mut cube = vec![0u8; LAYOUT_BYTES];
+            assert_eq!(XGComputeTexture2DLayout(desc_2d(64, 64, 1, 1, 28, 0, 0, 9).as_ptr(), one.as_mut_ptr()), S_OK);
+            assert_eq!(XGComputeTexture2DLayout(desc_2d(64, 64, 1, 1, 28, 0, MISC_CUBE, 9).as_ptr(), cube.as_mut_ptr()), S_OK);
+            let mut six = vec![0u8; LAYOUT_BYTES];
+            let mut d = desc(64, 64, 6, 1, 28, 0x109);
+            d[0x30..0x34].fill(0);
+            Texture::new(&d).unwrap().write(&mut *(six.as_mut_ptr() as *mut [u8; LAYOUT_BYTES]));
+            assert_eq!(cube, six, "a cube is six slices");
+            assert_eq!(size(&cube), 6 * size(&one));
+
+            let mut c = std::ptr::null_mut::<c_void>();
+            assert_eq!(XGCreateTexture2DComputer(desc_2d(64, 64, 1, 1, 28, 0, 0, 0xFFFF_FFFF).as_ptr(), &mut c), E_INVALIDARG);
+            assert!(c.is_null());
+            let mut pitched = desc_2d(64, 64, 1, 1, 28, 0, 0, 0);
+            pitched[12] = 64;
+            assert_eq!(XGCreateTexture2DComputer(pitched.as_ptr(), &mut c), E_NOTIMPL);
+
+            // 1D: width, mips, array, format, usage, bind, CPU access, misc, mode, pitch
+            let line = [256u32, 1, 1, 28, 0, 0, 0, 0, 0, 0];
+            assert_eq!(XGCreateTexture1DComputer(line.as_ptr(), &mut c), S_OK);
+            assert_eq!(get_size(c), 1024);
+            release(c);
+            // 3D: width, height, depth, mips, format, usage, bind, CPU access, misc, mode, pitch
+            let vol = [32u32, 32, 8, 1, 28, 0, 0, 0, 0, 9, 0];
+            let mut l3 = vec![0u8; LAYOUT_BYTES];
+            assert_eq!(XGComputeTexture3DLayout(vol.as_ptr(), l3.as_mut_ptr()), S_OK);
+            let mut d3 = desc(32, 32, 8, 1, 28, 0x109);
+            d3[0..4].copy_from_slice(&4u32.to_le_bytes());
+            let mut want = vec![0u8; LAYOUT_BYTES];
+            Texture::new(&d3).unwrap().write(&mut *(want.as_mut_ptr() as *mut [u8; LAYOUT_BYTES]));
+            assert_eq!(l3, want);
+        }
+    }
+
+    #[test]
+    fn optimal_swizzle_mode_is_the_library_choice() {
+        unsafe {
+            // (bind, D3D12 flags): plain, render target, depth, small and large UAV
+            for (fmt, w, h, bind, flags) in [(28, 256, 256, 0, 0), (28, 256, 256, 0x20, 1), (40, 256, 256, 0x40, 2), (28, 64, 64, 0x80, 4), (28, 1024, 1024, 0x80, 4)] {
+                let bits = 8u64 << element(fmt).unwrap().0;
+                assert_eq!(XGComputeOptimalSwizzleMode(3, fmt, w, h, 1, 1, bind, 0), optimal_mode(0, flags, bits, w as u64, h), "bind {bind:#x} {w}x{h}");
+            }
+            let mut m = 0;
+            assert_eq!(XGComputeOptimalDepthStencilSwizzleMode(40, 64, 64, 1, 1, 1, 1, 0, &mut m), S_OK);
+            assert_eq!(m, 0x18);
+            assert_eq!(XGValidateDepthStencilSwizzleMode(40, 1, 0x18), S_OK);
+            assert_eq!(XGValidateDepthStencilSwizzleMode(40, 1, 0x1B), E_FAIL);
+        }
+    }
+
+    #[test]
+    fn tile_shapes_are_d3d12s_standard_ones() {
+        let mut t = [9u32; 3];
+        let mut e = [9u32; 3];
+        unsafe {
+            assert_eq!(XGComputeTileShape(3, 28, 4, 1, &mut t, &mut e), S_OK);
+            assert_eq!((t, e), ([128, 128, 1], [128, 128, 1]));
+            assert_eq!(XGComputeTileShape(3, 71, 8, 1, &mut t, &mut e), S_OK); // BC1: 4x4 texels an element
+            assert_eq!((t, e), ([512, 256, 1], [128, 64, 1]));
+            assert_eq!(XGComputeTileShape(3, 28, 4, 4, &mut t, std::ptr::null_mut()), S_OK);
+            assert_eq!(t, [64, 64, 1]);
+            assert_eq!(XGComputeTileShape(4, 0, 1, 1, &mut t, &mut e), S_OK);
+            assert_eq!((t, e), ([0; 3], [64, 32, 32]));
+            assert_eq!(XGComputeTileShape(3, 28, 3, 1, &mut t, &mut e), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn a_texture_descriptor_gives_the_computer_of_its_texture() {
+        use crate::gpu::desc::{gfx10_format, xcl_image_for_view, ImageType};
+        let g = gfx10_format(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28)).unwrap();
+        let words = xcl_image_for_view(0, g, ImageType::D2, 100, 50, 1, 3);
+        unsafe {
+            let mut a = std::ptr::null_mut();
+            assert_eq!(XGCreateTextureComputerFromDescriptor(&words, &mut a), S_OK);
+            let mut b = std::ptr::null_mut();
+            assert_eq!(XGCreateTextureComputer(desc(100, 50, 1, 3, 28, 0x100 | ((words[3] >> 20) & 0x1F)).as_ptr(), &mut b), S_OK);
+            assert_eq!(layout_of_computer(a), layout_of_computer(b));
+            assert_eq!(XGCreateTextureComputerFromDescriptor(&[0u32; 8], &mut a), E_INVALIDARG);
+            assert!(a.is_null());
+        }
+    }
+
+    #[test]
+    fn library_state_and_buffer_layout() {
+        unsafe {
+            XGTerminateLibrary();
+            assert_eq!(XGInitializeLibrary(), S_OK);
+            assert_eq!(XGInitializeLibrary(), crate::util::S_FALSE);
+            assert_eq!(XGTerminateLibrary(), S_OK);
+            assert_eq!(XGEnterExclusiveLock(), 0);
+            assert_eq!(XGEncodeDCC(), E_NOTIMPL);
+            let mut l = vec![0xCDu8; LAYOUT_BYTES];
+            assert_eq!(XGComputeBufferLayout([1000u32, 0, 0, 0, 0, 0].as_ptr(), l.as_mut_ptr()), S_OK);
+            assert_eq!(u64::from_le_bytes(l[0..8].try_into().unwrap()), 1000);
+            assert_eq!(u64::from_le_bytes(l[8..16].try_into().unwrap()), 256);
+            assert_eq!(u32::from_le_bytes(l[0x10..0x14].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(l[0x1B38..0x1B3C].try_into().unwrap()), 1);
+        }
+    }
+
+    #[test]
+    fn computer_has_all_14_methods_and_is_not_a_tiled_resource() {
+        let v = vtbl();
+        assert_eq!(v.len(), 14);
+        let mut out = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(desc(64, 64, 1, 1, 28, 0x109).as_ptr(), &mut out), S_OK);
+            let f: unsafe extern "system" fn(*mut c_void) -> u8 = std::mem::transmute(v[12]);
+            assert_eq!(f(out), 0);
+            release(out);
         }
     }
 
