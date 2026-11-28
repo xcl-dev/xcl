@@ -2213,12 +2213,21 @@ mod tests {
     fn fine_timer_makes_short_sleeps_short() {
         // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
         fine_timer();
-        let t = std::time::Instant::now();
-        for _ in 0..20 {
-            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
-        }
-        let per = t.elapsed() / 20;
-        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+        // the median of single sleeps: on the coarse tick nearly every Sleep(1) waits ~15.6 ms, while
+        // a busy machine (parallel tests, a shared CI VM) delays only some of them; a time-critical
+        // thread runs as soon as its timer fires instead of queueing behind the busy threads
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+        let mut took: Vec<_> = (0..21)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+                t.elapsed()
+            })
+            .collect();
+        took.sort();
+        let per = took[took.len() / 2];
+        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?} (median of {took:?}): the 15.6 ms tick");
     }
 
     #[test]
