@@ -288,6 +288,7 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   (`XCL_PREPARE_HISTORY_SECONDS`, 15 by default); one driver call cannot be interrupted.
   Native recipes validated on this adapter and driver reuse their verified blobs across
   rebuilds. Compute verification also survives changes to the preparation worker count.
+  A two-pass mesh recipe needs verified files for both its mesh and compute passes.
   Changes to translation, pipeline layout, settings or cache files trigger validation. During
   validation, exact recipes that the driver accepts are imported from the previous pipeline
   library; incompatible or missing recipes are rebuilt normally.

@@ -52,17 +52,34 @@ pub(crate) fn driver_files(dir: &Path) -> Option<Inventory> {
 pub(super) struct File { name: String, stamp: Stamp }
 type Recipes = HashMap<u64, Vec<File>>;
 
-thread_local! { static CAPTURE: RefCell<Option<Vec<File>>> = const { RefCell::new(None) }; }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass { Graphics, Mesh, Compute }
 
-pub(super) fn capture(f: impl FnOnce() -> bool) -> (bool, Vec<File>) {
+pub(super) struct Captured { file: File, pass: Pass }
+
+thread_local! { static CAPTURE: RefCell<Option<Vec<Captured>>> = const { RefCell::new(None) }; }
+
+pub(super) fn capture(f: impl FnOnce() -> bool) -> (bool, Vec<Captured>) {
     CAPTURE.with(|slot| { *slot.borrow_mut() = Some(Vec::new()); });
     let success = f();
     let files = CAPTURE.with(|slot| slot.take().unwrap_or_default());
     (success, files)
 }
 
+#[cfg(test)]
+pub(crate) fn capture_for_test(f: impl FnOnce() -> bool) -> bool { capture(f).0 }
+
+/// Keep only receipts recorded before a build attempt that must be retried.
+pub(crate) fn checkpoint() -> usize { CAPTURE.with(|slot| slot.borrow().as_ref().map_or(0, Vec::len)) }
+
+pub(crate) fn discard_since(checkpoint: usize) {
+    CAPTURE.with(|slot| {
+        if let Some(files) = slot.borrow_mut().as_mut() { files.truncate(checkpoint); }
+    });
+}
+
 /// Record only bytes accepted by the native driver that still occupy this cache file.
-pub(crate) fn accepted(path: Option<&Path>, bytes: &[u8]) {
+pub(crate) fn accepted(path: Option<&Path>, bytes: &[u8], pass: Pass) {
     CAPTURE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(files) = slot.as_mut() else { return };
@@ -73,7 +90,7 @@ pub(crate) fn accepted(path: Option<&Path>, bytes: &[u8]) {
             if stamp(&path.metadata().ok()?)? != before { return None; }
             Some(File { name: path.file_name()?.to_str()?.to_owned(), stamp: before })
         };
-        if let Some(file) = verified() { files.push(file); }
+        if let Some(file) = verified() { files.push(Captured { file, pass }); }
     });
 }
 
@@ -85,20 +102,21 @@ pub(super) struct Index {
 
 impl Index {
     pub(super) fn open(dir: &Path, known: &Inventory, key: u64, windows: u32) -> Option<Self> {
-        let path = dir.join(format!("warm-recipes-v2-{key:016x}-{windows:02x}.bin"));
+        let path = dir.join(format!("warm-recipes-v3-{key:016x}-{windows:02x}.bin"));
         let mut entries: Recipes = read_receipt(&path).unwrap_or_default();
         entries.retain(|_, files| !files.is_empty() && files.iter().all(|f| known.get(&f.name) == Some(&f.stamp)));
         Some(Self { path, entries, new: Default::default() })
     }
     pub(super) fn can_defer(&self, hash: u64) -> bool { self.entries.contains_key(&hash) }
-    pub(super) fn add(&self, hash: u64, files: Vec<File>, mesh: bool) {
+    pub(super) fn add(&self, hash: u64, files: Vec<Captured>, mesh: bool) {
         let complete = if mesh {
-            files.len() == 2 && files.iter().any(|f| f.name.starts_with("tp-ms-"))
-                && files.iter().any(|f| f.name.starts_with("tp-cs-"))
+            files.len() == 2 && files.iter().any(|f| f.pass == Pass::Mesh)
+                && files.iter().any(|f| f.pass == Pass::Compute)
+                && files[0].file.name != files[1].file.name
         } else {
-            files.len() == 1 && files[0].name.starts_with("gfx-")
+            files.len() == 1 && files[0].pass == Pass::Graphics
         };
-        if complete { self.new.lock().unwrap().insert(hash, files); }
+        if complete { self.new.lock().unwrap().insert(hash, files.into_iter().map(|f| f.file).collect()); }
     }
     pub(super) fn save(mut self) {
         let new = self.new.into_inner().unwrap();
@@ -124,16 +142,17 @@ mod tests {
 
     #[test]
     fn verified_mesh_needs_both_unchanged_driver_files() {
+        use crate::hle::d3d12x::real::driver_cache;
         let dir = std::env::temp_dir().join(format!("xcl-warm-mesh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let graphics = dir.join("tp-ms-test.pso");
-        let compute = dir.join("tp-cs-test.pso");
+        let graphics = dir.join(driver_cache::graphics_name(3, 64));
+        let compute = dir.join(driver_cache::name_for_root_node(b"synthetic compute", 0, false, &[], 0));
         std::fs::write(&graphics, b"graphics").unwrap();
         std::fs::write(&compute, b"compute").unwrap();
         let open = || Index::open(&dir, &driver_files(&dir).unwrap(), 1, 4).unwrap();
         let capture_passes = |compute_bytes: &[u8]| capture(|| {
-            accepted(Some(&graphics), b"graphics");
-            accepted(Some(&compute), compute_bytes);
+            accepted(Some(&graphics), b"graphics", Pass::Mesh);
+            accepted(Some(&compute), compute_bytes, Pass::Compute);
             true
         }).1;
         let book = open();
@@ -144,6 +163,74 @@ mod tests {
         assert!(open().can_defer(2));
         std::fs::remove_file(&compute).unwrap();
         assert!(!open().can_defer(2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_mesh_cache_names_make_complete_receipts() {
+        use crate::hle::d3d12x::real::driver_cache;
+        let dir = std::env::temp_dir().join(format!("xcl-warm-native-mesh-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mesh_a = dir.join(driver_cache::graphics_name(1, 64));
+        let mesh_b = dir.join(driver_cache::graphics_name(2, 64));
+        let compute = dir.join(driver_cache::name_for_root_node(b"synthetic compute", 0, false, &[], 0));
+        std::fs::write(&mesh_a, b"mesh a").unwrap();
+        std::fs::write(&mesh_b, b"mesh b").unwrap();
+        std::fs::write(&compute, b"compute").unwrap();
+        let open = || Index::open(&dir, &driver_files(&dir).unwrap(), 2, 4).unwrap();
+        let book = open();
+        for (key, mesh, bytes) in [(1, &mesh_a, b"mesh a".as_slice()), (2, &mesh_b, b"mesh b".as_slice())] {
+            let (_, files) = capture(|| {
+                accepted(Some(mesh), bytes, Pass::Mesh);
+                accepted(Some(&compute), b"compute", Pass::Compute);
+                true
+            });
+            book.add(key, files, true);
+        }
+        let (_, wrong_roles) = capture(|| {
+            accepted(Some(&mesh_a), b"mesh a", Pass::Mesh);
+            accepted(Some(&mesh_b), b"mesh b", Pass::Mesh);
+            true
+        });
+        book.add(3, wrong_roles, true);
+        let (_, stale_mesh) = capture(|| {
+            let start = checkpoint();
+            accepted(Some(&mesh_a), b"mesh a", Pass::Mesh);
+            discard_since(start);
+            accepted(Some(&compute), b"compute", Pass::Compute);
+            true
+        });
+        book.add(4, stale_mesh, true);
+        let (_, retried_pair) = capture(|| {
+            let start = checkpoint();
+            accepted(Some(&mesh_a), b"mesh a", Pass::Mesh);
+            discard_since(start);
+            accepted(Some(&mesh_b), b"mesh b", Pass::Mesh);
+            accepted(Some(&compute), b"compute", Pass::Compute);
+            true
+        });
+        book.add(5, retried_pair, true);
+        book.save();
+        assert!(open().can_defer(1));
+        assert!(open().can_defer(2));
+        assert!(!open().can_defer(3));
+        assert!(!open().can_defer(4));
+        assert!(open().can_defer(5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_graphics_receipt_is_revalidated() {
+        let dir = std::env::temp_dir().join(format!("xcl-warm-v2-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let graphics = dir.join(crate::hle::d3d12x::real::driver_cache::graphics_name(4, 64));
+        std::fs::write(&graphics, b"graphics").unwrap();
+        let old = dir.join("warm-recipes-v2-0000000000000004-04.bin");
+        let files = vec![File { name: graphics.file_name().unwrap().to_str().unwrap().to_owned(),
+            stamp: stamp(&graphics.metadata().unwrap()).unwrap() }];
+        assert!(write_receipt(&old, &HashMap::from([(7u64, files)])));
+        let book = Index::open(&dir, &driver_files(&dir).unwrap(), 4, 4).unwrap();
+        assert!(!book.can_defer(7), "old one-file receipts cannot prove a two-pass build");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

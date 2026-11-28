@@ -5077,6 +5077,7 @@ unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *co
 /// E_OUTOFMEMORY in under a second, and builds the same programs in the switch form (#156).
 fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     HEAP_WINDOW_OOM.with(|o| o.set(false));
+    let receipt_start = crate::shaders::warm_replay::checkpoint();
     let r = build();
     if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
         return r;
@@ -5087,6 +5088,7 @@ fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     if n < 5 || n % 100 == 0 {
         crate::xlog_warn!("D3D12.X: the driver ran out of memory on a pipeline with heap windows – building it in the switch form ({} so far)", n + 1);
     }
+    crate::shaders::warm_replay::discard_since(receipt_start);
     crate::gpu::recomp::pso::in_switch_form(build)
 }
 
@@ -7998,14 +8000,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let hr = build.hr;
     if build.reused {
         if let Some(blob) = cached.as_ref() {
-            crate::shaders::warm_replay::accepted(disk.as_deref(), blob);
+            crate::shaders::warm_replay::accepted(disk.as_deref(), blob, crate::shaders::warm_replay::Pass::Graphics);
         }
     }
     if cacheable && build.cache_eligible {
         let kept = keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, gkey, bytes, disk.as_deref(), build.built_in_driver,
             || read_pso_cached_blob(*ppv)).or_else(|| graphics_blob(gkey));
         if let (Some(p), Some(b)) = (disk.as_deref(), kept) {
-            crate::shaders::warm_replay::accepted(Some(p), &b);
+            crate::shaders::warm_replay::accepted(Some(p), &b, crate::shaders::warm_replay::Pass::Graphics);
         }
     } else if build.reused && from_disk {
         GRAPHICS_BLOBS.admit(gkey, cached.as_ref().unwrap().clone(), GRAPHICS_BLOBS_MAX);
@@ -9285,7 +9287,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if let Some(key) = gkey {
         if greused {
             if let Some(blob) = gcached.as_ref() {
-                crate::shaders::warm_replay::accepted(gdisk.as_deref(), blob);
+                crate::shaders::warm_replay::accepted(gdisk.as_deref(), blob, crate::shaders::warm_replay::Pass::Mesh);
             }
             if let Some(blob) = gcached.as_ref().filter(|_| gfrom_disk) {
                 GRAPHICS_BLOBS.admit(key, blob.clone(), GRAPHICS_BLOBS_MAX);
@@ -9295,7 +9297,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             let kept = keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, key, mesh_bytes, gdisk.as_deref(), gin_driver,
                 || read_pso_cached_blob(mesh_pso.as_raw())).or_else(|| graphics_blob(key));
             if let (Some(path), Some(blob)) = (gdisk.as_deref(), kept) {
-                crate::shaders::warm_replay::accepted(Some(path), &blob);
+                crate::shaders::warm_replay::accepted(Some(path), &blob, crate::shaders::warm_replay::Pass::Mesh);
             }
         }
     }
@@ -9354,14 +9356,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let creused = compute_from_library || (hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0);
     if creused {
         if let Some(blob) = ccached.as_ref() {
-            crate::shaders::warm_replay::accepted(cdisk.as_deref(), blob);
+            crate::shaders::warm_replay::accepted(cdisk.as_deref(), blob, crate::shaders::warm_replay::Pass::Compute);
         }
     }
     if hc >= 0 && !creused && !compute.is_null() {
         let kept = keep_driver_blob_at(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, ckey, tp.cs.len(), cdisk.as_deref(), cpersist_took,
             driver_cache::compute_keep_threshold(), || read_pso_cached_blob(compute)).or_else(|| compute_blob(ckey));
         if let (Some(p), Some(b)) = (cdisk.as_deref(), kept) {
-            crate::shaders::warm_replay::accepted(Some(p), &b);
+            crate::shaders::warm_replay::accepted(Some(p), &b, crate::shaders::warm_replay::Pass::Compute);
         }
     } else if creused && cfrom_disk {
         COMPUTE_BLOBS.admit(ckey, ccached.as_ref().unwrap().clone(), COMPUTE_BLOBS_MAX);
@@ -12153,6 +12155,37 @@ mod rect_list_pso_tests {
 #[cfg(test)]
 mod fallback_stream_tests {
     use super::*;
+
+    #[test]
+    fn switch_form_retry_discards_failed_attempt_receipt() {
+        use crate::shaders::warm_replay::{self, Pass};
+        let dir = std::env::temp_dir().join(format!("xcl-switch-receipt-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mesh = dir.join(driver_cache::graphics_name(1, 64));
+        let compute = dir.join(driver_cache::name_for_root_node(b"synthetic compute", 0, false, &[], 0));
+        std::fs::write(&mesh, b"mesh").unwrap();
+        std::fs::write(&compute, b"compute").unwrap();
+        let mut attempts = 0;
+        let ok = warm_replay::capture_for_test(|| {
+            let success = with_switch_fallback(|| {
+                attempts += 1;
+                if attempts == 1 {
+                    warm_replay::accepted(Some(&mesh), b"mesh", Pass::Mesh);
+                    HEAP_WINDOW_OOM.with(|flag| flag.set(true));
+                    false
+                } else {
+                    assert_eq!(warm_replay::checkpoint(), 0, "failed-attempt file reached the retry");
+                    warm_replay::accepted(Some(&compute), b"compute", Pass::Compute);
+                    true
+                }
+            });
+            assert_eq!(warm_replay::checkpoint(), 1);
+            success
+        });
+        assert!(ok);
+        assert_eq!(attempts, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_stream_counts_referenced_shader_code_not_its_descriptors() {

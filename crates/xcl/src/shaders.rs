@@ -3162,6 +3162,12 @@ enum GraphicsHistoryRecord {
     Mesh(gfx_records::MeshRecord),
 }
 
+fn legacy_two_pass(keys: &[u64; 5], shaders: &HashMap<u64, Vec<u8>>) -> bool {
+    keys[2] == 0 && keys[3] == 0
+        && shaders.get(&keys[0]).is_some_and(|vs| recomp::pso::is_console(vs))
+        && shaders.get(&keys[4]).is_some_and(|gs| recomp::pso::is_console(gs))
+}
+
 impl GraphicsHistoryRecord {
     fn from_entry(entry: gfx_records::Entry) -> Option<Self> {
         match entry {
@@ -3276,6 +3282,10 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
                 let Some(&index) = ready.get(i) else { break };
                 let r = &records[index];
                 let code = |key| shaders.get(&key).map(Vec::as_slice);
+                let two_pass = match r {
+                    GraphicsHistoryRecord::Mesh(_) => true,
+                    GraphicsHistoryRecord::Legacy(record) => legacy_two_pass(&record.shaders, &shaders),
+                };
                 // (a pipeline that panics fails; the others are built)
                 let key = recipe_keys[index];
                 let run = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r {
@@ -3293,7 +3303,7 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
                         true
                     } else {
                         let (ok, files) = warm_replay::capture(run);
-                        if ok { book.add(key, files, matches!(r, GraphicsHistoryRecord::Mesh(_))); }
+                        if ok { book.add(key, files, two_pass); }
                         ok
                     }
                 } else { run() };
@@ -4243,6 +4253,19 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    #[test]
+    fn legacy_console_gs_needs_both_native_passes() {
+        let shaders = HashMap::from([
+            (1, sample(1, &[fssm(&CODE, &[(2, 0)])])),
+            (2, sample(2, &[fssm(&CODE, &[(3, 2)])])),
+            (3, b"PC shader".to_vec()),
+        ]);
+        assert!(legacy_two_pass(&[1, 0, 0, 0, 2], &shaders));
+        assert!(!legacy_two_pass(&[1, 0, 3, 0, 2], &shaders));
+        assert!(!legacy_two_pass(&[1, 0, 0, 0, 3], &shaders));
+        assert!(!legacy_two_pass(&[1, 0, 0, 0, 0], &shaders));
     }
 
     #[test]
