@@ -95,6 +95,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();
+        crate::gpu::texture::trim_idle_staging();
     });
     // Activity diagnostics and pressure policy share one bounded two-second sampler. Pressure-only
     // mode queries only adapter-local usage; it does not enable the activity hot-path probes.

@@ -214,6 +214,7 @@ struct Uploader {
     value: u64,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    last_batch: std::time::Instant,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -224,6 +225,8 @@ static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploa
 
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
+const STAGING_IDLE_MIN: u64 = 64 << 20;
+const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 
 fn staging_capacity(bytes: u64) -> Option<u64> {
@@ -242,7 +245,7 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        Ok(Uploader { alloc, list, fence, value: 0, staging: None, last_batch: std::time::Instant::now() })
     }
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
@@ -321,6 +324,7 @@ pub(crate) unsafe fn upload_batch_with_zero_mips(
         std::mem::forget(up);
         return Err(copy_error(e));
     }
+    up.last_batch = std::time::Instant::now();
     put_back(key, up);
     Ok(failed)
 }
@@ -399,6 +403,32 @@ pub(crate) unsafe fn submit_batch_with_zero_mips(
 
 fn put_back(key: usize, up: Uploader) {
     UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
+}
+
+fn release_idle_staging(up: &mut Uploader, now: std::time::Instant) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    if now.saturating_duration_since(up.last_batch) >= STAGING_IDLE
+        && up.staging.as_ref().is_some_and(|s| s.2 >= STAGING_IDLE_MIN)
+    {
+        up.staging.take()
+    } else {
+        None
+    }
+}
+
+/// A checked-out uploader may be in flight. Only trim the cache, which contains
+/// uploaders returned after a successful fence wait.
+pub(crate) fn trim_idle_staging() {
+    let now = std::time::Instant::now();
+    let released: Vec<_> = {
+        let mut cache = UPLOADERS.lock().unwrap();
+        cache.iter_mut().flat_map(|m| m.values_mut())
+            .filter_map(|up| release_idle_staging(up, now)).collect()
+    };
+    let bytes: u64 = released.iter().map(|s| s.2).sum();
+    drop(released);
+    if bytes != 0 {
+        crate::xlog_info!("texture uploads: released {} MiB of idle staging", bytes >> 20);
+    }
 }
 
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
@@ -1202,8 +1232,16 @@ mod tests {
             for (resource, bytes, _) in &batch {
                 assert!(read_back(&dev, &queue, resource, bytes) == *bytes, "repeat pixel mismatch");
             }
-            // Drop the test's large uploader after its last copy fence and readbacks have passed.
-            let uploader = UPLOADERS.lock().unwrap().as_mut().unwrap().remove(&key);
+            // Use the queue's real completed batch, with synthetic times for the idle policy.
+            let mut uploader = UPLOADERS.lock().unwrap().as_mut().unwrap().remove(&key).unwrap();
+            let expires = uploader.last_batch + STAGING_IDLE;
+            assert!(release_idle_staging(&mut uploader, expires - std::time::Duration::from_millis(1)).is_none());
+            let released = release_idle_staging(&mut uploader, expires).unwrap();
+            assert_eq!(released.2, grown.1);
+            assert!(uploader.staging.is_none());
+            drop(released);
+            let (_, _) = uploader.staging(&dev, STAGING_MIN).unwrap();
+            assert!(release_idle_staging(&mut uploader, expires).is_none(), "keep the small staging buffer");
             drop(uploader);
             if let Ok(info) = dev.cast::<ID3D12InfoQueue>() {
                 let mut errors = 0;
