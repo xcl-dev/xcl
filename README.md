@@ -272,6 +272,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   With presentation disabled, preparation runs without a window. A staged corpus still gates
   launch when the null renderer is selected. For an unstaged title set `XCL_PREPARE=0`
   to skip startup preparation, or `XCL_PREPARE_GRAPHICS=0` to skip optional graphics history.
+  `XCL_PREPARE_USED_ONLY=1` (off by default) builds a driver pipeline before the title starts only for
+  the compute programs an earlier run used (`used-pipelines.txt` beside the DXIL cache, so only runs with
+  the same cache count); the title builds the others when it first uses them. The log says how many
+  records match. With no such list, or none matching this pack, every compute program is built as
+  before. `XCL_PREPARE_ALL=1` overrides it.
   Native recipes validated on this adapter and driver reuse their verified blobs across
   rebuilds. Compute verification also survives changes to the preparation worker count.
   Changes to translation, pipeline layout, settings or cache files trigger validation. During
