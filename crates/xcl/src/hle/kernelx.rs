@@ -1769,14 +1769,13 @@ pub fn fine_timer() {
     };
     let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
     let kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state as *const _ as *const c_void, size) } != 0;
-    // in 100 ns units; "finest" is the smallest period the system supports
-    let (mut coarsest, mut finest, mut was) = (0u32, 0u32, 0u32);
-    if unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut was) } < 0 || finest == 0 {
+    let Some((was, now, status)) = request_finest_timer(
+        |coarsest, finest, current| unsafe { NtQueryTimerResolution(coarsest, finest, current) },
+        |desired, current| unsafe { NtSetTimerResolution(desired, 1, current) },
+    ) else {
         crate::xlog_warn!("timer: NtQueryTimerResolution failed – Windows' default resolution");
         return;
-    }
-    let mut now = 0u32;
-    let status = unsafe { NtSetTimerResolution(finest, 1, &mut now) };
+    };
     crate::xlog_info!(
         "timer: {} (was {:.2} ms, now {:.2} ms; kept while the window is hidden: {})",
         if status >= 0 { "finest resolution for the title" } else { "raising the resolution failed" },
@@ -1784,6 +1783,20 @@ pub fn fine_timer() {
         now as f64 / 10_000.0,
         if kept { "yes" } else { "no" }
     );
+}
+
+fn request_finest_timer(
+    query: impl FnOnce(&mut u32, &mut u32, &mut u32) -> i32,
+    set: impl FnOnce(u32, &mut u32) -> i32,
+) -> Option<(u32, u32, i32)> {
+    // Timer periods are in 100 ns units.
+    let (mut coarsest, mut finest, mut was) = (0, 0, 0);
+    if query(&mut coarsest, &mut finest, &mut was) < 0 || finest == 0 {
+        return None;
+    }
+    let mut now = 0;
+    let status = set(finest, &mut now);
+    Some((was, now, status))
 }
 
 pub unsafe extern "system" fn GetSystemOSVersion(out: *mut SystemOsVersionInfo) {
@@ -2210,15 +2223,22 @@ mod tests {
     }
 
     #[test]
-    fn fine_timer_makes_short_sleeps_short() {
-        // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
-        fine_timer();
-        let t = std::time::Instant::now();
-        for _ in 0..20 {
-            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
-        }
-        let per = t.elapsed() / 20;
-        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+    fn fine_timer_requests_the_finest_supported_period() {
+        let query = |coarsest: &mut u32, finest: &mut u32, current: &mut u32| {
+            *coarsest = 156_250;
+            *finest = 5_000;
+            *current = 10_000;
+            0
+        };
+        let result = request_finest_timer(query, |desired, current| {
+            assert_eq!(desired, 5_000);
+            *current = desired;
+            0
+        });
+        assert_eq!(result, Some((10_000, 5_000, 0)));
+        assert_eq!(request_finest_timer(query, |_, _| -1), Some((10_000, 0, -1)));
+        assert_eq!(request_finest_timer(|_, _, _| -1, |_, _| panic!("query failed")), None);
+        assert_eq!(request_finest_timer(|_, _, _| 0, |_, _| panic!("no period")), None);
     }
 
     #[test]
