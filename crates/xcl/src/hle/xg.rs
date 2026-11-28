@@ -112,14 +112,15 @@ pub struct Texture {
 
 /// (log2 bytes per element, pixels per element side) of a DXGI format; None for the 96-bit
 /// and packed 4:2:2 ones (not tiled) and unknown formats. The console's own 116 / 117
-/// (R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT) are 32 bits a pixel, like R10G10B10A2.
+/// (R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT) are 32 bits a pixel, like R10G10B10A2, and so are 189
+/// (R10G10B10_SNORM_A2_UNORM) and 191 (R24G8_UNORM); 190 (R4G4_UNORM) is 8.
 pub fn element(f: u32) -> Option<(u32, u32)> {
     Some(match f {
         1..=4 => (4, 1),
         9..=22 => (3, 1),
-        23..=47 | 67 | 87..=93 | 116 | 117 => (2, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (2, 1),
         48..=59 | 85 | 86 | 115 => (1, 1),
-        60..=65 => (0, 1),
+        60..=65 | 190 => (0, 1),
         70..=72 | 79..=81 => (3, 4),
         73..=78 | 82..=84 | 94..=99 => (4, 4),
         _ => return None,

@@ -788,6 +788,16 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 116 | 117) {
         d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
     }
+    // The console's 189 R10G10B10_SNORM_A2_UNORM, 190 R4G4_UNORM and 191 R24G8_UNORM are the PC's
+    // sampler-feedback 189 / 190 and A4B4G4R4 (16 bits) 191: a typeless format of the same size
+    // instead (R10G10B10A2, R8, R24G8). 187 / 188 (the console's sampler feedback) are left.
+    if matches!(format, 189..=191) {
+        static LOGGED: [std::sync::atomic::AtomicBool; 3] = [const { std::sync::atomic::AtomicBool::new(false) }; 3];
+        if !LOGGED[(format - 189) as usize].swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: console format {format} in a resource desc: made the PC's {} of the same size{}", pc_same_size_format(format), if format == 191 { "" } else { " (the values are not representable)" });
+        }
+        d[0x20..0x24].copy_from_slice(&pc_same_size_format(format).to_le_bytes());
+    }
     // B5G5R5A1 / B4G4R4A4 targets (and B5G6R5 UAVs): not ones a PC driver takes for rendering
     // or unordered access – R8G8B8A8 holds the same values with full PC RTV/UAV/SRV support.
     if (matches!(format, 86 | 115) && flags & 5 != 0) || (format == 85 && flags & 4 != 0) {
@@ -847,6 +857,16 @@ pub fn pc_initial_state_for_desc(orig_flags: u32, pc_flags: u32, state: u32) -> 
     }
 }
 
+/// The PC typeless format of the same size as the console's 189 (R10G10B10_SNORM_A2_UNORM:
+/// R10G10B10A2_TYPELESS), 190 (R4G4_UNORM: R8_TYPELESS) and 191 (R24G8_UNORM: R24G8_TYPELESS).
+fn pc_same_size_format(f: u32) -> u32 {
+    match f {
+        189 => 23,
+        190 => 60,
+        _ => 44,
+    }
+}
+
 /// The PC format of a view, pipeline or clear value in the console's D16_UNORM_S8_UINT family:
 /// D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT (`pc_resource_desc` makes such
 /// resources R24G8_TYPELESS).
@@ -856,6 +876,9 @@ pub fn pc_view_format(f: u32) -> u32 {
         119 => 46,
         120 => 47,
         116 | 117 => 10,
+        189 => 24, // R10G10B10A2_UNORM, 190: R8_UNORM, 191: R24_UNORM_X8_TYPELESS
+        190 => 61,
+        191 => 46,
         f => f,
     }
 }
@@ -1731,6 +1754,29 @@ mod tests {
                 assert!(r.is_some());
             }
         }
+    }
+
+    #[test]
+    fn console_formats_187_to_191_become_pc_formats_of_the_same_size() {
+        let desc = |f: u32| {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&3u32.to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&f.to_le_bytes());
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            u32::from_le_bytes(super::pc_resource_desc(&x)[0x20..0x24].try_into().unwrap())
+        };
+        assert_eq!((desc(189), desc(190), desc(191)), (23, 60, 44));
+        assert_eq!((desc(187), desc(188)), (187, 188), "sampler feedback is left alone");
+        assert_eq!((super::pc_view_format(189), super::pc_view_format(190), super::pc_view_format(191)), (24, 61, 46));
+        // a 64 x 64 191 texture: 4 bytes a pixel on both sides, a 256-byte row
+        let (log2, _) = crate::hle::xg::element(191).unwrap();
+        assert_eq!((1usize << log2) * 64, 256);
+        assert_eq!(crate::hle::xg::element(desc(191)), crate::hle::xg::element(191));
+        assert_eq!((crate::hle::xg::element(189), crate::hle::xg::element(190)), (Some((2, 1)), Some((0, 1))));
     }
 
     #[test]
