@@ -5827,12 +5827,90 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     Some(p + (va - start) as usize)
 }
 
+/// `XCL_ACTIVITY`: what `sync_title_buffers` did so far (the `SYNC_*` indices)
+static SYNC_COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const SYNC_DRAWS: usize = 0;
+const SYNC_MIRRORED: usize = 1;
+const SYNC_COPIES: usize = 2;
+const SYNC_WHOLE: usize = 3;
+const SYNC_BYTES: usize = 4;
+const SYNC_INDICES: usize = 5;
+const SYNC_READABLE: usize = 6;
+const SYNC_READABLE_LARGE: usize = 7;
+const SYNC_READABLE_NS: usize = 8;
+/// ns of the whole function so far, and of its slowest `readable()` since `take_sync_slowest`
+static SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static SYNC_READABLE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+/// whether the mirror sync counts and times at all: only with `XCL_ACTIVITY` (`enable_sync_activity`)
+static SYNC_ON: AtomicBool = AtomicBool::new(false);
+
+/// `XCL_ACTIVITY`: from now on the mirror sync counts and times what it does
+pub fn enable_sync_activity() {
+    SYNC_ON.store(true, Ordering::Relaxed);
+}
+
+/// `XCL_ACTIVITY`: draws through the mirror sync, of those with a mirror, copies, whole-buffer
+/// copies, bytes copied, indices scanned, `readable()` calls, of those over 16 pages (the
+/// `VirtualQuery` walk), ns in `readable()`, ns in the sync – all so far
+pub fn sync_activity() -> [u64; 10] {
+    let mut out = [0; 10];
+    for (o, c) in out.iter_mut().zip(&SYNC_COUNTS) {
+        *o = c.load(Ordering::Relaxed);
+    }
+    out[9] = SYNC_NS.load(Ordering::Relaxed);
+    out
+}
+
+/// ns of the slowest `readable()` of the mirror sync since the last call
+pub fn take_sync_slowest() -> u64 {
+    SYNC_READABLE_MAX_NS.swap(0, Ordering::Relaxed)
+}
+
+/// Whether `XCL_ACTIVITY` logs a row for these `sync_activity` deltas and slowest `readable()`:
+/// when anything moved, also with no draw synced (a sync still running at the sample, or stalled)
+pub fn sync_row_due(delta: &[u64], slowest: u64) -> bool {
+    slowest > 0 || delta.iter().any(|&v| v > 0)
+}
+
+fn sync_count(k: usize, n: u64) {
+    if SYNC_ON.load(Ordering::Relaxed) {
+        SYNC_COUNTS[k].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// `readable()`, counted and timed for `XCL_ACTIVITY`
+fn sync_readable(p: usize, len: usize) -> bool {
+    if !SYNC_ON.load(Ordering::Relaxed) {
+        return crate::gpu::shader::readable(p, len);
+    }
+    let t = Instant::now();
+    let r = crate::gpu::shader::readable(p, len);
+    let ns = t.elapsed().as_nanos() as u64;
+    sync_count(SYNC_READABLE, 1);
+    if len > 0 && ((p + len - 1) >> 12) - (p >> 12) + 1 > 16 {
+        sync_count(SYNC_READABLE_LARGE, 1);
+    }
+    sync_count(SYNC_READABLE_NS, ns);
+    SYNC_READABLE_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    r
+}
+
 /// Before a draw on `list`: the parts of mirrored buffers it reads are copied from the title's
 /// memory. `indexed`: (first index, index count, base vertex); else `first_vertex`, `vertices`.
 pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
     if MIRROR_BYTES.load(Ordering::Relaxed) == 0 {
         return;
     }
+    if !SYNC_ON.load(Ordering::Relaxed) {
+        return sync_mirrors(list, indexed, first_vertex, vertices, instances);
+    }
+    let t = Instant::now();
+    sync_mirrors(list, indexed, first_vertex, vertices, instances);
+    sync_count(SYNC_DRAWS, 1);
+    SYNC_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+unsafe fn sync_mirrors(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
     let (vbs, ib) = {
         let g = LISTS.lock().unwrap();
         let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
@@ -5846,11 +5924,14 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         }
         v
     };
+    sync_count(SYNC_MIRRORED, 1);
     let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
+        if len > 0 && sync_readable(va as usize + from as usize, len) {
             std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+            sync_count(SYNC_COPIES, 1);
+            sync_count(SYNC_BYTES, len as u64);
         }
     };
     // the vertices read: [lo, hi)
@@ -5862,9 +5943,10 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
                 copy(va, m, bytes, from, len);
             }
             let n = (len.min((bytes as u64).saturating_sub(from)) / size) as usize;
-            if n == 0 || !crate::gpu::shader::readable((va + from) as usize, n * size as usize) {
+            if n == 0 || !sync_readable((va + from) as usize, n * size as usize) {
                 (0, u64::MAX)
             } else {
+                sync_count(SYNC_INDICES, n as u64);
                 let at = (va + from) as *const u8;
                 let (mut lo, mut hi) = (u32::MAX, 0u32);
                 for k in 0..n {
@@ -5888,6 +5970,7 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         // a buffer stepped by instance is not told apart: with instances (callers pass more
         // than 1 for a first instance other than 0 too), all of it
         if instances > 1 || hi == u64::MAX || stride == 0 || hi.saturating_mul(stride as u64) > bytes as u64 {
+            sync_count(SYNC_WHOLE, 1);
             copy(va, m, bytes, 0, bytes as u64);
         } else {
             copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
@@ -11728,5 +11811,41 @@ mod tests {
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
+    }
+
+    /// Without `XCL_ACTIVITY` the mirror sync counts and times nothing; once it is enabled it does.
+    #[test]
+    fn the_mirror_sync_counts_only_once_xcl_activity_enables_it() {
+        let buf = vec![0u8; 17 << 12]; // over 16 pages
+        let (p, len) = (buf.as_ptr() as usize, buf.len());
+        assert!(!SYNC_ON.load(Ordering::Relaxed), "only this test enables the counters");
+        let before = sync_activity();
+        assert!(sync_readable(p, len));
+        sync_count(SYNC_COPIES, 1);
+        assert_eq!(sync_activity(), before);
+        assert_eq!(take_sync_slowest(), 0);
+
+        enable_sync_activity();
+        assert!(sync_readable(p, len));
+        sync_count(SYNC_COPIES, 1);
+        let after = sync_activity();
+        // (other tests' draws may count too once it is on: at least ours)
+        assert!(after[SYNC_READABLE] > before[SYNC_READABLE]);
+        assert!(after[SYNC_READABLE_LARGE] > before[SYNC_READABLE_LARGE]);
+        assert!(after[SYNC_COPIES] > before[SYNC_COPIES]);
+    }
+
+    /// A 2 s row with `readable()` work but no draw synced yet is logged, not dropped with its slowest call.
+    #[test]
+    fn a_mirror_sync_row_with_no_finished_draw_is_still_logged() {
+        let mut d = [0u64; 10];
+        assert!(!sync_row_due(&d, 0));
+        d[SYNC_READABLE] = 1;
+        d[SYNC_READABLE_NS] = 5_000_000;
+        assert!(sync_row_due(&d, 5_000_000));
+        assert!(sync_row_due(&[0; 10], 5_000_000));
+        d = [0; 10];
+        d[SYNC_DRAWS] = 1;
+        assert!(sync_row_due(&d, 0));
     }
 }
